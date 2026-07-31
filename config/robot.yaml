@@ -1,0 +1,153 @@
+fastlio_odom_adapter:
+  ros__parameters:
+    input_odom_topic: /Odometry
+    output_odom_topic: /fastlio/odom
+    odom_frame: odom
+    base_frame: base_link
+    publish_tf: true
+    base_to_body_xyz: [0.299, -0.02329, 0.32088]
+    base_to_body_rpy: [0.0, 0.0, 3.141592653589793]
+
+sparse_obstacle_filter:
+  ros__parameters:
+    input_topic: /cloud_registered_body
+    output_topic: /vlm_nav/filtered_obstacle_cloud
+    enabled: true
+    # Count distinct 0.05 m XY obstacle cells inside one body-sized window.
+    # Fewer than three cells are sensor noise and do not enter SLAM/Nav2, so
+    # they cannot block path planning, path following, Spin, or docking.
+    filter_resolution: 0.05
+    footprint_length: 0.72
+    footprint_width: 0.50
+    min_obstacle_points: 3
+    min_obstacle_height: 0.05
+    max_obstacle_height: 1.50
+    max_filter_range: 20.0
+
+sparse_costmap_filter:
+  ros__parameters:
+    input_topic: /local_costmap/costmap_raw
+    output_topic: /vlm_nav/behavior_costmap_raw
+    enabled: true
+    # A lethal cell is retained only when this many lethal cells exist inside
+    # the metric-radius neighborhood. With a 0.05 m map, the defaults ignore
+    # isolated one- or two-cell returns while retaining denser obstacles.
+    neighborhood_radius: 0.20
+    min_occupied_cells: 3
+    lethal_cost: 254
+
+vlm_nav:
+  ros__parameters:
+    enabled: false
+    target_description: chair
+    global_frame: map
+    base_frame: base_link
+    camera_frame: camera_color_optical_frame
+    map_topic: /map
+    rgb_topic: /camera/color/image_raw
+    depth_topic: /camera/aligned_depth_to_color/image_raw
+    camera_info_topic: /camera/color/camera_info
+    navigate_action: /navigate_to_pose
+    compute_path_action: /compute_path_to_pose
+    spin_action: /spin
+    # Each ARM starts by clearing Nav2 costmaps before the initial scan Spin.
+    # This removes stale near-body obstacles caused by a previous supervised
+    # run or manual misclassification.
+    clear_costmap_on_arm: true
+    global_costmap_clear_service: /global_costmap/clear_entirely_global_costmap
+    local_costmap_clear_service: /local_costmap/clear_entirely_local_costmap
+    # Do not issue the first Spin until the behavior server's filtered costmap
+    # has published a frame newer than both clear-service completions.
+    behavior_costmap_topic: /vlm_nav/behavior_costmap_raw
+    initial_costmap_refresh_timeout: 3.0
+    stop_cmd_topic: /cmd_vel
+    vlm_sample_rate: 2.0
+    vlm_timeout: 3.0
+    max_result_age: 4.0
+    confidence_threshold: 0.60
+    image_detail: low
+    jpeg_quality: 85
+    vlm_image_record_path: "~/.ros/vlm_nav/arm_records"
+    vlm_image_record_keep_arms: 3
+    api_failure_limit: 3
+    confirm_frames: 3
+    confirmation_radius: 0.35
+    target_lost_timeout: 10.0
+    depth_neighborhood_radius: 5
+    min_depth_samples: 8
+    min_depth: 0.20
+    # Direct target grounding is trusted up to this range. Farther readings
+    # trigger a Nav2-validated intermediate approach along the VLM direction.
+    max_depth: 6.0
+    max_depth_deviation: 0.20
+    # Sparse or mixed target depth triggers a small pixel-directed rotation
+    # and a fresh stationary VLM/RGB-D observation.
+    depth_reobserve_angle_deg: 10.0
+    depth_reobserve_attempt_limit: 3
+    # If the target remains outside reliable depth range, approach one safe
+    # intermediate point and observe again instead of grounding it directly.
+    target_probe_distance: 2.0
+    target_probe_attempt_limit: 3
+    min_waypoint_distance: 0.30
+    max_waypoint_distance: 2.50
+    max_ground_height: 0.35
+    free_snap_distance: 0.25
+    # Unknown standoff cells are provisional: Nav2 must still produce a path,
+    # known obstacles retain veto power, and every /map update revalidates the
+    # active endpoint.
+    allow_unknown_standoff: true
+    # A parking candidate is checked with the oriented robot footprint. One or
+    # two occupied map cells inside it are sparse noise; three or more veto it.
+    standoff_footprint_length: 0.72
+    standoff_footprint_width: 0.50
+    standoff_min_occupied_cells: 3
+    standoff_occupied_threshold: 50
+    standoff_candidate_wait_timeout: 10.0
+    target_clearance: 0.50
+    robot_front_extent: 0.36
+    approach_goal_margin: 0.05
+    # Try the nominal 0.81 m parking ring first, then a degraded 1.01 m ring.
+    # Every ring keeps the same map-clearance and Nav2 path safety checks.
+    standoff_radius_offsets: [0.0, 0.20]
+    # Opt-in profile used only by easy_case.launch.py. It bypasses VLM
+    # waypoints, standoff-map classification, and frontier exploration.
+    easy_case_mode: false
+    easy_case_timeout: 120.0
+    easy_case_standoff_distance: 0.81
+    easy_case_alignment_tolerance: 0.10
+    easy_case_max_path_deviation: 0.10
+    scan_first: true
+    scan_steps: 8
+    # At each heading, stop before capturing one fresh RGB-D frame and wait
+    # for that exact frame's VLM result before rotating again.
+    scan_settle_time: 0.30
+    scan_result_retry_limit: 3
+    spin_time_allowance: 20.0
+    allow_frontier_after_scan: true
+    min_frontier_cells: 8
+    max_frontier_candidates: 16
+    frontier_confidence_threshold: 0.5
+    frontier_decision_failure_limit: 3
+    path_horizon_segments: 16
+    path_execute_segments: 8
+    frontier_full_commit_distance: 1.0
+    rescan_at_frontier: true
+    navigation_tick_period: 0.5
+    goal_timeout: 120.0
+    blocked_goal_seconds: 15.0
+    # Pause and automatically recover from short RGB-D / image-time TF gaps.
+    # Only a continuous sensor outage longer than sensor_failure_timeout fails.
+    rgbd_wait_timeout: 2.0
+    sensor_failure_timeout: 30.0
+    sensor_recovery_frames: 3
+    tf_failure_timeout: 3.0
+    # FAST_LIO may trail camera time under load. Keep a small sampled RGB-D
+    # queue until the exact image-time transform arrives; never use latest TF
+    # as a projection substitute.
+    image_tf_wait_timeout: 5.0
+    image_tf_queue_size: 16
+    # Rolling execution radius for one Nav2-validated segment. Paths extending
+    # beyond it are truncated and reassessed by VLM from the reached checkpoint;
+    # this is not a total task-distance limit.
+    max_travel_radius: 3.0
+    publish_stop_command: true

@@ -1,0 +1,14 @@
+<!-- Easy-case navigation: plan once and follow once, with no recovery tree. -->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <Sequence name="EasyCaseDirectNavigation">
+      <ComputePathToPose
+        goal="{goal}"
+        path="{path}"
+        planner_id="{selected_planner}"/>
+      <FollowPath
+        path="{path}"
+        controller_id="{selected_controller}"/>
+    </Sequence>
+  </BehaviorTree>
+</root>

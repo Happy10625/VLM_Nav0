@@ -1,0 +1,11 @@
+build/
+install/
+log/
+bags/
+*.db3
+*.db3.zstd
+*.mcap
+.pytest_cache/
+__pycache__/
+*.py[cod]
+.env

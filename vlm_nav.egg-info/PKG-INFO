@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: vlm_nav
+Version: 0.1.0
+Summary: VLM grounded RGB-D navigation for ROS 2 and Nav2
+Maintainer: robot
+Maintainer-email: robot@example.com
+License: MIT
+Requires-Dist: setuptools
+Requires-Dist: numpy
+Dynamic: license
+Dynamic: maintainer
+Dynamic: maintainer-email
+Dynamic: requires-dist
+Dynamic: summary

@@ -1,0 +1,3 @@
+[console_scripts]
+fastlio_odom_adapter = vlm_nav.fastlio_odom_adapter:main
+vlm_navigator = vlm_nav.vlm_navigator:main
