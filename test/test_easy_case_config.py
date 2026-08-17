@@ -97,10 +97,10 @@ def test_rviz_keeps_core_views_on_and_auxiliary_views_off():
     assert "rviz_default_plugins/PublishPoint" not in tool_classes
 
 
-def test_mapping_and_nav2_use_the_sparse_filtered_cloud():
+def test_mapping_and_nav2_use_the_standard_filtered_cloud():
     mapping_source = (ROOT / "launch" / "mapping.launch.py").read_text()
     nav2 = yaml.safe_load((ROOT / "config" / "nav2_overrides.yaml").read_text())
-    expected_topic = "/vlm_nav/filtered_obstacle_cloud"
+    expected_topic = "/vlm_nav/obstacle_cloud"
 
     assert expected_topic in mapping_source
     assert "/cloud_registered_body" not in mapping_source

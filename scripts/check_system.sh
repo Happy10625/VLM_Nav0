@@ -50,7 +50,7 @@ check_vlm_latency() {
 
 for node in /ranger_base_node /livox_lidar_publisher /laser_mapping \
   /fastlio_odom_adapter /slam_toolbox /controller_server /planner_server \
-  /bt_navigator /sparse_obstacle_filter /sparse_costmap_filter /vlm_nav; do
+  /bt_navigator /obstacle_cloud_filter /vlm_nav; do
   if ros2 node list 2>/dev/null | grep -Fxq "$node"; then
     pass "节点 ${node}"
   else
@@ -60,9 +60,8 @@ done
 
 for topic in /camera/color/image_raw /camera/aligned_depth_to_color/image_raw \
   /camera/color/camera_info /cloud_registered_body \
-  /vlm_nav/filtered_obstacle_cloud /scan /map \
-  /vlm_nav/behavior_costmap_raw /sparse_obstacle_filter/status \
-  /sparse_costmap_filter/status /vlm_nav/state; do
+  /vlm_nav/obstacle_cloud /scan /map /local_costmap/costmap_raw \
+  /diagnostics /vlm_nav/state; do
   count="$(timeout 4 ros2 topic info "$topic" 2>/dev/null |
     awk '/Publisher count:/ {print $3; found=1; exit} END {if (!found) print 0}')"
   if [[ "$count" -ge 1 ]]; then
@@ -72,7 +71,7 @@ for topic in /camera/color/image_raw /camera/aligned_depth_to_color/image_raw \
   fi
 done
 
-for frames in "map base_link" "map camera_color_optical_frame"; do
+for frames in "map base_link" "map camera_color_optical_frame" "base_link body"; do
   read -r parent child <<<"$frames"
   check_tf "$parent" "$child" || true
 done

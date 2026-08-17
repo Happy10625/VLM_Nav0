@@ -9,3 +9,4 @@ bags/
 __pycache__/
 *.py[cod]
 .env
+*.egg-info/

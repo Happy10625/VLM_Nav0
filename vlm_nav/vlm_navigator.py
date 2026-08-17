@@ -124,7 +124,7 @@ class VLMNavigator(Node):
             "local_costmap_clear_service": (
                 "/local_costmap/clear_entirely_local_costmap"
             ),
-            "behavior_costmap_topic": "/vlm_nav/behavior_costmap_raw",
+            "behavior_costmap_topic": "/local_costmap/costmap_raw",
             "initial_costmap_refresh_timeout": 3.0,
             "stop_cmd_topic": "/cmd_vel",
             "vlm_sample_rate": 5.0,
@@ -157,7 +157,6 @@ class VLMNavigator(Node):
             "standoff_footprint_width": 0.50,
             "standoff_min_occupied_cells": 3,
             "standoff_occupied_threshold": 50,
-            "standoff_candidate_wait_timeout": 10.0,
             "target_clearance": 0.50,
             "robot_front_extent": 0.36,
             "approach_goal_margin": 0.05,
@@ -337,16 +336,11 @@ class VLMNavigator(Node):
         self.easy_direct_goal = None
         self.easy_path_deviation = math.inf
         self.pending_waypoints = []
-        self.standoff_wait_started = 0.0
-        self.standoff_known_free_count = 0
-        self.standoff_unknown_count = 0
-        self.standoff_rejected_count = 0
+        self.standoff_pending_count = 0
         self.standoff_ring_stats = []
         self.standoff_candidate_radii = {}
         self.selected_standoff_radius = 0.0
         self.selected_standoff_mode = "none"
-        self.active_standoff_pose = None
-        self.active_standoff_status = "none"
         self.last_debug_pixels = None
         self.last_vlm_confidence = 0.0
         self.last_vlm_disposition = "none"
@@ -812,16 +806,11 @@ class VLMNavigator(Node):
         self.easy_alignment_error = math.inf
         self.easy_direct_goal = None
         self.easy_path_deviation = math.inf
-        self.standoff_wait_started = 0.0
-        self.standoff_known_free_count = 0
-        self.standoff_unknown_count = 0
-        self.standoff_rejected_count = 0
+        self.standoff_pending_count = 0
         self.standoff_ring_stats = []
         self.standoff_candidate_radii = {}
         self.selected_standoff_radius = 0.0
         self.selected_standoff_mode = "none"
-        self.active_standoff_pose = None
-        self.active_standoff_status = "none"
         self.session_origin = None
         self.scan_headings = []
         self.scan_index = 0
@@ -938,16 +927,11 @@ class VLMNavigator(Node):
         self.target_position = None
         self.pending_waypoints.clear()
         self.target_seen_time = 0.0
-        self.standoff_wait_started = 0.0
-        self.standoff_known_free_count = 0
-        self.standoff_unknown_count = 0
-        self.standoff_rejected_count = 0
+        self.standoff_pending_count = 0
         self.standoff_ring_stats = []
         self.standoff_candidate_radii = {}
         self.selected_standoff_radius = 0.0
         self.selected_standoff_mode = "none"
-        self.active_standoff_pose = None
-        self.active_standoff_status = "none"
         self.frontier_generation += 1
         self.frontier_candidates = []
         self.frontier_rejected_ids = set()
@@ -1081,36 +1065,6 @@ class VLMNavigator(Node):
             message.info.height, message.info.width
         )
         self.map_revision += 1
-        if self.easy_case_enabled():
-            return
-        if self.state != APPROACHING or self.target_position is None:
-            return
-        pose = self.robot_pose()
-        if pose is None:
-            return
-        self.evaluate_standoff_candidates(pose, publish=True)
-        if self.active_standoff_pose is None:
-            return
-        status, _ = self.classify_standoff_point(
-            self.active_standoff_pose[:2], free_snap_distance=0.0
-        )
-        previous = self.active_standoff_status
-        self.active_standoff_status = status
-        if status in ("known_free", "unknown"):
-            if status != previous:
-                self.get_logger().info(
-                    "Active standoff map status changed: "
-                    f"{previous} -> {status}"
-                )
-            return
-        rejected_pose = self.active_standoff_pose
-        self.get_logger().warn(
-            "Active standoff became unsafe after map update "
-            f"(status={status}, x={rejected_pose[0]:.2f}, "
-            f"y={rejected_pose[1]:.2f}); cancelling and replanning"
-        )
-        self.cancel_motion(publish_stop=True)
-        self.standoff_wait_started = time.monotonic()
 
     @staticmethod
     def image_to_rgb(message):
@@ -2312,24 +2266,8 @@ class VLMNavigator(Node):
                 return
             candidates = self.evaluate_standoff_candidates(pose, publish=True)
             if not candidates:
-                now = time.monotonic()
-                if self.standoff_wait_started <= 0.0:
-                    self.standoff_wait_started = now
-                    self.publish_stop()
-                    self.get_logger().warn(
-                        "No currently acceptable standoff candidate; "
-                        "waiting for occupancy-map updates"
-                    )
-                wait_timeout = float(self.p.standoff_candidate_wait_timeout)
-                if (
-                    wait_timeout > 0.0
-                    and now - self.standoff_wait_started > wait_timeout
-                ):
-                    self.fail_safe(
-                        "No acceptable standoff candidate after dynamic map wait"
-                    )
+                self.fail_safe("Cannot construct target standoff candidates")
                 return
-            self.standoff_wait_started = 0.0
             self.plan_then_navigate(candidates, "approach")
             return
 
@@ -2471,26 +2409,19 @@ class VLMNavigator(Node):
         candidate_radii = {}
         ring_stats = []
         for radius in radii:
-            known_free = []
-            unknown = []
+            ring_candidates = []
             visuals = []
             for x, y, _, _ in standoff_candidates(
                 self.target_position[:2], pose[:2], radius
             ):
-                status, accepted_point = self.classify_standoff_point((x, y))
-                visuals.append((x, y, accepted_point, status))
-                if (
-                    status not in ("known_free", "unknown")
-                    or accepted_point is None
-                ):
-                    continue
+                visuals.append((x, y, (x, y), "pending_nav2"))
                 snapped_yaw = math.atan2(
-                    self.target_position[1] - accepted_point[1],
-                    self.target_position[0] - accepted_point[0],
+                    self.target_position[1] - y,
+                    self.target_position[0] - x,
                 )
                 candidate = (
-                    float(accepted_point[0]),
-                    float(accepted_point[1]),
+                    float(x),
+                    float(y),
                     snapped_yaw,
                 )
                 key = self.goal_key(candidate)
@@ -2498,29 +2429,19 @@ class VLMNavigator(Node):
                     continue
                 seen.add(key)
                 candidate_radii[key] = float(radius)
-                if status == "known_free":
-                    known_free.append(candidate)
-                else:
-                    unknown.append(candidate)
-            free_count = sum(item[3] == "known_free" for item in visuals)
-            unknown_count = sum(item[3] == "unknown" for item in visuals)
+                ring_candidates.append(candidate)
             ring_stats.append({
                 "radius": float(radius),
-                "free": free_count,
-                "unknown": unknown_count,
-                "rejected": len(visuals) - free_count - unknown_count,
+                "pending_nav2": len(ring_candidates),
             })
             ring_visuals.append((float(radius), visuals))
             # Radius priority is strict: exhaust the inner ring before trying
             # any candidate from the degraded outer ring.
-            ordered.extend(known_free)
-            ordered.extend(unknown)
+            ordered.extend(ring_candidates)
         self.standoff_candidate_radii = candidate_radii
         self.standoff_ring_stats = ring_stats
-        self.standoff_known_free_count = sum(item["free"] for item in ring_stats)
-        self.standoff_unknown_count = sum(item["unknown"] for item in ring_stats)
-        self.standoff_rejected_count = sum(
-            item["rejected"] for item in ring_stats
+        self.standoff_pending_count = sum(
+            item["pending_nav2"] for item in ring_stats
         )
         if publish:
             self.publish_standoff_candidates(
@@ -2673,16 +2594,18 @@ class VLMNavigator(Node):
             )
         self.last_plan_max_radius = max(radii) if radii else math.inf
         limit = float(self.p.max_travel_radius)
+        kind = self.plan_kind
         rejection = None
         if wrapped.status != GoalStatus.STATUS_SUCCEEDED:
             rejection = f"planner_action_status_{int(wrapped.status)}"
-        elif len(path) < 2:
+        elif not path:
+            rejection = "empty_path"
+        elif kind != "approach" and len(path) < 2:
             rejection = "path_too_short"
         if rejection is None:
             self.last_plan_rejection_reason = "none"
             requested_pose = self.current_plan_pose
-            kind = self.plan_kind
-            if kind in ("approach", "target_probe"):
+            if kind == "target_probe":
                 status, _ = self.classify_standoff_point(
                     requested_pose[:2], free_snap_distance=0.0
                 )
@@ -2696,6 +2619,30 @@ class VLMNavigator(Node):
                         token,
                     )
                     return
+            if kind == "approach":
+                horizon = max(
+                    1, int(getattr(self.p, "path_horizon_segments", 16))
+                )
+                samples = (
+                    sample_polyline(points, horizon)[0]
+                    if len(points) >= 2
+                    else points
+                )
+                self.last_plan_commit_length = self.last_plan_path_length
+                self.last_plan_radius_clipped = False
+                self.rolling_goal_is_final = True
+                self.select_standoff_radius(requested_pose)
+                self.active_motion_origin = self.plan_window_origin
+                if getattr(self, "marker_pub", None) is not None:
+                    self.publish_task_boundary()
+                    self.publish_rolling_path(samples, requested_pose, points)
+                    self.publish_selected_standoff(requested_pose)
+                self.plan_pending = False
+                self.plan_handle = None
+                self.plan_candidates = []
+                self.plan_kind = None
+                self.send_navigation_goal(*requested_pose, kind)
+                return
             if kind == "easy_approach":
                 self.easy_path_deviation = max_polyline_deviation(
                     points, self.plan_window_origin, requested_pose[:2]
@@ -2798,14 +2745,6 @@ class VLMNavigator(Node):
             )
             if kind == "frontier":
                 self.frontier_goal_is_final = self.rolling_goal_is_final
-            if kind == "approach" and self.rolling_goal_is_final:
-                self.active_standoff_pose = requested_pose
-                self.active_standoff_status = status
-            else:
-                self.active_standoff_pose = None
-                self.active_standoff_status = "none"
-            if kind == "approach":
-                self.select_standoff_radius(requested_pose)
             self.active_motion_origin = self.plan_window_origin
             if getattr(self, "marker_pub", None) is not None:
                 self.publish_task_boundary()
@@ -2950,9 +2889,6 @@ class VLMNavigator(Node):
         self.goal_kind = None
         self.goal_pose = None
         self.active_motion_origin = None
-        if kind == "approach":
-            self.active_standoff_pose = None
-            self.active_standoff_status = "none"
         if status != GoalStatus.STATUS_SUCCEEDED:
             if failed_pose is not None:
                 self.blocked_goals[self.goal_key(failed_pose)] = (
@@ -2995,7 +2931,7 @@ class VLMNavigator(Node):
             self.publish_stop()
             self.set_state(APPROACHING)
             self.publish_easy_event("target_alignment_action_succeeded")
-        elif kind in ("waypoint", "approach") and not goal_was_final:
+        elif kind == "waypoint" and not goal_was_final:
             self.pending_waypoints.clear()
             self.rolling_reassessment_required = True
             self.rolling_reassessment_after_sequence = self.sequence
@@ -3054,8 +2990,6 @@ class VLMNavigator(Node):
         self.rolling_goal_is_final = True
         self.rolling_reassessment_required = False
         self.rolling_reassessment_after_sequence = -1
-        self.active_standoff_pose = None
-        self.active_standoff_status = "none"
         self.clear_standoff_selection()
         if publish_stop:
             self.publish_stop()
@@ -3193,6 +3127,7 @@ class VLMNavigator(Node):
     def standoff_marker_deletes(self):
         markers = [
             self.delete_marker(0, "standoff_summary"),
+            self.delete_marker(0, "standoff_selected"),
         ]
         for ring_index in range(2):
             markers.append(self.delete_marker(ring_index, "standoff_ring"))
@@ -3201,6 +3136,7 @@ class VLMNavigator(Node):
             markers.append(self.delete_marker(index, "standoff_free"))
             markers.append(self.delete_marker(index, "standoff_unknown"))
             markers.append(self.delete_marker(index, "standoff_outside"))
+            markers.append(self.delete_marker(index, "standoff_pending_nav2"))
         return markers
 
     def clear_standoff_markers(self):
@@ -3209,7 +3145,7 @@ class VLMNavigator(Node):
         )
 
     def publish_standoff_candidates(self, target, rings):
-        """Show both parking rings and their local-map validation results."""
+        """Show raw parking candidates that are waiting for Nav2 validation."""
         markers = MarkerArray(markers=self.standoff_marker_deletes())
         marker_index = 0
         for ring_index, (_radius, candidates) in enumerate(rings):
@@ -3234,48 +3170,20 @@ class VLMNavigator(Node):
                 ring.points.append(ring.points[0])
             markers.markers.append(ring)
 
-            for x, y, accepted_point, status in candidates:
-                if status == "known_free" and accepted_point is not None:
-                    item = self.marker(
-                        marker_index,
-                        "standoff_free",
-                        Marker.CYLINDER,
-                        accepted_point[0],
-                        accepted_point[1],
-                        0.09,
-                    )
-                    item.scale.x = item.scale.y = 0.14
-                    item.scale.z = 0.05
-                    item.color.r = 0.0
-                    item.color.g = 1.0
-                    item.color.b = 0.2
-                elif status == "unknown" and accepted_point is not None:
-                    item = self.marker(
-                        marker_index,
-                        "standoff_unknown",
-                        Marker.CYLINDER,
-                        accepted_point[0],
-                        accepted_point[1],
-                        0.09,
-                    )
-                    item.scale.x = item.scale.y = 0.16
-                    item.scale.z = 0.055
-                    item.color.r = 1.0
-                    item.color.g = 0.78
-                    item.color.b = 0.0
-                else:
-                    namespace = (
-                        "standoff_outside"
-                        if status == "outside"
-                        else "standoff_rejected"
-                    )
-                    item = self.marker(
-                        marker_index, namespace, Marker.SPHERE, x, y, 0.09
-                    )
-                    item.scale.x = item.scale.y = item.scale.z = 0.11
-                    item.color.r = 0.85 if status == "outside" else 1.0
-                    item.color.g = 0.05
-                    item.color.b = 0.85 if status == "outside" else 0.05
+            for x, y, _accepted_point, _status in candidates:
+                item = self.marker(
+                    marker_index,
+                    "standoff_pending_nav2",
+                    Marker.CYLINDER,
+                    x,
+                    y,
+                    0.09,
+                )
+                item.scale.x = item.scale.y = 0.14
+                item.scale.z = 0.05
+                item.color.r = 1.0
+                item.color.g = 0.78
+                item.color.b = 0.0
                 markers.markers.append(item)
                 marker_index += 1
 
@@ -3289,15 +3197,11 @@ class VLMNavigator(Node):
         )
         summary.scale.x = summary.scale.y = 0.0
         summary.scale.z = 0.14
-        accepted_count = (
-            self.standoff_known_free_count + self.standoff_unknown_count
-        )
-        summary.color.r = 1.0 if accepted_count == 0 else 0.2
-        summary.color.g = 0.2 if accepted_count == 0 else 1.0
+        summary.color.r = 1.0
+        summary.color.g = 0.78
         summary.color.b = 0.1
         ring_text = " | ".join(
-            f"r={item['radius']:.2f}:f={item['free']} "
-            f"u={item['unknown']} x={item['rejected']}"
+            f"r={item['radius']:.2f}:pending={item['pending_nav2']}"
             for item in self.standoff_ring_stats
         )
         selected = float(getattr(self, "selected_standoff_radius", 0.0))
@@ -3309,6 +3213,22 @@ class VLMNavigator(Node):
         summary.text = f"{ring_text} | {selection_text}"
         markers.markers.append(summary)
         self.marker_pub.publish(markers)
+
+    def publish_selected_standoff(self, pose):
+        marker = self.marker(
+            0,
+            "standoff_selected",
+            Marker.CYLINDER,
+            pose[0],
+            pose[1],
+            0.10,
+        )
+        marker.scale.x = marker.scale.y = 0.20
+        marker.scale.z = 0.07
+        marker.color.r = 0.0
+        marker.color.g = 1.0
+        marker.color.b = 0.2
+        self.marker_pub.publish(MarkerArray(markers=[marker]))
 
     def publish_grounded_markers(self, target, waypoints):
         markers = MarkerArray(markers=self.vlm_grounding_deletes())
@@ -3646,8 +3566,7 @@ class VLMNavigator(Node):
 
         ring_stats = getattr(self, "standoff_ring_stats", [])
         rings = ",".join(
-            f"{item['radius']:.2f}:f{item['free']}/u{item['unknown']}"
-            f"/x{item['rejected']}"
+            f"{item['radius']:.2f}:pending{item['pending_nav2']}"
             for item in ring_stats
         ) or "none"
         selected_radius = float(

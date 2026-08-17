@@ -35,8 +35,6 @@ setup(
     entry_points={
         "console_scripts": [
             "fastlio_odom_adapter = vlm_nav.fastlio_odom_adapter:main",
-            "sparse_obstacle_filter = vlm_nav.sparse_obstacle_filter:main",
-            "sparse_costmap_filter = vlm_nav.sparse_costmap_filter:main",
             "vlm_navigator = vlm_nav.vlm_navigator:main",
         ]
     },

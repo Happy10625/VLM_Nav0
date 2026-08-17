@@ -11,10 +11,8 @@ global_costmap:
       obstacle_layer:
         observation_sources: fastlio_cloud
         fastlio_cloud:
-          topic: /vlm_nav/filtered_obstacle_cloud
-          # The PointCloud2 header is frame_id=body. Leave sensor_frame unset
-          # so Nav2 Humble uses that real frame instead of also requiring the
-          # nonexistent livox_frame transform at the cloud timestamp.
+          topic: /vlm_nav/obstacle_cloud
+          # The preprocessing output is already in base_link.
           data_type: PointCloud2
           marking: true
           clearing: true
@@ -22,6 +20,7 @@ global_costmap:
           raytrace_max_range: 8.0
           obstacle_min_range: 0.20
           obstacle_max_range: 7.5
+          # TODO(real-robot calibration): validate the shared height range.
           min_obstacle_height: 0.05
           max_obstacle_height: 1.50
 
@@ -55,8 +54,8 @@ local_costmap:
         z_voxels: 16
         observation_sources: fastlio_cloud
         fastlio_cloud:
-          topic: /vlm_nav/filtered_obstacle_cloud
-          # Use the PointCloud2 header frame (body); livox_frame is not in TF.
+          topic: /vlm_nav/obstacle_cloud
+          # The preprocessing output is already in base_link.
           data_type: PointCloud2
           marking: true
           clearing: true
@@ -64,8 +63,9 @@ local_costmap:
           raytrace_max_range: 8.0
           obstacle_min_range: 0.20
           obstacle_max_range: 7.5
+          # TODO(real-robot calibration): validate the shared height range.
           min_obstacle_height: 0.05
-          max_obstacle_height: 1.40
+          max_obstacle_height: 1.50
 
 controller_server:
   ros__parameters:
@@ -85,9 +85,10 @@ controller_server:
 
 behavior_server:
   ros__parameters:
-    # Spin and other behavior collision simulations consume the filtered map.
-    # Planner/controller costmaps are built from the filtered cloud above.
-    costmap_topic: /vlm_nav/behavior_costmap_raw
+    # Humble Behavior Server consumes the same standard local costmap semantics
+    # as the planner/controller obstacle chain; no copied or rewritten map.
+    costmap_topic: /local_costmap/costmap_raw
+    footprint_topic: /local_costmap/published_footprint
     max_rotational_vel: 0.25
     min_rotational_vel: 0.10
     rotational_acc_lim: 0.30

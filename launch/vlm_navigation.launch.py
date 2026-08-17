@@ -60,15 +60,8 @@ def generate_launch_description():
             ),
             Node(
                 package="vlm_nav",
-                executable="sparse_obstacle_filter",
-                name="sparse_obstacle_filter",
-                output="screen",
-                parameters=[LaunchConfiguration("params_file")],
-            ),
-            Node(
-                package="vlm_nav",
-                executable="sparse_costmap_filter",
-                name="sparse_costmap_filter",
+                executable="obstacle_cloud_filter",
+                name="obstacle_cloud_filter",
                 output="screen",
                 parameters=[LaunchConfiguration("params_file")],
             ),

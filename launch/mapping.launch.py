@@ -15,7 +15,7 @@ def generate_launch_description():
                 name="fastlio_cloud_to_scan",
                 output="screen",
                 remappings=[
-                    ("cloud_in", "/vlm_nav/filtered_obstacle_cloud"),
+                    ("cloud_in", "/vlm_nav/obstacle_cloud"),
                     ("scan", "/scan"),
                 ],
                 parameters=[

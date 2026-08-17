@@ -12,6 +12,7 @@ rclpy = pytest.importorskip("rclpy")
 
 from action_msgs.msg import GoalStatus
 from builtin_interfaces.msg import Time
+from geometry_msgs.msg import PoseStamped
 from visualization_msgs.msg import Marker
 from tf2_ros import TransformException
 
@@ -493,7 +494,7 @@ def test_easy_case_detouring_plan_is_rejected():
     assert "not sufficiently straight" in rejected[0][0]
 
 
-def test_path_leaving_rolling_radius_is_truncated_and_dispatched():
+def test_approach_dispatches_the_exact_nav2_validated_candidate_without_truncation():
     node = VLMNavigator.__new__(VLMNavigator)
     node.plan_token = 2
     node.plan_attempt_count = 1
@@ -520,9 +521,8 @@ def test_path_leaving_rolling_radius_is_truncated_and_dispatched():
         info=lambda *_args: None,
         warn=lambda *_args: None,
     )
-    node.classify_standoff_point = lambda *_args, **_kwargs: (
-        "known_free",
-        (4.0, 0.0),
+    node.classify_standoff_point = lambda *_args, **_kwargs: pytest.fail(
+        "approach must not consult the occupancy-map standoff helper"
     )
     dispatched = []
     rejected = []
@@ -538,14 +538,82 @@ def test_path_leaving_rolling_radius_is_truncated_and_dispatched():
     node.on_plan_result(SimpleNamespace(result=lambda: wrapped), token=2)
 
     assert not rejected
-    assert dispatched[0][0] == pytest.approx(3.0)
-    assert dispatched[0][1] == pytest.approx(0.0)
-    assert dispatched[0][3] == "approach"
-    assert node.last_plan_radius_clipped is True
-    assert node.rolling_goal_is_final is False
-    assert node.last_plan_commit_length == pytest.approx(3.0)
+    assert dispatched == [(4.0, 0.0, 0.0, "approach")]
+    assert node.last_plan_radius_clipped is False
+    assert node.rolling_goal_is_final is True
+    assert node.last_plan_commit_length == pytest.approx(4.0)
     assert node.selected_standoff_radius == pytest.approx(1.01)
     assert node.selected_standoff_mode == "degraded"
+
+
+def test_compute_path_and_navigate_use_the_same_approach_goal():
+    candidate = (1.25, -0.40, 0.75)
+    node = VLMNavigator.__new__(VLMNavigator)
+    node.plan_token = 12
+    node.plan_kind = "approach"
+    node.plan_candidates = [candidate]
+    node.plan_attempt_count = 0
+    node.last_plan_candidate = None
+    compute_goals = []
+
+    class Future:
+        def add_done_callback(self, callback):
+            self.callback = callback
+
+    node.path_planner = SimpleNamespace(
+        send_goal_async=lambda goal: compute_goals.append(goal) or Future()
+    )
+    def make_pose(x, y, yaw):
+        message = PoseStamped()
+        message.pose.position.x = x
+        message.pose.position.y = y
+        message.pose.orientation.z = math.sin(yaw / 2.0)
+        message.pose.orientation.w = math.cos(yaw / 2.0)
+        return message
+
+    node.make_pose_stamped = make_pose
+    node.request_next_plan(12)
+
+    node.p = SimpleNamespace(
+        max_travel_radius=3.0,
+        target_clearance=0.50,
+        robot_front_extent=0.36,
+        approach_goal_margin=0.05,
+        standoff_radius_offsets=[0.0, 0.20],
+    )
+    node.plan_pending = True
+    node.plan_handle = object()
+    node.standoff_candidate_radii = {node.goal_key(candidate): 0.81}
+    node.selected_standoff_radius = 0.0
+    node.selected_standoff_mode = "none"
+    node.get_logger = lambda: SimpleNamespace(
+        info=lambda *_args: None,
+        warn=lambda *_args: None,
+    )
+    navigate_goals = []
+    node.send_navigation_goal = lambda *goal: navigate_goals.append(goal)
+    wrapped = SimpleNamespace(
+        status=GoalStatus.STATUS_SUCCEEDED,
+        result=SimpleNamespace(
+            path=SimpleNamespace(
+                poses=[path_pose(0.0, 0.0), path_pose(candidate[0], candidate[1])]
+            )
+        ),
+    )
+
+    node.on_plan_result(SimpleNamespace(result=lambda: wrapped), token=12)
+
+    compute_pose = compute_goals[0].goal.pose
+    compute_yaw = math.atan2(
+        2.0 * compute_pose.orientation.w * compute_pose.orientation.z,
+        1.0 - 2.0 * compute_pose.orientation.z**2,
+    )
+    assert (
+        compute_pose.position.x,
+        compute_pose.position.y,
+        compute_yaw,
+    ) == pytest.approx(candidate)
+    assert navigate_goals == [(*candidate, "approach")]
 
 
 def test_standoff_candidates_use_inner_ring_before_degraded_outer_ring():
@@ -557,7 +625,9 @@ def test_standoff_candidates_use_inner_ring_before_degraded_outer_ring():
         approach_goal_margin=0.05,
         standoff_radius_offsets=[0.0, 0.20],
     )
-    node.classify_standoff_point = lambda point: ("known_free", point)
+    node.classify_standoff_point = lambda point: pytest.fail(
+        "approach candidates must be left for Nav2 to validate"
+    )
 
     candidates = node.evaluate_standoff_candidates(
         pose=(3.0, 5.0, 0.0), publish=False
@@ -573,9 +643,10 @@ def test_standoff_candidates_use_inner_ring_before_degraded_outer_ring():
     assert [item["radius"] for item in node.standoff_ring_stats] == pytest.approx(
         [0.81, 1.01]
     )
+    assert all(item["pending_nav2"] == 16 for item in node.standoff_ring_stats)
 
 
-def test_outer_standoff_remains_when_target_blocks_entire_inner_ring():
+def test_standoff_candidates_are_not_removed_by_legacy_map_classification():
     node = VLMNavigator.__new__(VLMNavigator)
     node.target_position = (5.0, 5.0, 0.5)
     node.p = SimpleNamespace(
@@ -585,23 +656,21 @@ def test_outer_standoff_remains_when_target_blocks_entire_inner_ring():
         standoff_radius_offsets=[0.0, 0.20],
     )
 
-    def classify(point):
-        radius = math.hypot(point[0] - 5.0, point[1] - 5.0)
-        return ("occupied", None) if radius < 0.9 else ("known_free", point)
-
-    node.classify_standoff_point = classify
+    node.classify_standoff_point = lambda _point: ("occupied", None)
 
     candidates = node.evaluate_standoff_candidates(
         pose=(3.0, 5.0, 0.0), publish=False
     )
 
-    assert len(candidates) == 16
+    assert len(candidates) == 32
+    assert all(
+        math.hypot(item[0] - 5.0, item[1] - 5.0) == pytest.approx(0.81)
+        for item in candidates[:16]
+    )
     assert all(
         math.hypot(item[0] - 5.0, item[1] - 5.0) == pytest.approx(1.01)
-        for item in candidates
+        for item in candidates[16:]
     )
-    assert node.standoff_ring_stats[0]["rejected"] == 16
-    assert node.standoff_ring_stats[1]["free"] == 16
 
 
 def test_selected_outer_ring_sets_degraded_success_limit_and_can_be_reset():
@@ -656,6 +725,32 @@ def test_planner_action_failure_is_distinct_from_radius_rejection():
     assert not dispatched
     assert rejected and rejected[0][1] == 5
     assert "reason=planner_action_status_6" in rejected[0][0]
+
+
+def test_empty_approach_path_rejects_candidate_and_tries_the_next_one():
+    node = VLMNavigator.__new__(VLMNavigator)
+    node.plan_token = 6
+    node.plan_attempt_count = 1
+    node.current_plan_pose = (1.0, 0.0, 0.0)
+    node.plan_kind = "approach"
+    node.p = SimpleNamespace(
+        max_travel_radius=3.0,
+        blocked_goal_seconds=15.0,
+    )
+    requested = []
+    node.get_logger = lambda: SimpleNamespace(warn=lambda *_args: None)
+    node.blocked_goals = {}
+    node.plan_handle = object()
+    node.request_next_plan = requested.append
+    wrapped = SimpleNamespace(
+        status=GoalStatus.STATUS_SUCCEEDED,
+        result=SimpleNamespace(path=SimpleNamespace(poses=[])),
+    )
+
+    node.on_plan_result(SimpleNamespace(result=lambda: wrapped), token=6)
+
+    assert requested == [6]
+    assert node.last_plan_rejection_reason == "empty_path"
 
 
 def test_long_frontier_path_commits_only_first_half_for_reassessment():
@@ -731,26 +826,24 @@ def test_short_frontier_path_commits_to_actual_frontier():
     assert node.frontier_goal_is_final is True
 
 
-def test_rolling_approach_checkpoint_waits_for_a_newer_vlm_frame():
+def test_rolling_waypoint_checkpoint_waits_for_a_newer_vlm_frame():
     node = VLMNavigator.__new__(VLMNavigator)
     node.goal_token = 9
     node.goal_pose = (3.0, 0.0, 0.0)
     node.goal_handle = object()
     node.goal_pending = False
-    node.goal_kind = "approach"
+    node.goal_kind = "waypoint"
     node.rolling_goal_is_final = False
     node.sequence = 42
     node.pending_waypoints = [(4.0, 0.0, 0.0)]
     node.active_motion_origin = (0.0, 0.0)
-    node.active_standoff_pose = None
-    node.active_standoff_status = "none"
     stopped = []
     node.publish_stop = lambda: stopped.append(True)
     node.get_logger = lambda: SimpleNamespace(info=lambda _message: None)
     wrapped = SimpleNamespace(status=GoalStatus.STATUS_SUCCEEDED)
 
     node.on_navigation_result(
-        SimpleNamespace(result=lambda: wrapped), token=9, kind="approach"
+        SimpleNamespace(result=lambda: wrapped), token=9, kind="waypoint"
     )
 
     assert stopped
@@ -1132,31 +1225,14 @@ def test_delayed_image_tf_is_retried_at_the_exact_original_stamp():
     assert node.last_image_tf_error == "none"
 
 
-def test_map_update_cancels_active_standoff_that_becomes_occupied():
+def test_map_update_does_not_cancel_nav2_validated_approach():
     node = VLMNavigator.__new__(VLMNavigator)
     node.state = APPROACHING
     node.target_position = (2.0, 0.0, 0.5)
     node.map_revision = 3
-    node.active_standoff_pose = (1.2, 0.0, 0.0)
-    node.active_standoff_status = "unknown"
-    node.robot_pose = lambda: (0.0, 0.0, 0.0)
-    node.evaluate_standoff_candidates = lambda pose, publish: []
-    node.classify_standoff_point = lambda point, free_snap_distance: (
-        "occupied",
-        None,
-    )
-    warnings = []
-    node.get_logger = lambda: SimpleNamespace(
-        warn=warnings.append,
-        info=lambda *_args: None,
-    )
+    node.get_logger = lambda: SimpleNamespace(warn=lambda *_args: None)
     cancelled = []
-    node.cancel_motion = lambda publish_stop: (
-        cancelled.append(publish_stop),
-        setattr(node, "active_standoff_pose", None),
-        setattr(node, "active_standoff_status", "none"),
-    )
-    node.standoff_wait_started = 0.0
+    node.cancel_motion = lambda publish_stop: cancelled.append(publish_stop)
     message = SimpleNamespace(
         info=SimpleNamespace(width=2, height=2),
         data=[0, 0, 0, 100],
@@ -1165,9 +1241,7 @@ def test_map_update_cancels_active_standoff_that_becomes_occupied():
     node.on_map(message)
 
     assert node.map_revision == 4
-    assert cancelled == [True]
-    assert node.standoff_wait_started > 0.0
-    assert "became unsafe" in warnings[0]
+    assert cancelled == []
 
 
 def test_compact_diagnostics_keep_only_fault_isolation_fields():

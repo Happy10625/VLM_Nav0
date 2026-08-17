@@ -8,33 +8,30 @@ fastlio_odom_adapter:
     base_to_body_xyz: [0.299, -0.02329, 0.32088]
     base_to_body_rpy: [0.0, 0.0, 3.141592653589793]
 
-sparse_obstacle_filter:
+obstacle_cloud_filter:
   ros__parameters:
     input_topic: /cloud_registered_body
-    output_topic: /vlm_nav/filtered_obstacle_cloud
-    enabled: true
-    # Count distinct 0.05 m XY obstacle cells inside one body-sized window.
-    # Fewer than three cells are sensor noise and do not enter SLAM/Nav2, so
-    # they cannot block path planning, path following, Spin, or docking.
-    filter_resolution: 0.05
-    footprint_length: 0.72
-    footprint_width: 0.50
-    min_obstacle_points: 3
-    min_obstacle_height: 0.05
-    max_obstacle_height: 1.50
-    max_filter_range: 20.0
-
-sparse_costmap_filter:
-  ros__parameters:
-    input_topic: /local_costmap/costmap_raw
-    output_topic: /vlm_nav/behavior_costmap_raw
-    enabled: true
-    # A lethal cell is retained only when this many lethal cells exist inside
-    # the metric-radius neighborhood. With a 0.05 m map, the defaults ignore
-    # isolated one- or two-cell returns while retaining denser obstacles.
-    neighborhood_radius: 0.20
-    min_occupied_cells: 3
-    lethal_cost: 254
+    output_topic: /vlm_nav/obstacle_cloud
+    target_frame: base_link
+    # TODO(real-robot calibration): validate queue depth at the actual cloud rate.
+    tf_queue_size: 20
+    use_sim_time: false
+    # TODO(real-robot calibration): validate both height limits on the robot.
+    min_height: 0.05
+    max_height: 1.50
+    # TODO(real-robot calibration): validate all six self CropBox boundaries.
+    # This box is independent of the Nav2 footprint and has no implicit padding.
+    self_crop_min_x: -0.36
+    self_crop_max_x: 0.36
+    self_crop_min_y: -0.25
+    self_crop_max_y: 0.25
+    self_crop_min_z: 0.05
+    self_crop_max_z: 1.50
+    # TODO(real-robot calibration): validate the initial 0.05 m voxel leaf.
+    voxel_leaf_size: 0.05
+    # diagnostic_updater owns an independent periodic timer. The cloud callback
+    # only updates its statistics snapshot.
+    diagnostic_updater.period: 1.0
 
 vlm_nav:
   ros__parameters:
@@ -56,9 +53,9 @@ vlm_nav:
     clear_costmap_on_arm: true
     global_costmap_clear_service: /global_costmap/clear_entirely_global_costmap
     local_costmap_clear_service: /local_costmap/clear_entirely_local_costmap
-    # Do not issue the first Spin until the behavior server's filtered costmap
+    # Do not issue the first Spin until the behavior server's local costmap
     # has published a frame newer than both clear-service completions.
-    behavior_costmap_topic: /vlm_nav/behavior_costmap_raw
+    behavior_costmap_topic: /local_costmap/costmap_raw
     initial_costmap_refresh_timeout: 3.0
     stop_cmd_topic: /cmd_vel
     vlm_sample_rate: 2.0
@@ -92,22 +89,19 @@ vlm_nav:
     max_waypoint_distance: 2.50
     max_ground_height: 0.35
     free_snap_distance: 0.25
-    # Unknown standoff cells are provisional: Nav2 must still produce a path,
-    # known obstacles retain veto power, and every /map update revalidates the
-    # active endpoint.
+    # Legacy target_probe map classification only. Target approach candidates
+    # are validated by ComputePathToPose and NavigateToPose instead.
     allow_unknown_standoff: true
-    # A parking candidate is checked with the oriented robot footprint. One or
-    # two occupied map cells inside it are sparse noise; three or more veto it.
+    # Legacy target_probe helper only; do not use these values to veto approach.
     standoff_footprint_length: 0.72
     standoff_footprint_width: 0.50
     standoff_min_occupied_cells: 3
     standoff_occupied_threshold: 50
-    standoff_candidate_wait_timeout: 10.0
     target_clearance: 0.50
     robot_front_extent: 0.36
     approach_goal_margin: 0.05
     # Try the nominal 0.81 m parking ring first, then a degraded 1.01 m ring.
-    # Every ring keeps the same map-clearance and Nav2 path safety checks.
+    # Each raw candidate is offered to Nav2 in order; no occupancy-grid snap.
     standoff_radius_offsets: [0.0, 0.20]
     # Opt-in profile used only by easy_case.launch.py. It bypasses VLM
     # waypoints, standoff-map classification, and frontier exploration.

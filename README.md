@@ -26,8 +26,11 @@ RGB + aligned depth + CameraInfo
                          │
                     Nav2 /cmd_vel
 
-Livox → FAST_LIO → /cloud_registered_body → 车体尺度稀疏点过滤
-      → /vlm_nav/filtered_obstacle_cloud → /scan → SLAM Toolbox → /map
+Livox → FAST_LIO → /cloud_registered_body → tf2 转到 base_link
+      → PCL PassThrough → CropBox(negative) → VoxelGrid
+      → /vlm_nav/obstacle_cloud
+           ├→ Nav2 global ObstacleLayer / local VoxelLayer
+           └→ /scan → SLAM Toolbox → /map
 ```
 
 ## 安装与构建
@@ -45,7 +48,7 @@ source VLM_Nav/install/setup.bash
 
 启动脚本使用 `/home/isee-cdh/ws/VLM_Nav/install`。修改源码后必须重新构建该
 安装目录并重启旧的 launch 进程；启动器会在打开终端前检查
-`sparse_obstacle_filter` 是否存在，避免旧 overlay 静默覆盖新版本。
+`obstacle_cloud_filter` 是否存在，避免旧 overlay 静默覆盖新版本。
 
 API 凭据只能放在环境变量中：
 
@@ -225,10 +228,9 @@ ros2 topic echo (接口)
 - 地图标记：`/vlm_nav/markers`
 - VLM 像素调试图：`/vlm_nav/debug_image`
 - 延迟、丢帧和错误计数：`/vlm_nav/diagnostics`
-- Spin 稀疏过滤代价地图：`/vlm_nav/behavior_costmap_raw`
-- 稀疏过滤统计：`/sparse_costmap_filter/status`
-- 规划用过滤点云：`/vlm_nav/filtered_obstacle_cloud`
-- 障碍点过滤统计：`/sparse_obstacle_filter/status`
+- 标准 Behavior Server 代价地图：`/local_costmap/costmap_raw`
+- 规划/建图共用障碍点云：`/vlm_nav/obstacle_cloud`
+- 点云过滤诊断：`/diagnostics`（硬件 ID `obstacle_cloud_filter`）
 - Nav2 动作：`/compute_path_to_pose`、`/navigate_to_pose`、`/spin`
 
 每次 ARM（`enabled` 从 `false` 切到 `true`）会建立一个独立的排障目录。
@@ -289,39 +291,36 @@ VLM 路径点截取 `2m` 内的中继点；若路径点也超出量程，则沿�
 后重新执行 8 方向扫描。RViz 的 `VLM Frontier Map`、`VLM Scan Montage` 和
 MarkerArray 会显示候选编号、VLM 选择、完整路径、已承诺半段和复评点。
 
-`max_travel_radius` 是每次 Nav2 规划的滚动执行半径，不是整个任务相对启动点的
-累计活动范围。若 Nav2 验证通过的目标接近路径或前沿路径离开本轮圆形窗口，
-节点在第一次越界处插值截断，只执行圆内路径；到达检查点后等待一帧更新的 VLM
-结果，再以当前位置为新圆心规划下一段。初始任务原点只保留用于累计距离诊断。
+`max_travel_radius` 继续约束 waypoint 和 frontier 的滚动执行范围。目标
+standoff 是例外：每个原始候选 G 先交给 `ComputePathToPose(G)`，首个成功且
+非空的路径会直接执行 `NavigateToPose(G)`，不会把路径截断后生成另一个 B。
 
-FAST_LIO 点云在进入 SLAM 和 Nav2 前先执行车体尺度稀疏过滤。默认把 XY 平面按
-`0.05m` 栅格去重，并对每个障碍格统计车体大小 `0.72m × 0.50m` 窗口内的
-障碍格数：少于 3 格的单点/双点返回视为噪声，3 格及以上保留为真实障碍。
-SLAM、全局/局部规划器和控制器都订阅过滤后的
-`/vlm_nav/filtered_obstacle_cloud`，因此噪声点不会阻止通过或目标停靠。
+FAST_LIO 点云在进入 SLAM 和 Nav2 前只执行标准预处理：按点云时间等待
+`body → base_link` TF、`pcl_ros::transformPointCloud`、PCL z PassThrough、
+negative CropBox 自身剔除及 VoxelGrid。没有 XY 邻域、离群点、聚类、时序或
+自定义 range 判定。range 仍由 Nav2 observation source 和
+pointcloud_to_laserscan 控制。高度、CropBox 六边界与 `0.05m` voxel 都是初始值，
+必须实机校准。Behavior Server 直接读取 `/local_costmap/costmap_raw`，不再复制
+或改写 Nav2 costmap。
 
-停靠候选还会按面向目标的实际停车朝向，用 `0.72m × 0.50m` 车体 footprint
-复核占据地图。footprint 内少于 3 个占用格时仍接受该停靠区域，不再因单点或
-双点噪声把停靠点标为不可靠；达到 3 格时才否决。对应参数为
-`standoff_footprint_length`、`standoff_footprint_width` 和
-`standoff_min_occupied_cells`。地图边界、未知区域策略和 Nav2 路径验证仍然
-有效。
+目标 approach 不再用 `/map`、自定义 footprint 或三格阈值否决候选；最终几何
+可达性由 Nav2 决定。`/map` 仍服务 SLAM、frontier 与 free/occupied/unknown
+语义。`target_probe` 暂时仍复用旧的地图分类 helper，留待后续单独清理。
 
-Spin 另外使用 `/vlm_nav/behavior_costmap_raw` 做末端兜底过滤。点云过滤参数位于
-`config/robot.yaml` 的 `sparse_obstacle_filter` 段，代价地图过滤参数位于
-`sparse_costmap_filter` 段。实车运行时可检查：
+### 首次实机障碍链验收
 
 ```bash
-ros2 topic echo /sparse_costmap_filter/status
-ros2 topic echo /sparse_obstacle_filter/status
-ros2 topic hz /vlm_nav/filtered_obstacle_cloud
-ros2 topic hz /vlm_nav/behavior_costmap_raw
+ros2 topic info -v /cloud_registered_body
+ros2 run tf2_ros tf2_echo base_link body
+ros2 topic hz /vlm_nav/obstacle_cloud
+ros2 topic echo /diagnostics
 ros2 param get /behavior_server costmap_topic
 ```
 
-最后一条应返回 `/vlm_nav/behavior_costmap_raw`。点云状态中的
-`removed_points` 表示本帧规划链路忽略的稀疏返回；代价地图状态中的
-`lethal_cells_removed` 表示 Spin 兜底过滤移除的致命栅格数。
+源 topic 的 QoS 必须与 sensor-data subscriber 兼容。`base_link ↔ body` 必须持续
+存在、数值稳定并表示固定刚体关系；若缺失、漂移或异常，应停止 filter 调参，
+单独处理 FAST-LIO TF 架构。第一次验证必须从新的 SLAM Toolbox 建图会话开始，
+不加载或复用旧地图，避免旧 `/map` 噪声经 global StaticLayer 继续影响规划。
 
 ## 测试
 
@@ -346,6 +345,19 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   PYTHONPATH=.:${PYTHONPATH:-} \
   python3 -m pytest -q test
 ```
+
+Humble 环境中的完整构建和 CTest/pytest 注册验证：
+
+```bash
+colcon build --base-paths VLM_Nav0 --packages-select vlm_nav --symlink-install
+colcon test --packages-select vlm_nav --event-handlers console_direct+
+colcon test-result --verbose
+python3 -m pytest -q VLM_Nav0/test
+```
+
+后续 TODO：评估 Co-NavGPT2 的 `mask + depth → object point cloud` 目标定位方法，
+用于未来替换当前单 pixel 深度定位；本阶段不迁移其 obstacle_map、FMMPlanner 或
+离散运动栈。`easy_case` 历史代码清理也留到后续 legacy cleanup。
 
 上线顺序应为：离线测试 → ROS bag/假 VLM → 实时传感器但不使能 →
 手动 Nav2 → 封闭空旷区域低速 ARM。Livox 无法可靠检测台阶落差，测试区域

@@ -108,8 +108,8 @@ source "${script_dir}/common.sh"
 vlm_nav_prefix="$(ros2 pkg prefix vlm_nav 2>/dev/null || true)"
 if [[ -z "$vlm_nav_prefix" ]] \
   || ! ros2 pkg executables vlm_nav 2>/dev/null \
-    | awk '$2 == "sparse_obstacle_filter" { found=1 } END { exit !found }'; then
-  echo "错误：当前 ROS overlay 中缺少 vlm_nav/sparse_obstacle_filter。" >&2
+    | awk '$2 == "obstacle_cloud_filter" { found=1 } END { exit !found }'; then
+  echo "错误：当前 ROS overlay 中缺少 vlm_nav/obstacle_cloud_filter。" >&2
   echo "当前 vlm_nav 前缀：${vlm_nav_prefix:-未找到}" >&2
   echo "请重新构建 VLM_Nav，并在重启前 source 对应 install/setup.bash。" >&2
   exit 1
