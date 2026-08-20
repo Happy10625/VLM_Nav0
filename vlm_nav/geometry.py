@@ -14,9 +14,17 @@ class TargetTracker:
         self.required_frames = max(1, int(required_frames))
         self.confirmation_radius = float(confirmation_radius)
         self.positions = []
+        self.reset_count = 0
+        self.last_jump_distance = 0.0
+
+    @property
+    def progress(self) -> int:
+        return len(self.positions)
 
     def reset(self):
         self.positions.clear()
+        self.reset_count = 0
+        self.last_jump_distance = 0.0
 
     def update(self, point: Sequence[float]) -> Optional[Tuple[float, ...]]:
         candidate = np.asarray(point, dtype=float)
@@ -24,8 +32,11 @@ class TargetTracker:
             return None
         if self.positions:
             center = np.median(np.asarray(self.positions), axis=0)
-            if np.linalg.norm(candidate[:2] - center[:2]) > self.confirmation_radius:
+            distance = float(np.linalg.norm(candidate[:2] - center[:2]))
+            self.last_jump_distance = distance
+            if distance > self.confirmation_radius:
                 self.positions.clear()
+                self.reset_count += 1
         self.positions.append(tuple(float(value) for value in candidate))
         self.positions = self.positions[-self.required_frames :]
         if len(self.positions) < self.required_frames:
@@ -369,28 +380,6 @@ def select_frontier(grid: np.ndarray, robot_cell: Sequence[int], min_cells: int 
         key=lambda cluster: len(cluster["cells"]) - 0.35 * cluster["distance_cells"],
     )
     return selected, clusters
-
-
-def approach_goal_radius(clearance: float, front_extent: float, margin: float) -> float:
-    return max(0.05, float(clearance) + float(front_extent) - float(margin))
-
-
-def standoff_candidates(
-    target_xy: Sequence[float],
-    robot_xy: Sequence[float],
-    radius: float,
-    samples: int = 16,
-):
-    """Return poses on a target-facing ring, nearest-to-robot first."""
-    poses = []
-    for index in range(max(4, int(samples))):
-        angle = 2.0 * math.pi * index / max(4, int(samples))
-        x = float(target_xy[0]) + radius * math.cos(angle)
-        y = float(target_xy[1]) + radius * math.sin(angle)
-        yaw = math.atan2(float(target_xy[1]) - y, float(target_xy[0]) - x)
-        distance = math.hypot(x - float(robot_xy[0]), y - float(robot_xy[1]))
-        poses.append((x, y, yaw, distance))
-    return sorted(poses, key=lambda pose: pose[3])
 
 
 def normalize_angle(angle: float) -> float:

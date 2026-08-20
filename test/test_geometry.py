@@ -3,14 +3,12 @@ import math
 import numpy as np
 
 from vlm_nav.geometry import (
-    approach_goal_radius,
     classify_standoff_cell,
     depth_at_pixel,
     depth_at_pixel_with_reason,
     project_pixel,
     select_frontier,
     snap_to_free_cell,
-    standoff_candidates,
     TargetTracker,
 )
 
@@ -199,16 +197,6 @@ def test_frontier_selection_only_uses_reachable_free_space():
     assert clusters
 
 
-def test_standoff_radius_preserves_half_metre_front_clearance():
-    radius = approach_goal_radius(0.50, 0.36, 0.05)
-    assert math.isclose(radius, 0.81)
-    candidates = standoff_candidates((5.0, 5.0), (3.0, 5.0), radius, samples=8)
-    assert len(candidates) == 8
-    for x, y, yaw, _ in candidates:
-        assert math.isclose(math.hypot(x - 5.0, y - 5.0), 0.81)
-        assert math.isclose(yaw, math.atan2(5.0 - y, 5.0 - x))
-
-
 def test_target_requires_three_spatially_consistent_observations():
     tracker = TargetTracker(required_frames=3, confirmation_radius=0.35)
     assert tracker.update((1.0, 2.0, 0.4)) is None
@@ -217,3 +205,16 @@ def test_target_requires_three_spatially_consistent_observations():
     assert np.allclose(confirmed, (1.0, 2.0, 0.45))
     # A distant observation starts a new confirmation window.
     assert tracker.update((3.0, 3.0, 0.4)) is None
+
+
+def test_target_tracker_reports_progress_and_inconsistent_reset_distance():
+    """Catch silent confirmation-window resets that look like a hung state."""
+    tracker = TargetTracker(required_frames=3, confirmation_radius=0.35)
+
+    tracker.update((1.0, 2.0, 0.4))
+    tracker.update((1.1, 2.0, 0.5))
+    tracker.update((2.0, 2.0, 0.4))
+
+    assert tracker.progress == 1
+    assert tracker.reset_count == 1
+    assert math.isclose(tracker.last_jump_distance, 0.95)

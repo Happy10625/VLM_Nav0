@@ -69,6 +69,9 @@ vlm_nav:
     api_failure_limit: 3
     confirm_frames: 3
     confirmation_radius: 0.35
+    # Do not remain silently stopped forever when grounded target positions
+    # cannot form a spatially consistent confirmation window.
+    target_confirmation_timeout: 20.0
     target_lost_timeout: 10.0
     depth_neighborhood_radius: 5
     min_depth_samples: 8
@@ -82,32 +85,30 @@ vlm_nav:
     depth_reobserve_angle_deg: 10.0
     depth_reobserve_attempt_limit: 3
     # If the target remains outside reliable depth range, approach one safe
-    # intermediate point and observe again instead of grounding it directly.
+    # target-ray observation subgoal and observe again. Raw candidates go
+    # directly to Nav2; no occupancy-grid snap or footprint heuristic is used.
     target_probe_distance: 2.0
     target_probe_attempt_limit: 3
-    min_waypoint_distance: 0.30
-    max_waypoint_distance: 2.50
+    target_probe_min_distance: 0.30
     max_ground_height: 0.35
-    free_snap_distance: 0.25
-    # Legacy target_probe map classification only. Target approach candidates
-    # are validated by ComputePathToPose and NavigateToPose instead.
-    allow_unknown_standoff: true
-    # Legacy target_probe helper only; do not use these values to veto approach.
-    standoff_footprint_length: 0.72
-    standoff_footprint_width: 0.50
-    standoff_min_occupied_cells: 3
-    standoff_occupied_threshold: 50
-    target_clearance: 0.50
-    robot_front_extent: 0.36
-    approach_goal_margin: 0.05
-    # Try the nominal 0.81 m parking ring first, then a degraded 1.01 m ring.
-    # Each raw candidate is offered to Nav2 in order; no occupancy-grid snap.
-    standoff_radius_offsets: [0.0, 0.20]
-    # Opt-in profile used only by easy_case.launch.py. It bypasses VLM
-    # waypoints, standoff-map classification, and frontier exploration.
+    # The target is a semantic reference point, not a guaranteed geometric
+    # center. Task success requires the stopped base center within this radius.
+    target_success_radius: 0.81
+    # Request NavigateToPose cancellation before the final success boundary;
+    # residual braking motion must still settle inside target_success_radius.
+    approach_cancel_radius: 0.89
+    arrival_odom_topic: /fastlio/odom
+    arrival_linear_speed_tolerance: 0.03
+    arrival_angular_speed_tolerance: 0.05
+    arrival_stationary_samples: 3
+    arrival_odom_max_age: 0.5
+    arrival_cancel_timeout: 3.0
+    arrival_stop_timeout: 5.0
+    arrival_retry_limit: 1
+    # Opt-in profile used only by easy_case.launch.py. It keeps alignment and
+    # straight-path validation while sharing the target-reference arrival contract.
     easy_case_mode: false
     easy_case_timeout: 120.0
-    easy_case_standoff_distance: 0.81
     easy_case_alignment_tolerance: 0.10
     easy_case_max_path_deviation: 0.10
     scan_first: true

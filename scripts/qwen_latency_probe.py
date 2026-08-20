@@ -13,7 +13,7 @@ from cv_bridge import CvBridge
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 
-from vlm_nav.vlm_client import OpenAICompatibleVLMClient, overlay_coordinate_grid
+from vlm_nav.vlm_client import OpenAICompatibleVLMClient
 from vlm_nav.exploration import render_frontier_map, scan_montage
 from vlm_nav.models import FrontierCandidate
 
@@ -48,10 +48,9 @@ def receive_frame(topic: str, wait_seconds: float):
 
 
 def encoded_size(rgb, jpeg_quality: int):
-    annotated = overlay_coordinate_grid(rgb, normalized_1000=True)
     ok, encoded = cv2.imencode(
         ".jpg",
-        cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR),
+        cv2.cvtColor(np.ascontiguousarray(rgb), cv2.COLOR_RGB2BGR),
         [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality],
     )
     if not ok:

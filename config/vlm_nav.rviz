@@ -158,7 +158,7 @@ Visualization Manager:
       Value: false
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
-      Name: VLM TARGET / PATH (red / green)
+      Name: VLM TARGET (red)
       Namespaces:
         {}
       Topic:

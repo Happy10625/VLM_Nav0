@@ -73,6 +73,7 @@ def test_all_obstacle_consumers_share_the_filtered_cloud_and_height_range():
     assert global_cloud["topic"] == OBSTACLE_TOPIC
     assert local_cloud["topic"] == OBSTACLE_TOPIC
     for source in (global_cloud, local_cloud):
+        assert source["sensor_frame"] == "body"
         assert source["min_obstacle_height"] == 0.05
         assert source["max_obstacle_height"] == 1.50
 
@@ -98,6 +99,30 @@ def test_behavior_server_and_arm_refresh_use_standard_local_costmap():
     )
     assert '"behavior_costmap_topic": "/local_costmap/costmap_raw"' in navigator
     assert "/vlm_nav/behavior_costmap_raw" not in navigator
+
+
+def test_standoff_candidate_visualization_parameter_is_removed():
+    robot = yaml.safe_load((ROOT / "config" / "robot.yaml").read_text())
+
+    assert "debug_show_standoff_candidates" not in robot["vlm_nav"]["ros__parameters"]
+
+
+def test_target_probe_config_has_no_vlm_waypoint_or_map_heuristic_parameters():
+    robot = yaml.safe_load((ROOT / "config" / "robot.yaml").read_text())
+    params = robot["vlm_nav"]["ros__parameters"]
+
+    assert params["target_probe_min_distance"] == 0.30
+    for removed in (
+        "min_waypoint_distance",
+        "max_waypoint_distance",
+        "free_snap_distance",
+        "allow_unknown_standoff",
+        "standoff_footprint_length",
+        "standoff_footprint_width",
+        "standoff_min_occupied_cells",
+        "standoff_occupied_threshold",
+    ):
+        assert removed not in params
 
 
 def test_package_declares_cpp_dependencies_and_pcl_filters_component():
@@ -127,6 +152,7 @@ def test_every_python_test_is_registered_with_ament_cmake_pytest():
         "test_pipeline.py",
         "test_vlm_client.py",
         "test_obstacle_chain_config.py",
+        "test_obstacle_cloud_filter_runtime.py",
     }
     registered = set(
         re.findall(r"ament_add_pytest_test\([^\s]+\s+test/([^\s\)]+)", cmake)

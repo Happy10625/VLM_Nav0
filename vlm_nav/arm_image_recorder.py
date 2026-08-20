@@ -9,7 +9,6 @@ import cv2
 import numpy as np
 
 from .models import FrontierDecision, VLMResult
-from .vlm_client import overlay_coordinate_grid
 
 
 class ArmImageRecorder:
@@ -54,26 +53,7 @@ class ArmImageRecorder:
             shutil.rmtree(entry.path)
 
     @staticmethod
-    def draw_target_path(image, result):
-        points = [(pixel.u, pixel.v) for pixel in result.waypoints]
-        if result.target_pixel is not None:
-            points.append((result.target_pixel.u, result.target_pixel.v))
-        for start, end in zip(points, points[1:]):
-            cv2.arrowedLine(
-                image, start, end, (255, 255, 0), 4, cv2.LINE_AA, tipLength=0.12
-            )
-        for index, pixel in enumerate(result.waypoints):
-            cv2.circle(image, (pixel.u, pixel.v), 9, (0, 255, 0), -1, cv2.LINE_AA)
-            cv2.putText(
-                image,
-                f"W{index + 1}",
-                (pixel.u + 11, pixel.v - 5),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.58,
-                (0, 255, 0),
-                2,
-                cv2.LINE_AA,
-            )
+    def draw_target_annotation(image, result):
         if result.target_pixel is not None:
             target = (result.target_pixel.u, result.target_pixel.v)
             cv2.circle(image, target, 12, (255, 0, 0), 3, cv2.LINE_AA)
@@ -84,6 +64,28 @@ class ArmImageRecorder:
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.58,
                 (255, 0, 0),
+                2,
+                cv2.LINE_AA,
+            )
+        if result.evidence_pixel is not None:
+            evidence = (result.evidence_pixel.u, result.evidence_pixel.v)
+            cv2.circle(image, evidence, 11, (255, 0, 255), 3, cv2.LINE_AA)
+            cv2.drawMarker(
+                image,
+                evidence,
+                (255, 0, 255),
+                cv2.MARKER_CROSS,
+                15,
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                image,
+                "EVIDENCE",
+                (evidence[0] + 14, evidence[1] + 18),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.52,
+                (255, 0, 255),
                 2,
                 cv2.LINE_AA,
             )
@@ -141,15 +143,9 @@ class ArmImageRecorder:
                     self._write_rgb(map_path, map_image)
                     saved.append(map_path)
             else:
-                normalized = (
-                    isinstance(result, VLMResult)
-                    and result.coordinate_mode == "normalized_1000"
-                )
-                image = overlay_coordinate_grid(
-                    snapshot.rgb, normalized_1000=normalized
-                )
+                image = np.ascontiguousarray(snapshot.rgb.copy())
                 if isinstance(result, VLMResult):
-                    self.draw_target_path(image, result)
+                    self.draw_target_annotation(image, result)
                 path = os.path.join(self.session_path, prefix + ".jpg")
                 self._write_rgb(path, image)
                 saved.append(path)

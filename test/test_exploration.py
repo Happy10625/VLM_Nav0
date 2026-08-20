@@ -4,7 +4,6 @@ import pytest
 from vlm_nav.exploration import (
     clip_polyline_to_length,
     clip_polyline_to_radius,
-    direct_standoff_goal,
     max_polyline_deviation,
     render_frontier_map,
     sample_polyline,
@@ -67,12 +66,6 @@ def test_polyline_arc_length_prefix_interpolates_inside_an_edge():
 
     assert travelled == pytest.approx(2.0)
     assert clipped[-1] == pytest.approx((1.0, 1.0))
-
-
-def test_easy_case_direct_standoff_goal_faces_target():
-    goal = direct_standoff_goal((0.0, 0.0, 1.2), (2.0, 0.0), 0.81)
-
-    assert goal == pytest.approx((1.19, 0.0, 0.0, 2.0))
 
 
 def test_easy_case_path_deviation_measures_lateral_detour():

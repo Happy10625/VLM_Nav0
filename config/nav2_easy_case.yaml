@@ -41,7 +41,8 @@ planner_server:
     planner_plugins: ["GridBased"]
     GridBased:
       plugin: "nav2_navfn_planner/NavfnPlanner"
-      tolerance: 0.10
+      tolerance: 0.76
+      use_final_approach_orientation: true
       use_astar: false
       allow_unknown: true
 
@@ -56,9 +57,8 @@ controller_server:
       required_movement_radius: 0.05
       movement_time_allowance: 20.0
     general_goal_checker:
-      plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.12
-      yaw_goal_tolerance: 0.20
+      plugin: "nav2_controller::PositionGoalChecker"
+      xy_goal_tolerance: 0.05
       stateful: true
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
@@ -84,7 +84,7 @@ controller_server:
       linear_granularity: 0.05
       angular_granularity: 0.025
       transform_tolerance: 0.50
-      xy_goal_tolerance: 0.12
+      xy_goal_tolerance: 0.05
       trans_stopped_velocity: 0.03
       short_circuit_trajectory_evaluation: true
       stateful: true

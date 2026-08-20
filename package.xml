@@ -2,7 +2,7 @@
 <package format="3">
   <name>vlm_nav</name>
   <version>0.1.0</version>
-  <description>RGB-D VLM waypoint grounding with FAST_LIO, SLAM Toolbox, and Nav2.</description>
+  <description>RGB-D VLM target grounding with FAST_LIO, SLAM Toolbox, and Nav2.</description>
   <maintainer email="robot@example.com">robot</maintainer>
   <license>MIT</license>
 

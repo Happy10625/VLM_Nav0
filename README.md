@@ -1,8 +1,8 @@
 # VLM_Nav
 
 独立的 ROS 2 Humble 视觉语言导航包。它读取 RealSense 对齐 RGB-D，
-把带像素坐标网格的 RGB 图像发送给 OpenAI 兼容 VLM，将返回的目标/地面
-像素结合深度和图像时刻 TF 投影到 `map`，再通过 Nav2 的路径规划与导航
+把原始 RGB 图像发送给 OpenAI 兼容 VLM，将返回的目标/语义证据像素结合
+深度和图像时刻 TF 投影到 `map`，再通过 Nav2 的路径规划与导航
 动作控制 Ranger。VLM 从不直接产生速度命令。
 
 本目录借鉴 `Co-NavGPT2` 和其中的 `co_nav2_nav`，但运行和构建不要求修改
@@ -71,9 +71,11 @@ export DASHSCOPE_BASE_URL="https://你的业务空间ID.cn-beijing.maas.aliyuncs
 `qwen3-vl-flash`，使用非流式 JSON 输出并显式设置
 `enable_thinking=false`，避免推理内容增加导航延迟。旧的
 `OPENAI_API_KEY`、`OPENAI_BASE_URL` 和 `OPENAI_MODEL` 仍保留为兼容回退。
-Qwen3-VL 的目标和路径点使用 0～1000 归一化坐标，节点校验后转换为相机
-真实像素；其他兼容模型仍使用实际像素坐标。发送图和 RViz 调试图中的坐标网格
-会随模型使用相同坐标制。
+发送给 VLM 的图片、ARM 记录图和 RViz 调试图均不绘制坐标栅格。Qwen3-VL
+按照其原生 0～1000 相对坐标返回目标与语义证据位置，节点将其换算成相机图像的
+实际像素后再做标注、深度查询和导航；例如 1280×720 图像最终使用
+`u=0～1279`、`v=0～719`。其他兼容模型直接返回实际像素坐标。节点也兼容
+Qwen 偶发返回的严格二元素坐标数组 `[u,v]`，换算后仍执行整数类型和边界校验。
 
 相机运行后，可使用实机 RGB 帧连续测试图片约束、JSON 响应和端到端延迟：
 
@@ -88,6 +90,14 @@ python3 /home/isee-cdh/ws/VLM_Nav/scripts/qwen_latency_probe.py \
 选择，并独立打印成功率及延迟统计。
 
 ## 启动
+
+### 启动总步骤
+
+启动共三步：
+
+- 启动硬件
+- 启动建图和导航
+- ARM开启实验
 
 ### 启动相机、底盘、雷达和 FAST_LIO
 
@@ -118,61 +128,27 @@ cd /home/isee-cdh/ws
 ```bash
 cd /home/isee-cdh/ws
 unset ALL_PROXY all_proxy
-./VLM_Nav/scripts/start_navigation_validation.sh "chair"
+./VLM_Nav/scripts/start_navigation_validation.sh "放置了可乐的椅子"
 ```
 
 该脚本始终以 `enabled=false` 启动 VLM_Nav，并拒绝重复启动已有的
 `/vlm_nav` 节点。
 
-### 椅子直达 Easy Case
-
-完全清空且封闭的测试场地可使用独立的直达入口：
-
-```bash
-cd /home/isee-cdh/ws
-unset ALL_PROXY all_proxy
-./VLM_Nav/scripts/start_easy_case_validation.sh "chair"
-```
-
-该入口同样以 `enabled=false` 启动，但将 `easy_case_mode` 设为 `true`，
-并使用 `config/nav2_easy_case.yaml`。全局和局部 costmap 均为滚动空白地图且
-`plugins: []`，因此不会避让人、物体、墙、台阶或坑洞。Livox、FAST_LIO 和
-SLAM 仍运行，只用于定位、TF 和地图观测。
-
-ARM 前除通用检查外，应确认：
-
-```bash
-ros2 param get /vlm_nav easy_case_mode
-ros2 param get /global_costmap/global_costmap plugins
-ros2 param get /local_costmap/local_costmap plugins
-```
-
-预期依次为 `True`、`[]`、`[]`。Easy Case 采用
-`SCANNING → TARGET_CONFIRMING → TARGET_ALIGNING → APPROACHING → SUCCEEDED`：
-三帧确认后先通过 Spin 正对椅子，再忽略 VLM 中间 waypoints 和地图停靠点分类，
-将车体中心导航到距椅子约 `0.81m` 的唯一停靠点，使车头距椅子约 `0.50m`。
-Nav2 规划路径横向偏离直线超过 `0.10m` 时拒绝执行。完整扫描没有找到目标、
-对准失败、直线路径失败、目标丢失或任务超过 `120s` 均直接进入 `FAILED`，
-不会进入前沿探索。
-
-此模式仅用于 easy case：场地必须完全清空，并物理隔离楼梯、坑洞和平台边缘；
-必须保证实体急停可用并全程有人监护。`easy_case_mode` 只能在
-`enabled=false` 时修改，普通的 `start_navigation_validation.sh` 不受影响。
-
-如果还要启动Rviz:
-
-```bash
-/home/isee-cdh/ws/VLM_Nav/scripts/start_rviz.sh
-```
-
 首次使用必须校准 `config/robot.yaml` 中的雷达/车体外参，以及
 `vlm_navigation.launch.py` 中的相机静态外参。若相机驱动已经发布同一静态
 TF，请使用 `publish_camera_tf:=false`，避免重复 TF 发布者。
+
+### 检查与ARM实验
 
 保持停车状态执行检查：
 
 ```bash
 VLM_Nav/scripts/check_system.sh
+
+# 对于TF时间戳问题，着重测试
+ros2 topic hz /livox/imu
+ros2 topic hz /Odometry
+ros2 run tf2_ros tf2_echo camera_init body
 ```
 
 该脚本除节点、话题和 TF 外，还会从实时相机取一帧发起真实 VLM 请求，
@@ -233,16 +209,17 @@ ros2 topic echo (接口)
 - 点云过滤诊断：`/diagnostics`（硬件 ID `obstacle_cloud_filter`）
 - Nav2 动作：`/compute_path_to_pose`、`/navigate_to_pose`、`/spin`
 
+地图标记显示 VLM 目标参考位置、Nav2 目标和已验证路径；不再生成或显示停靠环候选。
+
 每次 ARM（`enabled` 从 `false` 切到 `true`）会建立一个独立的排障目录。
-每次 VLM 请求完成后，节点保存发送给 VLM 的图片，并在图片上叠加 VLM
-给出的路径：
+每次 VLM 请求完成后，节点保存发送给 VLM 的图片，并叠加目标与语义证据标记：
 
 ```text
 ~/.ros/vlm_nav/arm_records/arm_YYYYmmdd_HHMMSS_ffffff/
 ```
 
-目标图片中的 `W1`、`W2`、`W3` 按 VLM 返回顺序标记，黄色箭头连接到
-`TARGET`；前沿请求会同时保存场景图和地图图，地图上的绿色箭头标出
+目标图片标记 `TARGET` 和 `EVIDENCE`；前沿请求会同时保存场景图和地图图，
+地图上的绿色箭头标出
 `ROBOT -> FRONTIER N`。文件名包含请求序号、请求类型和处理结论，便于把
 误识别、过期结果或 API 错误与现场画面对齐。
 
@@ -264,23 +241,22 @@ ros2 topic echo (接口)
 
 - `Camera RGB (live)`：相机原始 RGB 实时画面，不依赖 VLM 是否启用；
 - 红色球体和文字：VLM 识别并经 RGB-D 投影后的目标；
-- 绿色圆柱：VLM 给出的可行地面导航点；
-- 青色连线：按近到远连接导航点并最终指向目标；
 - 车体上方黄色文字：目标描述、导航状态、处理结论、置信度和 API 延迟；
-- `VLM Annotated Image`：带目标像素及路径点编号的原始相机图。
+- `VLM Annotated Image`：带目标和语义证据像素标记的原始相机图。
 
 状态包括 `DISARMED`、`SCANNING`、`FRONTIER_SELECTING`、`EXPLORING`、
 `TARGET_CONFIRMING`、`TARGET_REOBSERVING`、`TARGET_ALIGNING`、
-`APPROACHING`、`SENSOR_WAITING`、`SUCCEEDED`、`API_ERROR` 和 `FAILED`。
-连续三次 API 失败、TF 超时或 Nav2 失败都会取消运动并发送零速度。滚动检查点
-未重新看到目标时，节点会恢复 8 方向扫描和前沿探索，而不是立即结束任务。
+`APPROACHING`、`APPROACH_STOPPING`、`SENSOR_WAITING`、`SUCCEEDED`、`API_ERROR` 和 `FAILED`。
+连续三次 API 失败、TF 超时或 Nav2 失败都会取消运动并发送零速度。
 
 目标像素的深度稀疏或混杂时，节点进入 `TARGET_REOBSERVING`，按照 VLM 目标
 像素的方位做最多 `10°` 的小角度 Spin，停车稳定后重新获取 RGB-D 与 VLM
-结果。连续三次仍不能取得可靠深度，或目标深度明确超过 `6m` 时，节点优先从
-VLM 路径点截取 `2m` 内的中继点；若路径点也超出量程，则沿目标像素射线生成
-逐渐变近的候选点。候选点必须先通过占据地图检查和 Nav2 路径验证，到达后重新
-观测目标，最多执行三次中继接近。
+结果。连续三次仍不能取得可靠深度，或目标深度明确超过 `6m` 时，仅在目标尚未
+可靠落地并完成三帧确认前，节点沿目标像素射线生成最远 `2m` 的主动观察
+subgoal。候选点不经过占据地图吸附、footprint 或邻域启发式，最终可达性完全由
+Nav2 `ComputePathToPose` 决定；到达后停车重新观测，最多执行三次中继接近。
+目标参考位置一旦确认，后续深度暂时失败也不会再插入 subgoal，而是直接继续
+对该参考位置进行规划。
 
 完整扫描未找到目标后，SLAM 占据栅格只负责生成安全、可达的前沿候选。节点把
 8 方向扫描拼图和带编号的前沿地图发送给 Qwen，由 Qwen 返回唯一候选编号、
@@ -291,9 +267,17 @@ VLM 路径点截取 `2m` 内的中继点；若路径点也超出量程，则沿�
 后重新执行 8 方向扫描。RViz 的 `VLM Frontier Map`、`VLM Scan Montage` 和
 MarkerArray 会显示候选编号、VLM 选择、完整路径、已承诺半段和复评点。
 
-`max_travel_radius` 继续约束 waypoint 和 frontier 的滚动执行范围。目标
-standoff 是例外：每个原始候选 G 先交给 `ComputePathToPose(G)`，首个成功且
-非空的路径会直接执行 `NavigateToPose(G)`，不会把路径截断后生成另一个 B。
+`max_travel_radius` 继续约束 target probe 和 frontier 的滚动执行范围。目标接近
+直接以 `target_reference_position` 调用 `ComputePathToPose` 和 `NavigateToPose`，
+不再生成停靠候选，也不会把已验证路径截断成另一个终点。
+
+到目标参考位置的距离首次达到 `0.89m` 以内时，节点先取消当前
+`NavigateToPose`，进入 `APPROACH_STOPPING`。只有动作进入 `CANCELED` 或
+`SUCCEEDED` 终态，并且 `/fastlio/odom` 连续 3 帧满足线速度不超过 `0.03m/s`、
+角速度不超过 `0.05rad/s`，节点才重新读取距离。复核仍不超过 `0.81m` 才进入
+`SUCCEEDED`；Nav2 自行返回成功也必须经过同一复核。第一次复核超界会重新规划
+一次；这次重试允许继续驶入 `0.81m` 成功边界，第二次停车复核仍超界则进入
+`FAILED`。
 
 FAST_LIO 点云在进入 SLAM 和 Nav2 前只执行标准预处理：按点云时间等待
 `body → base_link` TF、`pcl_ros::transformPointCloud`、PCL z PassThrough、
@@ -303,9 +287,9 @@ pointcloud_to_laserscan 控制。高度、CropBox 六边界与 `0.05m` voxel 都
 必须实机校准。Behavior Server 直接读取 `/local_costmap/costmap_raw`，不再复制
 或改写 Nav2 costmap。
 
-目标 approach 不再用 `/map`、自定义 footprint 或三格阈值否决候选；最终几何
-可达性由 Nav2 决定。`/map` 仍服务 SLAM、frontier 与 free/occupied/unknown
-语义。`target_probe` 暂时仍复用旧的地图分类 helper，留待后续单独清理。
+目标 approach 和 target probe 都不使用 `/map`、自定义 footprint、邻域吸附或
+N 格阈值否决候选，最终几何可达性由 Nav2 决定。`/map` 仍服务 SLAM、frontier
+与 free/occupied/unknown 语义；通用地图几何 helper 保留给正式地图流程使用。
 
 ### 首次实机障碍链验收
 

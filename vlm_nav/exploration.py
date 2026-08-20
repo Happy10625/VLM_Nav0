@@ -7,30 +7,6 @@ import cv2
 import numpy as np
 
 
-def direct_standoff_goal(
-    robot_pose: Sequence[float],
-    target_xy: Sequence[float],
-    standoff_radius: float,
-):
-    """Return the straight-line standoff goal facing a stationary target."""
-    robot_x, robot_y = float(robot_pose[0]), float(robot_pose[1])
-    target_x, target_y = float(target_xy[0]), float(target_xy[1])
-    radius = float(standoff_radius)
-    if radius <= 0.0:
-        raise ValueError("standoff_radius must be positive")
-    dx, dy = target_x - robot_x, target_y - robot_y
-    distance = math.hypot(dx, dy)
-    if distance <= 1e-6:
-        raise ValueError("robot and target positions coincide")
-    yaw = math.atan2(dy, dx)
-    return (
-        target_x - radius * dx / distance,
-        target_y - radius * dy / distance,
-        yaw,
-        distance,
-    )
-
-
 def max_polyline_deviation(
     points: Sequence[Sequence[float]],
     start_xy: Sequence[float],

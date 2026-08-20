@@ -30,7 +30,15 @@ def test_worker_has_one_in_flight_and_replaces_pending_with_latest():
     def infer(_image, _target):
         started.set()
         release.wait(timeout=2.0)
-        return VLMResult(False, 0.1, None, ())
+        return VLMResult(
+            target_visible=False,
+            object_match=False,
+            qualifier_match=True,
+            relation_match=True,
+            confidence=0.1,
+            target_pixel=None,
+            evidence_pixel=None,
+        )
 
     worker = LatestFrameWorker(
         infer,

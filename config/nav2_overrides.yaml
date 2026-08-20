@@ -12,7 +12,9 @@ global_costmap:
         observation_sources: fastlio_cloud
         fastlio_cloud:
           topic: /vlm_nav/obstacle_cloud
-          # The preprocessing output is already in base_link.
+          # Points are expressed in base_link after preprocessing, while
+          # raytracing must start at the original FAST_LIO sensor origin.
+          sensor_frame: body
           data_type: PointCloud2
           marking: true
           clearing: true
@@ -27,9 +29,10 @@ global_costmap:
 planner_server:
   ros__parameters:
     GridBased:
-      # Provisional VLM standoff endpoints may be in unknown map cells.
-      # The live obstacle layer and VLM endpoint revalidation still veto
-      # newly observed occupied space.
+      # Reserve 0.05 m for the controller so the combined native Nav2
+      # tolerance cannot exceed the 0.81 m task-success radius.
+      tolerance: 0.76
+      use_final_approach_orientation: true
       allow_unknown: true
 
 local_costmap:
@@ -55,7 +58,9 @@ local_costmap:
         observation_sources: fastlio_cloud
         fastlio_cloud:
           topic: /vlm_nav/obstacle_cloud
-          # The preprocessing output is already in base_link.
+          # Points are expressed in base_link after preprocessing, while
+          # raytracing must start at the original FAST_LIO sensor origin.
+          sensor_frame: body
           data_type: PointCloud2
           marking: true
           clearing: true
@@ -69,16 +74,16 @@ local_costmap:
 
 controller_server:
   ros__parameters:
+    goal_checker_plugins: ["general_goal_checker"]
     general_goal_checker:
-      # Ignore the RViz goal arrow once the base center is within 0.25 m.
-      xy_goal_tolerance: 0.25
-      yaw_goal_tolerance: 3.141592653589793
+      plugin: "nav2_controller::PositionGoalChecker"
+      xy_goal_tolerance: 0.05
       stateful: true
     FollowPath:
       max_vel_x: 0.20
       max_vel_theta: 0.40
-      xy_goal_tolerance: 0.25
-      trans_stopped_velocity: 0.05
+      xy_goal_tolerance: 0.05
+      trans_stopped_velocity: 0.03
     progress_checker:
       required_movement_radius: 0.10
       movement_time_allowance: 15.0

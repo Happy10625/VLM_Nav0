@@ -5,6 +5,7 @@ from dataclasses import replace
 import json
 import math
 import queue
+import threading
 import time
 from types import SimpleNamespace
 
@@ -18,7 +19,7 @@ from message_filters import ApproximateTimeSynchronizer, Subscriber
 from nav2_msgs.action import ComputePathToPose, NavigateToPose, Spin
 from nav2_msgs.msg import Costmap
 from nav2_msgs.srv import ClearEntireCostmap
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Odometry
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.action import ActionClient
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
@@ -39,16 +40,12 @@ from tf2_ros import Buffer, TransformException, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
 
 from .geometry import (
-    approach_goal_radius,
-    classify_standoff_cell,
     depth_at_pixel_with_reason,
     grid_to_world,
     normalize_angle,
     project_pixel,
     scan_yaws,
     select_frontier,
-    snap_to_free_cell,
-    standoff_candidates,
     TargetTracker,
     transform_matrix,
     world_to_grid,
@@ -56,7 +53,6 @@ from .geometry import (
 from .exploration import (
     clip_polyline_to_length,
     clip_polyline_to_radius,
-    direct_standoff_goal,
     max_polyline_deviation,
     render_frontier_map,
     sample_polyline,
@@ -72,7 +68,7 @@ from .models import (
     VLMResult,
     WorkerResult,
 )
-from .vlm_client import OpenAICompatibleVLMClient, overlay_coordinate_grid
+from .vlm_client import OpenAICompatibleVLMClient
 
 
 DISARMED = "DISARMED"
@@ -84,6 +80,7 @@ TARGET_CONFIRMING = "TARGET_CONFIRMING"
 TARGET_REOBSERVING = "TARGET_REOBSERVING"
 TARGET_ALIGNING = "TARGET_ALIGNING"
 APPROACHING = "APPROACHING"
+APPROACH_STOPPING = "APPROACH_STOPPING"
 SENSOR_WAITING = "SENSOR_WAITING"
 SUCCEEDED = "SUCCEEDED"
 API_ERROR = "API_ERROR"
@@ -138,6 +135,7 @@ class VLMNavigator(Node):
             "api_failure_limit": 3,
             "confirm_frames": 3,
             "confirmation_radius": 0.35,
+            "target_confirmation_timeout": 20.0,
             "target_lost_timeout": 10.0,
             "depth_neighborhood_radius": 5,
             "min_depth_samples": 8,
@@ -148,22 +146,20 @@ class VLMNavigator(Node):
             "depth_reobserve_attempt_limit": 3,
             "target_probe_distance": 2.0,
             "target_probe_attempt_limit": 3,
-            "min_waypoint_distance": 0.30,
-            "max_waypoint_distance": 2.50,
+            "target_probe_min_distance": 0.30,
             "max_ground_height": 0.35,
-            "free_snap_distance": 0.25,
-            "allow_unknown_standoff": True,
-            "standoff_footprint_length": 0.72,
-            "standoff_footprint_width": 0.50,
-            "standoff_min_occupied_cells": 3,
-            "standoff_occupied_threshold": 50,
-            "target_clearance": 0.50,
-            "robot_front_extent": 0.36,
-            "approach_goal_margin": 0.05,
-            "standoff_radius_offsets": [0.0, 0.20],
+            "target_success_radius": 0.81,
+            "approach_cancel_radius": 0.89,
+            "arrival_odom_topic": "/fastlio/odom",
+            "arrival_linear_speed_tolerance": 0.03,
+            "arrival_angular_speed_tolerance": 0.05,
+            "arrival_stationary_samples": 3,
+            "arrival_odom_max_age": 0.5,
+            "arrival_cancel_timeout": 3.0,
+            "arrival_stop_timeout": 5.0,
+            "arrival_retry_limit": 1,
             "easy_case_mode": False,
             "easy_case_timeout": 120.0,
-            "easy_case_standoff_distance": 0.81,
             "easy_case_alignment_tolerance": 0.10,
             "easy_case_max_path_deviation": 0.10,
             "scan_first": True,
@@ -246,6 +242,12 @@ class VLMNavigator(Node):
         self.create_subscription(
             CameraInfo, self.p.camera_info_topic, self.on_camera_info, 10
         )
+        self.create_subscription(
+            Odometry,
+            self.p.arrival_odom_topic,
+            self.on_arrival_odom,
+            qos_profile_sensor_data,
+        )
         self.perception_group = MutuallyExclusiveCallbackGroup()
         self.rgb_sub = Subscriber(
             self,
@@ -327,20 +329,15 @@ class VLMNavigator(Node):
         self.target_tracker = TargetTracker(
             int(self.p.confirm_frames), float(self.p.confirmation_radius)
         )
-        self.target_position = None
+        self.target_reference_position = None
         self.target_seen_time = 0.0
+        self.target_confirmation_started = 0.0
         self.easy_started = 0.0
         self.easy_alignment_complete = False
         self.easy_target_distance = math.inf
         self.easy_alignment_error = math.inf
         self.easy_direct_goal = None
         self.easy_path_deviation = math.inf
-        self.pending_waypoints = []
-        self.standoff_pending_count = 0
-        self.standoff_ring_stats = []
-        self.standoff_candidate_radii = {}
-        self.selected_standoff_radius = 0.0
-        self.selected_standoff_mode = "none"
         self.last_debug_pixels = None
         self.last_vlm_confidence = 0.0
         self.last_vlm_disposition = "none"
@@ -351,6 +348,16 @@ class VLMNavigator(Node):
         self.goal_pose = None
         self.goal_started = 0.0
         self.goal_token = 0
+        self.arrival_stop_started = 0.0
+        self.arrival_cancel_requested_at = 0.0
+        self.arrival_cancel_acknowledged = False
+        self.arrival_action_terminal = False
+        self.arrival_action_terminal_at = 0.0
+        self.arrival_stationary_count = 0
+        self.arrival_last_odom_received = 0.0
+        self.arrival_linear_speed = math.inf
+        self.arrival_angular_speed = math.inf
+        self.arrival_retry_count = 0
         self.plan_handle = None
         self.plan_pending = False
         self.plan_candidates = []
@@ -371,8 +378,6 @@ class VLMNavigator(Node):
         self.last_plan_commit_length = 0.0
         self.last_plan_radius_clipped = False
         self.rolling_goal_is_final = True
-        self.rolling_reassessment_required = False
-        self.rolling_reassessment_after_sequence = -1
         self.active_motion_origin = None
         self.blocked_goals = {}
 
@@ -390,7 +395,6 @@ class VLMNavigator(Node):
         self.last_target_grounding_error = "none"
         self.depth_reobserve_attempts = 0
         self.target_probe_attempts = 0
-        self.target_probe_candidates = []
         self.last_depth_recovery_action = "none"
         self.initial_costmap_clear_required = False
         self.initial_costmap_clear_requested = False
@@ -440,6 +444,9 @@ class VLMNavigator(Node):
         if isinstance(completed.result, VLMResult):
             parsed = {
                 "target_visible": completed.result.target_visible,
+                "object_match": completed.result.object_match,
+                "qualifier_match": completed.result.qualifier_match,
+                "relation_match": completed.result.relation_match,
                 "confidence": completed.result.confidence,
                 "target_pixel": (
                     {
@@ -449,10 +456,14 @@ class VLMNavigator(Node):
                     if completed.result.target_pixel is not None
                     else None
                 ),
-                "waypoints": [
-                    {"u": pixel.u, "v": pixel.v}
-                    for pixel in completed.result.waypoints
-                ],
+                "evidence_pixel": (
+                    {
+                        "u": completed.result.evidence_pixel.u,
+                        "v": completed.result.evidence_pixel.v,
+                    }
+                    if completed.result.evidence_pixel is not None
+                    else None
+                ),
                 "coordinate_mode": completed.result.coordinate_mode,
             }
         elif isinstance(completed.result, FrontierDecision):
@@ -567,7 +578,7 @@ class VLMNavigator(Node):
             "target_description": str(
                 getattr(self.p, "target_description", "chair")
             ),
-            "target_position": getattr(self, "target_position", None),
+            "target_reference_position": getattr(self, "target_reference_position", None),
             "direct_goal": getattr(self, "easy_direct_goal", None),
             **details,
         }
@@ -587,16 +598,15 @@ class VLMNavigator(Node):
 
     def on_parameters_changed(self, parameters):
         values = {parameter.name: parameter.value for parameter in parameters}
-        requested_enabled = bool(values.get("enabled", self.get_parameter("enabled").value))
+        requested_enabled = bool(
+            values.get("enabled", self.get_parameter("enabled").value)
+        )
         if "easy_case_mode" in values:
             if requested_enabled:
                 return SetParametersResult(
                     successful=False,
                     reason="change easy_case_mode only while enabled=false",
                 )
-            self.p.easy_case_mode = bool(values["easy_case_mode"])
-            self.task_epoch += 1
-            self.reset_task(DISARMED)
         if "target_description" in values:
             description = str(values["target_description"]).strip()
             if not description:
@@ -608,6 +618,12 @@ class VLMNavigator(Node):
                     successful=False,
                     reason="change target_description only while enabled=false",
                 )
+
+        if "easy_case_mode" in values:
+            self.p.easy_case_mode = bool(values["easy_case_mode"])
+            self.task_epoch += 1
+            self.reset_task(DISARMED)
+        if "target_description" in values:
             self.p.target_description = description
             self.task_epoch += 1
             self.reset_task(DISARMED)
@@ -795,10 +811,10 @@ class VLMNavigator(Node):
 
     def reset_task(self, state):
         self.cancel_motion(publish_stop=True)
+        self.reset_approach_stop(reset_retry=True)
         self.latest_snapshot = None
         self.target_tracker.reset()
-        self.target_position = None
-        self.pending_waypoints.clear()
+        self.target_reference_position = None
         self.target_seen_time = 0.0
         self.easy_started = 0.0
         self.easy_alignment_complete = False
@@ -806,11 +822,6 @@ class VLMNavigator(Node):
         self.easy_alignment_error = math.inf
         self.easy_direct_goal = None
         self.easy_path_deviation = math.inf
-        self.standoff_pending_count = 0
-        self.standoff_ring_stats = []
-        self.standoff_candidate_radii = {}
-        self.selected_standoff_radius = 0.0
-        self.selected_standoff_mode = "none"
         self.session_origin = None
         self.scan_headings = []
         self.scan_index = 0
@@ -824,7 +835,6 @@ class VLMNavigator(Node):
         self.last_target_grounding_error = "none"
         self.depth_reobserve_attempts = 0
         self.target_probe_attempts = 0
-        self.target_probe_candidates = []
         self.last_depth_recovery_action = "none"
         self.frontier_generation += 1
         self.frontier_candidates = []
@@ -854,8 +864,6 @@ class VLMNavigator(Node):
         self.last_plan_commit_length = 0.0
         self.last_plan_radius_clipped = False
         self.rolling_goal_is_final = True
-        self.rolling_reassessment_required = False
-        self.rolling_reassessment_after_sequence = -1
         self.active_motion_origin = None
         self.sensor_wait_started = 0.0
         self.sensor_wait_reason = "none"
@@ -873,6 +881,10 @@ class VLMNavigator(Node):
     def set_state(self, state):
         if state != self.state:
             self.state = state
+            if state == TARGET_CONFIRMING:
+                self.target_confirmation_started = time.monotonic()
+            else:
+                self.target_confirmation_started = 0.0
             self.get_logger().info(f"State -> {state}")
             self.publish_state()
 
@@ -924,14 +936,8 @@ class VLMNavigator(Node):
         self.sensor_wait_reason = "none"
         self.sensor_recovery_count = 0
         self.target_tracker.reset()
-        self.target_position = None
-        self.pending_waypoints.clear()
+        self.target_reference_position = None
         self.target_seen_time = 0.0
-        self.standoff_pending_count = 0
-        self.standoff_ring_stats = []
-        self.standoff_candidate_radii = {}
-        self.selected_standoff_radius = 0.0
-        self.selected_standoff_mode = "none"
         self.frontier_generation += 1
         self.frontier_candidates = []
         self.frontier_rejected_ids = set()
@@ -992,6 +998,33 @@ class VLMNavigator(Node):
             return
         if pose is None:
             return
+        if self.state == APPROACHING and self.target_reference_position is not None:
+            if self.target_reference_distance(pose) <= self.approach_stop_radius():
+                self.begin_approach_stop("distance_contract_reached")
+                return
+        if self.state == APPROACH_STOPPING:
+            self.advance_approach_stop(now, pose)
+            return
+        confirmation_timeout = float(
+            getattr(self.p, "target_confirmation_timeout", 20.0)
+        )
+        confirmation_started = float(
+            getattr(self, "target_confirmation_started", 0.0)
+        )
+        if (
+            self.state == TARGET_CONFIRMING
+            and confirmation_timeout > 0.0
+            and confirmation_started > 0.0
+            and now - confirmation_started > confirmation_timeout
+        ):
+            tracker = self.target_tracker
+            self.fail_safe(
+                "Target confirmation did not converge within "
+                f"{confirmation_timeout:.1f}s "
+                f"(progress={tracker.progress}/{tracker.required_frames}, "
+                f"spatial_resets={tracker.reset_count})"
+            )
+            return
         if (
             self.easy_case_enabled()
             and getattr(self, "easy_started", 0.0) > 0.0
@@ -1019,24 +1052,12 @@ class VLMNavigator(Node):
                 self.fail_safe("Robot exceeded active rolling-path radius")
                 return
         if (
-            self.target_position is not None
+            self.target_reference_position is not None
             and self.state in (TARGET_ALIGNING, APPROACHING)
             and now - self.target_seen_time > float(self.p.target_lost_timeout)
         ):
             if self.easy_case_enabled():
                 self.fail_safe("Target lost during easy-case alignment or approach")
-                return
-            if self.rolling_reassessment_required and pose is not None:
-                self.get_logger().warn(
-                    "Target not reacquired at rolling checkpoint; "
-                    "resuming VLM-guided scan and frontier exploration"
-                )
-                self.target_tracker.reset()
-                self.target_position = None
-                self.pending_waypoints.clear()
-                self.rolling_reassessment_required = False
-                self.rolling_reassessment_after_sequence = -1
-                self.begin_scan(pose)
                 return
             self.fail_safe("Target lost during approach")
             return
@@ -1054,6 +1075,25 @@ class VLMNavigator(Node):
     def on_behavior_costmap(self, _message):
         self.behavior_costmap_revision += 1
         self.last_behavior_costmap_received = time.monotonic()
+
+    def on_arrival_odom(self, message):
+        twist = message.twist.twist
+        self.arrival_last_odom_received = time.monotonic()
+        self.arrival_linear_speed = math.hypot(
+            float(twist.linear.x), float(twist.linear.y)
+        )
+        self.arrival_angular_speed = abs(float(twist.angular.z))
+        if self.state != APPROACH_STOPPING:
+            return
+        if (
+            self.arrival_linear_speed
+            <= float(self.p.arrival_linear_speed_tolerance)
+            and self.arrival_angular_speed
+            <= float(self.p.arrival_angular_speed_tolerance)
+        ):
+            self.arrival_stationary_count += 1
+        else:
+            self.arrival_stationary_count = 0
 
     def on_map(self, message):
         expected = int(message.info.width) * int(message.info.height)
@@ -1429,7 +1469,7 @@ class VLMNavigator(Node):
         self.api_failures = 0
         self.accepted_results += 1
         if self.state == API_ERROR:
-            if self.target_position is None:
+            if self.target_reference_position is None:
                 self.set_state(SCANNING)
             elif (
                 self.easy_case_enabled()
@@ -1441,10 +1481,14 @@ class VLMNavigator(Node):
         self.publish_debug(snapshot, result)
         if (
             not result.target_visible
+            or not result.object_match
+            or not result.qualifier_match
+            or not result.relation_match
             or result.target_pixel is None
+            or result.evidence_pixel is None
             or result.confidence < float(self.p.confidence_threshold)
         ):
-            if self.target_position is None:
+            if self.target_reference_position is None:
                 self.target_tracker.reset()
                 self.clear_vlm_grounding_markers()
                 if self.state == TARGET_CONFIRMING:
@@ -1462,8 +1506,7 @@ class VLMNavigator(Node):
                     )
                 else:
                     self.target_tracker.reset()
-                    self.target_position = None
-                    self.pending_waypoints.clear()
+                    self.target_reference_position = None
                     self.begin_scan(pose)
             self.log_worker_result(
                 completed,
@@ -1524,42 +1567,12 @@ class VLMNavigator(Node):
         self.clear_target_depth_recovery()
         self.target_seen_time = time.monotonic()
         self.confirm_target(target)
-        if (
-            self.rolling_reassessment_required
-            and snapshot.sequence > self.rolling_reassessment_after_sequence
-        ):
-            self.rolling_reassessment_required = False
-            self.rolling_reassessment_after_sequence = -1
-            self.get_logger().info(
-                "Fresh VLM target result accepted at rolling checkpoint; "
-                "planning the next Nav2-validated segment"
-            )
-        grounded_waypoints = []
+        self.publish_grounded_markers(target)
         if self.easy_case_enabled():
-            self.pending_waypoints.clear()
-            self.publish_grounded_markers(target, [])
             self.log_worker_result(
                 completed, age, state_before, "accepted_target_easy_case"
             )
             return
-        robot = self.robot_pose()
-        for pixel in result.waypoints:
-            point = self.ground_pixel(snapshot, pixel, require_ground=True)
-            if point is None or robot is None:
-                continue
-            distance = math.hypot(point[0] - robot[0], point[1] - robot[1])
-            if not (
-                float(self.p.min_waypoint_distance)
-                <= distance
-                <= float(self.p.max_waypoint_distance)
-            ):
-                continue
-            snapped = self.snap_free(point[:2])
-            if snapped is not None:
-                grounded_waypoints.append((snapped[0], snapped[1], 0.0))
-        if grounded_waypoints:
-            self.pending_waypoints = grounded_waypoints
-            self.publish_grounded_markers(target, grounded_waypoints)
         self.log_worker_result(completed, age, state_before, "accepted_target")
 
     def handle_frontier_worker_result(self, completed, age, state_before):
@@ -1679,7 +1692,17 @@ class VLMNavigator(Node):
         return point
 
     def confirm_target(self, point):
+        reset_count = int(getattr(self.target_tracker, "reset_count", 0))
         center = self.target_tracker.update(point)
+        new_reset_count = int(getattr(self.target_tracker, "reset_count", 0))
+        if new_reset_count > reset_count:
+            self.get_logger().warn(
+                "Target confirmation spatial reset: "
+                f"jump={self.target_tracker.last_jump_distance:.3f}m exceeds "
+                f"radius={self.target_tracker.confirmation_radius:.3f}m; "
+                f"progress={self.target_tracker.progress}/"
+                f"{self.target_tracker.required_frames}"
+            )
         if center is None:
             if self.state in (
                 SEARCHING,
@@ -1695,9 +1718,12 @@ class VLMNavigator(Node):
                 self.cancel_motion(publish_stop=True)
                 self.set_state(TARGET_CONFIRMING)
             return
-        first_confirmation = self.target_position is None
+        first_confirmation = self.target_reference_position is None
         if first_confirmation or not self.easy_case_enabled():
-            self.target_position = center
+            if self.easy_case_enabled():
+                self.target_reference_position = center
+            else:
+                self.set_confirmed_target_reference_position(center)
         if first_confirmation:
             self.cancel_motion(publish_stop=True)
             if self.easy_case_enabled():
@@ -1708,7 +1734,10 @@ class VLMNavigator(Node):
                 self.publish_easy_event("target_confirmed")
             else:
                 self.set_state(APPROACHING)
-        self.publish_grounded_markers(self.target_position, self.pending_waypoints)
+        self.publish_grounded_markers(self.target_reference_position)
+
+    def set_confirmed_target_reference_position(self, target):
+        self.target_reference_position = tuple(float(value) for value in target)
 
     # ---------- navigation ----------
 
@@ -1746,7 +1775,6 @@ class VLMNavigator(Node):
         self.scan_retry_count = 0
         self.depth_reobserve_attempts = 0
         self.target_probe_attempts = 0
-        self.target_probe_candidates = []
         self.last_depth_recovery_action = "none"
         self.frontier_request = None
         self.frontier_request_pending = False
@@ -1813,79 +1841,47 @@ class VLMNavigator(Node):
         return -math.atan2(float(pixel.u) - cx, fx)
 
     def build_target_probe_candidates(self, snapshot, result, pose):
-        """Build safe intermediate goals along VLM-indicated path directions."""
+        """Build observation subgoals along the visually grounded target ray."""
         maximum = min(
             float(self.p.target_probe_distance),
             float(self.p.max_travel_radius),
         )
-        minimum = float(self.p.min_waypoint_distance)
+        minimum = float(self.p.target_probe_min_distance)
         if maximum < minimum:
             return []
         target_bearing = self.target_relative_bearing(
             snapshot, result.target_pixel, pose
         )
         map_bearing = normalize_angle(float(pose[2]) + target_bearing)
-        waypoint_candidates = []
-
-        for pixel in result.waypoints:
-            point = self.ground_pixel(snapshot, pixel, require_ground=True)
-            if point is None:
-                continue
-            dx = float(point[0]) - float(pose[0])
-            dy = float(point[1]) - float(pose[1])
-            distance = math.hypot(dx, dy)
-            if distance < minimum:
-                continue
-            travel = min(distance, maximum)
-            waypoint_candidates.append(
-                (
-                    float(pose[0]) + travel * dx / distance,
-                    float(pose[1]) + travel * dy / distance,
-                )
-            )
-
-        waypoint_candidates.sort(
-            key=lambda point: math.hypot(
-                point[0] - float(pose[0]),
-                point[1] - float(pose[1]),
-            ),
-            reverse=True,
-        )
-        raw_candidates = list(waypoint_candidates)
-        # A target pixel still supplies a direction when every path pixel is
-        # beyond the depth camera. Try progressively nearer map points; Nav2
-        # remains the final reachability gate.
-        raw_candidates.extend(
+        raw_candidates = [
             (
                 float(pose[0]) + distance * math.cos(map_bearing),
                 float(pose[1]) + distance * math.sin(map_bearing),
             )
             for distance in (maximum, maximum * 0.75, maximum * 0.5)
             if distance >= minimum
-        )
+        ]
 
         candidates = []
         seen = set()
         for point in raw_candidates:
-            snapped = self.snap_free(point)
-            if snapped is None:
-                continue
-            key = self.goal_key(snapped)
+            key = self.goal_key(point)
             if key in seen:
                 continue
             seen.add(key)
-            candidates.append((snapped[0], snapped[1], map_bearing))
+            candidates.append((point[0], point[1], map_bearing))
         return candidates
 
     def clear_target_depth_recovery(self):
         self.depth_reobserve_attempts = 0
         self.target_probe_attempts = 0
-        self.target_probe_candidates = []
         self.last_depth_recovery_action = "none"
         self.scan_retry_count = 0
 
     def start_target_probe(self, snapshot, result, reason):
         """Approach one Nav2-validated point, then observe the target again."""
+        if self.target_reference_position is not None:
+            return False
         limit = max(1, int(self.p.target_probe_attempt_limit))
         if self.target_probe_attempts >= limit:
             self.fail_safe(
@@ -1901,28 +1897,26 @@ class VLMNavigator(Node):
         )
         if not candidates:
             self.fail_safe(
-                "Target depth is unavailable and no safe intermediate point "
-                f"exists along the VLM-indicated direction: {reason}"
+                "Target depth is unavailable and no observation subgoal "
+                f"exists along the target-pixel direction: {reason}"
             )
             return True
         self.cancel_motion(publish_stop=True)
         self.task_epoch += 1
         self.target_tracker.reset()
-        self.target_position = None
-        self.pending_waypoints.clear()
+        self.target_reference_position = None
         self.scan_waiting_for_vlm = False
         self.scan_request_sequence = -1
         self.scan_settle_until = 0.0
         self.depth_reobserve_attempts = 0
         self.target_probe_attempts += 1
-        self.target_probe_candidates = candidates
         self.last_depth_recovery_action = (
             f"target_probe:{self.target_probe_attempts}/{limit}"
         )
         self.set_state(TARGET_REOBSERVING)
         self.get_logger().warn(
-            "Target is outside reliable depth range; approaching a "
-            "Nav2-validated intermediate point along the VLM direction "
+            "Target is outside reliable depth range; requesting Nav2 validation "
+            "for an observation subgoal along the target-pixel direction "
             f"({self.target_probe_attempts}/{limit})"
         )
         self.plan_then_navigate(candidates, "target_probe")
@@ -1930,6 +1924,8 @@ class VLMNavigator(Node):
 
     def recover_target_depth(self, snapshot, result, reason):
         """Select rotation or staged approach for an ungrounded VLM target."""
+        if self.target_reference_position is not None:
+            return False
         recoverable_prefixes = (
             "insufficient_valid_depth_samples:",
             "mixed_depth_samples:",
@@ -1940,9 +1936,6 @@ class VLMNavigator(Node):
         pose = self.robot_pose()
         if pose is None:
             return False
-        self.target_probe_candidates = self.build_target_probe_candidates(
-            snapshot, result, pose
-        )
         rotate_limit = max(1, int(self.p.depth_reobserve_attempt_limit))
         if (
             str(reason).startswith("depth_out_of_range:")
@@ -2170,9 +2163,9 @@ class VLMNavigator(Node):
         if self.goal_handle is not None or self.goal_pending or self.plan_pending:
             return
 
-        if self.target_position is not None and self.state == TARGET_ALIGNING:
-            dx = self.target_position[0] - pose[0]
-            dy = self.target_position[1] - pose[1]
+        if self.target_reference_position is not None and self.state == TARGET_ALIGNING:
+            dx = self.target_reference_position[0] - pose[0]
+            dy = self.target_reference_position[1] - pose[1]
             self.easy_target_distance = math.hypot(dx, dy)
             target_yaw = math.atan2(dy, dx)
             self.easy_alignment_error = normalize_angle(target_yaw - pose[2])
@@ -2195,80 +2188,31 @@ class VLMNavigator(Node):
                 self.send_spin(self.easy_alignment_error, kind="target_align")
             return
 
-        if self.target_position is not None and self.state == APPROACHING:
+        if self.target_reference_position is not None and self.state == APPROACHING:
             target_distance = math.hypot(
-                pose[0] - self.target_position[0],
-                pose[1] - self.target_position[1],
+                pose[0] - self.target_reference_position[0],
+                pose[1] - self.target_reference_position[1],
             )
             self.easy_target_distance = target_distance
-            success_limit = self.approach_success_limit()
-            if target_distance <= success_limit:
-                mode = getattr(self, "selected_standoff_mode", "none")
-                radius = float(
-                    getattr(self, "selected_standoff_radius", 0.0)
-                )
-                if mode == "degraded":
-                    self.get_logger().warn(
-                        "Approach succeeded with degraded standoff "
-                        f"radius={radius:.2f} m, "
-                        f"target_distance={target_distance:.2f} m"
-                    )
-                self.cancel_motion(publish_stop=True)
-                # Preserve the completed parking grade for SUCCEEDED-state
-                # diagnostics. A task reset or any safety cancellation clears it.
-                self.selected_standoff_radius = radius
-                self.selected_standoff_mode = mode
-                self.set_state(SUCCEEDED)
+            if target_distance <= self.approach_stop_radius():
+                self.begin_approach_stop("distance_contract_reached")
                 return
+            goal = (
+                float(self.target_reference_position[0]),
+                float(self.target_reference_position[1]),
+                float(pose[2]),
+            )
             if self.easy_case_enabled():
-                self.pending_waypoints.clear()
-                standoff_radius = float(
-                    self.p.easy_case_standoff_distance
-                )
-                try:
-                    goal = direct_standoff_goal(
-                        pose, self.target_position[:2], standoff_radius
-                    )
-                except ValueError as error:
-                    self.fail_safe(f"Cannot construct easy-case goal: {error}")
-                    return
-                direct_travel = math.hypot(goal[0] - pose[0], goal[1] - pose[1])
-                if direct_travel > float(self.p.max_travel_radius) + 1e-6:
-                    self.fail_safe(
-                        "Easy-case direct goal lies outside the 3 metre "
-                        "activity radius"
-                    )
-                    return
                 self.easy_direct_goal = goal[:3]
                 self.publish_easy_case_markers(pose)
                 self.publish_easy_event(
                     "direct_goal_requested",
                     target_distance_m=target_distance,
-                    direct_travel_m=direct_travel,
+                    direct_travel_m=target_distance,
                 )
                 self.plan_then_navigate([goal[:3]], "easy_approach")
                 return
-            if self.rolling_reassessment_required:
-                self.publish_stop()
-                return
-            waypoint_candidates = []
-            while self.pending_waypoints:
-                waypoint = self.pending_waypoints.pop(0)
-                distance = math.hypot(waypoint[0] - pose[0], waypoint[1] - pose[1])
-                if distance >= float(self.p.min_waypoint_distance):
-                    yaw = math.atan2(
-                        self.target_position[1] - waypoint[1],
-                        self.target_position[0] - waypoint[0],
-                    )
-                    waypoint_candidates.append((waypoint[0], waypoint[1], yaw))
-            if waypoint_candidates:
-                self.plan_then_navigate(waypoint_candidates, "waypoint")
-                return
-            candidates = self.evaluate_standoff_candidates(pose, publish=True)
-            if not candidates:
-                self.fail_safe("Cannot construct target standoff candidates")
-                return
-            self.plan_then_navigate(candidates, "approach")
+            self.plan_then_navigate([goal[:3]], "approach")
             return
 
         if self.state == TARGET_REOBSERVING:
@@ -2296,158 +2240,136 @@ class VLMNavigator(Node):
         if self.state == EXPLORING:
             self.prepare_frontier_cycle(pose, use_scan_context=False)
 
-    def snap_free(self, point_xy):
-        if self.grid is None or self.map_message is None:
-            return None
-        return snap_to_free_cell(
-            point_xy,
-            self.grid,
-            self.map_message.info.origin.position.x,
-            self.map_message.info.origin.position.y,
-            self.map_message.info.resolution,
-            float(self.p.free_snap_distance),
+    def target_reference_distance(self, pose):
+        if self.target_reference_position is None or pose is None:
+            return math.inf
+        return math.hypot(
+            float(pose[0]) - float(self.target_reference_position[0]),
+            float(pose[1]) - float(self.target_reference_position[1]),
         )
 
-    def classify_standoff_point(self, point_xy, free_snap_distance=None):
-        if self.grid is None or self.map_message is None:
-            return "outside", None
-        snap_distance = (
-            float(self.p.free_snap_distance)
-            if free_snap_distance is None
-            else float(free_snap_distance)
+    def approach_stop_radius(self):
+        if int(getattr(self, "arrival_retry_count", 0)) > 0:
+            return float(self.p.target_success_radius)
+        return float(self.p.approach_cancel_radius)
+
+    def reset_approach_stop(self, reset_retry=False):
+        self.arrival_stop_started = 0.0
+        self.arrival_cancel_requested_at = 0.0
+        self.arrival_cancel_acknowledged = False
+        self.arrival_action_terminal = False
+        self.arrival_action_terminal_at = 0.0
+        self.arrival_stationary_count = 0
+        if reset_retry:
+            self.arrival_retry_count = 0
+
+    def request_approach_cancel(self):
+        if self.goal_handle is None or self.arrival_cancel_requested_at > 0.0:
+            return
+        self.arrival_cancel_requested_at = time.monotonic()
+        try:
+            future = self.goal_handle.cancel_goal_async()
+            future.add_done_callback(self.on_approach_cancel_response)
+        except Exception as error:
+            self.fail_safe(f"Cannot request approach cancellation: {error}")
+
+    def on_approach_cancel_response(self, future):
+        try:
+            future.result()
+        except Exception as error:
+            if self.state == APPROACH_STOPPING:
+                self.fail_safe(f"Cannot confirm approach cancellation request: {error}")
+            return
+        self.arrival_cancel_acknowledged = True
+
+    def begin_approach_stop(self, reason, action_terminal=False):
+        if self.state == APPROACH_STOPPING:
+            if action_terminal and not self.arrival_action_terminal:
+                self.arrival_action_terminal = True
+                self.arrival_action_terminal_at = time.monotonic()
+            return
+        self.set_state(APPROACH_STOPPING)
+        self.arrival_stop_started = time.monotonic()
+        self.arrival_cancel_requested_at = 0.0
+        self.arrival_cancel_acknowledged = False
+        self.arrival_action_terminal = bool(action_terminal)
+        self.arrival_action_terminal_at = (
+            self.arrival_stop_started if action_terminal else 0.0
         )
-        target = getattr(self, "target_position", None)
-        footprint_yaw = (
-            math.atan2(
-                float(target[1]) - float(point_xy[1]),
-                float(target[0]) - float(point_xy[0]),
+        self.arrival_stationary_count = 0
+        self.publish_stop()
+        if self.plan_handle is not None or self.plan_pending:
+            self.plan_token += 1
+            if self.plan_handle is not None:
+                self.plan_handle.cancel_goal_async()
+            self.plan_handle = None
+            self.plan_pending = False
+            self.plan_candidates = []
+            self.plan_kind = None
+        if self.goal_handle is not None:
+            self.request_approach_cancel()
+        elif not self.goal_pending:
+            self.arrival_action_terminal = True
+            self.arrival_action_terminal_at = time.monotonic()
+        self.get_logger().info(f"Approach stop confirmation started: {reason}")
+
+    def advance_approach_stop(self, now=None, pose=None):
+        if self.state != APPROACH_STOPPING:
+            return
+        now = time.monotonic() if now is None else float(now)
+        self.publish_stop()
+        if not self.arrival_action_terminal:
+            cancel_started = float(self.arrival_cancel_requested_at)
+            terminal_wait_started = (
+                cancel_started
+                if cancel_started > 0.0
+                else float(self.arrival_stop_started)
             )
-            if target is not None
-            else 0.0
+            if now - terminal_wait_started > float(self.p.arrival_cancel_timeout):
+                self.fail_safe("Approach action cancellation did not become terminal")
+            return
+        terminal_at = float(getattr(self, "arrival_action_terminal_at", 0.0))
+        stop_elapsed = now - (
+            terminal_at if terminal_at > 0.0 else float(self.arrival_stop_started)
         )
-        return classify_standoff_cell(
-            point_xy,
-            self.grid,
-            self.map_message.info.origin.position.x,
-            self.map_message.info.origin.position.y,
-            self.map_message.info.resolution,
-            free_snap_distance=snap_distance,
-            footprint_yaw=footprint_yaw,
-            footprint_length=float(
-                getattr(self.p, "standoff_footprint_length", 0.72)
-            ),
-            footprint_width=float(
-                getattr(self.p, "standoff_footprint_width", 0.50)
-            ),
-            min_occupied_cells=int(
-                getattr(self.p, "standoff_min_occupied_cells", 3)
-            ),
-            occupied_threshold=int(self.p.standoff_occupied_threshold),
-            allow_unknown=bool(self.p.allow_unknown_standoff),
+        odom_age = self.elapsed_since(self.arrival_last_odom_received, now)
+        stationary = self.arrival_stationary_count >= int(
+            self.p.arrival_stationary_samples
         )
-
-    def configured_standoff_radii(self):
-        """Return unique parking radii in strict inner-to-outer order."""
-        base_radius = approach_goal_radius(
-            self.p.target_clearance,
-            self.p.robot_front_extent,
-            self.p.approach_goal_margin,
-        )
-        offsets = getattr(self.p, "standoff_radius_offsets", [0.0, 0.20])
-        radii = []
-        for value in offsets:
-            try:
-                offset = float(value)
-            except (TypeError, ValueError):
-                continue
-            if not math.isfinite(offset) or offset < 0.0:
-                continue
-            radius = base_radius + offset
-            if not any(abs(radius - existing) < 1e-6 for existing in radii):
-                radii.append(radius)
-        if not radii:
-            radii.append(base_radius)
-        return sorted(radii)
-
-    def clear_standoff_selection(self):
-        self.standoff_candidate_radii = {}
-        self.selected_standoff_radius = 0.0
-        self.selected_standoff_mode = "none"
-
-    def select_standoff_radius(self, pose):
-        base_radius = self.configured_standoff_radii()[0]
-        radius = self.standoff_candidate_radii.get(
-            self.goal_key(pose), base_radius
-        )
-        self.selected_standoff_radius = float(radius)
-        self.selected_standoff_mode = (
-            "normal" if abs(radius - base_radius) < 1e-6 else "degraded"
-        )
-        message = (
-            f"Selected {self.selected_standoff_mode} standoff ring "
-            f"radius={radius:.2f} m; success_limit="
-            f"{self.approach_success_limit():.2f} m"
-        )
-        if self.selected_standoff_mode == "degraded":
-            self.get_logger().warn(message)
-        else:
-            self.get_logger().info(message)
-
-    def approach_success_limit(self):
-        base_radius = self.configured_standoff_radii()[0]
-        selected = float(getattr(self, "selected_standoff_radius", 0.0))
-        radius = selected if selected > 0.0 else base_radius
-        return radius + float(self.p.approach_goal_margin)
-
-    def evaluate_standoff_candidates(self, pose, publish):
-        if self.target_position is None:
-            return []
-        radii = self.configured_standoff_radii()
-        ordered = []
-        ring_visuals = []
-        seen = set()
-        candidate_radii = {}
-        ring_stats = []
-        for radius in radii:
-            ring_candidates = []
-            visuals = []
-            for x, y, _, _ in standoff_candidates(
-                self.target_position[:2], pose[:2], radius
-            ):
-                visuals.append((x, y, (x, y), "pending_nav2"))
-                snapped_yaw = math.atan2(
-                    self.target_position[1] - y,
-                    self.target_position[0] - x,
+        if stationary and odom_age <= float(self.p.arrival_odom_max_age):
+            pose = self.robot_pose() if pose is None else pose
+            distance = self.target_reference_distance(pose)
+            self.easy_target_distance = distance
+            if distance <= float(self.p.target_success_radius):
+                self.finish_approach_success()
+                return
+            if self.arrival_retry_count < int(self.p.arrival_retry_limit):
+                self.arrival_retry_count += 1
+                self.get_logger().warn(
+                    "Approach action stopped outside distance contract; "
+                    "replanning target reference position"
                 )
-                candidate = (
-                    float(x),
-                    float(y),
-                    snapped_yaw,
-                )
-                key = self.goal_key(candidate)
-                if key in seen:
-                    continue
-                seen.add(key)
-                candidate_radii[key] = float(radius)
-                ring_candidates.append(candidate)
-            ring_stats.append({
-                "radius": float(radius),
-                "pending_nav2": len(ring_candidates),
-            })
-            ring_visuals.append((float(radius), visuals))
-            # Radius priority is strict: exhaust the inner ring before trying
-            # any candidate from the degraded outer ring.
-            ordered.extend(ring_candidates)
-        self.standoff_candidate_radii = candidate_radii
-        self.standoff_ring_stats = ring_stats
-        self.standoff_pending_count = sum(
-            item["pending_nav2"] for item in ring_stats
-        )
-        if publish:
-            self.publish_standoff_candidates(
-                self.target_position, ring_visuals
+                self.reset_approach_stop(reset_retry=False)
+                self.set_state(APPROACHING)
+                return
+            self.fail_safe(
+                "Approach stopped outside target distance contract after retry"
             )
-        return ordered
+            return
+        if stop_elapsed > float(self.p.arrival_stop_timeout):
+            self.fail_safe(
+                "Approach motion did not stop with fresh odometry before timeout"
+            )
+
+    def finish_approach_success(self):
+        self.publish_stop()
+        self.goal_handle = None
+        self.goal_pending = False
+        self.goal_kind = None
+        self.goal_pose = None
+        self.active_motion_origin = None
+        self.reset_approach_stop(reset_retry=False)
+        self.set_state(SUCCEEDED)
 
     @staticmethod
     def goal_key(pose):
@@ -2465,7 +2387,6 @@ class VLMNavigator(Node):
         ]
         if not self.plan_candidates:
             if kind in (
-                "waypoint",
                 "approach",
                 "easy_approach",
                 "target_probe",
@@ -2605,20 +2526,6 @@ class VLMNavigator(Node):
         if rejection is None:
             self.last_plan_rejection_reason = "none"
             requested_pose = self.current_plan_pose
-            if kind == "target_probe":
-                status, _ = self.classify_standoff_point(
-                    requested_pose[:2], free_snap_distance=0.0
-                )
-                if status not in ("known_free", "unknown"):
-                    self.last_plan_rejection_reason = (
-                        f"{kind}_endpoint_status_{status}"
-                    )
-                    self.reject_current_plan(
-                        f"{kind} endpoint changed before dispatch "
-                        f"(status={status})",
-                        token,
-                    )
-                    return
             if kind == "approach":
                 horizon = max(
                     1, int(getattr(self.p, "path_horizon_segments", 16))
@@ -2631,12 +2538,10 @@ class VLMNavigator(Node):
                 self.last_plan_commit_length = self.last_plan_path_length
                 self.last_plan_radius_clipped = False
                 self.rolling_goal_is_final = True
-                self.select_standoff_radius(requested_pose)
                 self.active_motion_origin = self.plan_window_origin
                 if getattr(self, "marker_pub", None) is not None:
                     self.publish_task_boundary()
                     self.publish_rolling_path(samples, requested_pose, points)
-                    self.publish_selected_standoff(requested_pose)
                 self.plan_pending = False
                 self.plan_handle = None
                 self.plan_candidates = []
@@ -2868,6 +2773,8 @@ class VLMNavigator(Node):
         result.add_done_callback(
             lambda done: self.on_navigation_result(done, token, kind)
         )
+        if kind in ("approach", "easy_approach") and self.state == APPROACH_STOPPING:
+            self.request_approach_cancel()
 
     def on_navigation_result(self, future, token, kind):
         if token != self.goal_token:
@@ -2883,12 +2790,33 @@ class VLMNavigator(Node):
                 self.fail_safe(f"Cannot obtain {kind} goal result: {error}")
             return
         failed_pose = self.goal_pose
-        goal_was_final = self.rolling_goal_is_final
         self.goal_handle = None
         self.goal_pending = False
         self.goal_kind = None
         self.goal_pose = None
         self.active_motion_origin = None
+        if kind in ("approach", "easy_approach"):
+            if self.state == APPROACH_STOPPING:
+                if status in (
+                    GoalStatus.STATUS_CANCELED,
+                    GoalStatus.STATUS_SUCCEEDED,
+                ):
+                    self.arrival_action_terminal = True
+                    self.arrival_action_terminal_at = time.monotonic()
+                else:
+                    self.fail_safe(
+                        f"{kind} goal failed while stopping with status {status}"
+                    )
+                return
+            if status == GoalStatus.STATUS_SUCCEEDED:
+                if kind == "easy_approach":
+                    self.publish_easy_event(
+                        "direct_navigation_action_succeeded"
+                    )
+                self.begin_approach_stop(
+                    "nav2_action_succeeded", action_terminal=True
+                )
+                return
         if status != GoalStatus.STATUS_SUCCEEDED:
             if failed_pose is not None:
                 self.blocked_goals[self.goal_key(failed_pose)] = (
@@ -2899,7 +2827,6 @@ class VLMNavigator(Node):
                     f"frontier goal failed with status {status}"
                 )
             elif kind in (
-                "waypoint",
                 "approach",
                 "scan",
                 "depth_reobserve",
@@ -2931,15 +2858,6 @@ class VLMNavigator(Node):
             self.publish_stop()
             self.set_state(APPROACHING)
             self.publish_easy_event("target_alignment_action_succeeded")
-        elif kind == "waypoint" and not goal_was_final:
-            self.pending_waypoints.clear()
-            self.rolling_reassessment_required = True
-            self.rolling_reassessment_after_sequence = self.sequence
-            self.publish_stop()
-            self.get_logger().info(
-                "Reached rolling path checkpoint; waiting for a fresh VLM "
-                "target result before planning the next Nav2 segment"
-            )
         elif kind == "frontier":
             pose = self.robot_pose()
             if pose is None:
@@ -2953,13 +2871,6 @@ class VLMNavigator(Node):
                 self.frontier_request = None
                 self.frontier_request_pending = False
                 self.set_state(EXPLORING)
-        elif kind in ("waypoint", "approach", "easy_approach"):
-            self.rolling_reassessment_required = False
-            self.rolling_reassessment_after_sequence = -1
-            if kind == "easy_approach":
-                self.publish_easy_event(
-                    "direct_navigation_action_succeeded"
-                )
 
     def reject_selected_frontier(self, reason):
         self.get_logger().warn(reason)
@@ -2988,20 +2899,15 @@ class VLMNavigator(Node):
         self.goal_pose = None
         self.active_motion_origin = None
         self.rolling_goal_is_final = True
-        self.rolling_reassessment_required = False
-        self.rolling_reassessment_after_sequence = -1
-        self.clear_standoff_selection()
+        self.reset_approach_stop(reset_retry=True)
         if publish_stop:
             self.publish_stop()
 
     # ---------- visualization and diagnostics ----------
 
     def publish_debug(self, snapshot, result):
-        image = overlay_coordinate_grid(
-            snapshot.rgb,
-            normalized_1000=result.coordinate_mode == "normalized_1000",
-        )
-        ArmImageRecorder.draw_target_path(image, result)
+        image = np.ascontiguousarray(snapshot.rgb.copy())
+        ArmImageRecorder.draw_target_annotation(image, result)
         message = Image()
         message.header.stamp = snapshot.stamp
         message.header.frame_id = snapshot.frame_id
@@ -3045,7 +2951,6 @@ class VLMNavigator(Node):
                     self.delete_marker(0, "task_radius"),
                     self.delete_marker(0, "task_radius_label"),
                     self.delete_marker(0, "easy_direct_line"),
-                    self.delete_marker(0, "easy_standoff_goal"),
                     self.delete_marker(0, "easy_stage"),
                 ]
             )
@@ -3109,128 +3014,17 @@ class VLMNavigator(Node):
         self.marker_pub.publish(markers)
 
     def vlm_grounding_deletes(self):
-        markers = [
+        return [
             self.delete_marker(0, "vlm_target"),
             self.delete_marker(0, "vlm_target_label"),
-            self.delete_marker(0, "vlm_path"),
         ]
-        markers.extend(
-            self.delete_marker(index, "vlm_waypoints") for index in range(3)
-        )
-        return markers
 
     def clear_vlm_grounding_markers(self):
         self.marker_pub.publish(
             MarkerArray(markers=self.vlm_grounding_deletes())
         )
 
-    def standoff_marker_deletes(self):
-        markers = [
-            self.delete_marker(0, "standoff_summary"),
-            self.delete_marker(0, "standoff_selected"),
-        ]
-        for ring_index in range(2):
-            markers.append(self.delete_marker(ring_index, "standoff_ring"))
-        for index in range(32):
-            markers.append(self.delete_marker(index, "standoff_rejected"))
-            markers.append(self.delete_marker(index, "standoff_free"))
-            markers.append(self.delete_marker(index, "standoff_unknown"))
-            markers.append(self.delete_marker(index, "standoff_outside"))
-            markers.append(self.delete_marker(index, "standoff_pending_nav2"))
-        return markers
-
-    def clear_standoff_markers(self):
-        self.marker_pub.publish(
-            MarkerArray(markers=self.standoff_marker_deletes())
-        )
-
-    def publish_standoff_candidates(self, target, rings):
-        """Show raw parking candidates that are waiting for Nav2 validation."""
-        markers = MarkerArray(markers=self.standoff_marker_deletes())
-        marker_index = 0
-        for ring_index, (_radius, candidates) in enumerate(rings):
-            ring = self.marker(
-                ring_index,
-                "standoff_ring",
-                Marker.LINE_STRIP,
-                0.0,
-                0.0,
-                0.07,
-            )
-            ring.scale.x = 0.035
-            if ring_index == 0:
-                ring.color.r, ring.color.g, ring.color.b = 1.0, 0.8, 0.0
-            else:
-                ring.color.r, ring.color.g, ring.color.b = 0.0, 0.75, 1.0
-            ring.points = [
-                Point(x=float(x), y=float(y), z=0.07)
-                for x, y, _, _ in candidates
-            ]
-            if ring.points:
-                ring.points.append(ring.points[0])
-            markers.markers.append(ring)
-
-            for x, y, _accepted_point, _status in candidates:
-                item = self.marker(
-                    marker_index,
-                    "standoff_pending_nav2",
-                    Marker.CYLINDER,
-                    x,
-                    y,
-                    0.09,
-                )
-                item.scale.x = item.scale.y = 0.14
-                item.scale.z = 0.05
-                item.color.r = 1.0
-                item.color.g = 0.78
-                item.color.b = 0.0
-                markers.markers.append(item)
-                marker_index += 1
-
-        summary = self.marker(
-            0,
-            "standoff_summary",
-            Marker.TEXT_VIEW_FACING,
-            target[0],
-            target[1],
-            float(target[2]) + 0.62,
-        )
-        summary.scale.x = summary.scale.y = 0.0
-        summary.scale.z = 0.14
-        summary.color.r = 1.0
-        summary.color.g = 0.78
-        summary.color.b = 0.1
-        ring_text = " | ".join(
-            f"r={item['radius']:.2f}:pending={item['pending_nav2']}"
-            for item in self.standoff_ring_stats
-        )
-        selected = float(getattr(self, "selected_standoff_radius", 0.0))
-        selection_text = (
-            "selected=none"
-            if selected <= 0.0
-            else f"selected={selected:.2f}({self.selected_standoff_mode})"
-        )
-        summary.text = f"{ring_text} | {selection_text}"
-        markers.markers.append(summary)
-        self.marker_pub.publish(markers)
-
-    def publish_selected_standoff(self, pose):
-        marker = self.marker(
-            0,
-            "standoff_selected",
-            Marker.CYLINDER,
-            pose[0],
-            pose[1],
-            0.10,
-        )
-        marker.scale.x = marker.scale.y = 0.20
-        marker.scale.z = 0.07
-        marker.color.r = 0.0
-        marker.color.g = 1.0
-        marker.color.b = 0.2
-        self.marker_pub.publish(MarkerArray(markers=[marker]))
-
-    def publish_grounded_markers(self, target, waypoints):
+    def publish_grounded_markers(self, target):
         markers = MarkerArray(markers=self.vlm_grounding_deletes())
         target_marker = self.marker(0, "vlm_target", Marker.SPHERE, target[0], target[1], target[2])
         target_marker.scale.x = 0.42
@@ -3261,26 +3055,6 @@ class VLMNavigator(Node):
         )
         markers.markers.append(target_label)
 
-        for index, waypoint in enumerate(waypoints):
-            item = self.marker(index, "vlm_waypoints", Marker.CYLINDER, waypoint[0], waypoint[1])
-            item.scale.x = item.scale.y = 0.26
-            item.scale.z = 0.10
-            item.color.g = 1.0
-            markers.markers.append(item)
-
-        if waypoints:
-            path = self.marker(0, "vlm_path", Marker.LINE_STRIP, 0.0, 0.0)
-            path.scale.x = 0.10
-            path.scale.y = 0.0
-            path.scale.z = 0.0
-            path.color.r = 0.0
-            path.color.g = 0.85
-            path.color.b = 1.0
-            path.points = [
-                Point(x=float(point[0]), y=float(point[1]), z=0.10)
-                for point in (*waypoints, target)
-            ]
-            markers.markers.append(path)
         self.marker_pub.publish(markers)
 
     def publish_frontiers(self, candidates):
@@ -3402,13 +3176,12 @@ class VLMNavigator(Node):
         self.marker_pub.publish(MarkerArray(markers=[item]))
 
     def publish_easy_case_markers(self, robot_pose):
-        if self.target_position is None:
+        if self.target_reference_position is None:
             return
-        target = self.target_position
+        target = self.target_reference_position
         markers = MarkerArray(
             markers=[
                 self.delete_marker(0, "easy_direct_line"),
-                self.delete_marker(0, "easy_standoff_goal"),
                 self.delete_marker(0, "easy_stage"),
             ]
         )
@@ -3425,22 +3198,6 @@ class VLMNavigator(Node):
         ]
         markers.markers.append(direct)
         label_x, label_y = float(target[0]), float(target[1])
-        if self.easy_direct_goal is not None:
-            x, y, yaw = self.easy_direct_goal
-            goal = self.marker(
-                0, "easy_standoff_goal", Marker.ARROW, x, y, 0.14
-            )
-            qx, qy, qz, qw = yaw_quaternion(yaw)
-            goal.pose.orientation.x = qx
-            goal.pose.orientation.y = qy
-            goal.pose.orientation.z = qz
-            goal.pose.orientation.w = qw
-            goal.scale.x, goal.scale.y, goal.scale.z = 0.50, 0.16, 0.16
-            goal.color.r = 1.0
-            goal.color.g = 0.75
-            goal.color.b = 0.0
-            markers.markers.append(goal)
-            label_x, label_y = x, y
         stage = self.marker(
             0,
             "easy_stage",
@@ -3506,6 +3263,7 @@ class VLMNavigator(Node):
             TARGET_CONFIRMING,
             TARGET_ALIGNING,
             APPROACHING,
+            APPROACH_STOPPING,
             SUCCEEDED,
         ):
             scan_status = "target_found"
@@ -3532,10 +3290,26 @@ class VLMNavigator(Node):
             f"worker={'busy' if worker_busy else 'idle'}"
         )
 
-        if self.target_position is not None:
-            x, y, z = self.target_position
+        if self.target_reference_position is not None:
+            x, y, z = self.target_reference_position
             target_status = (
                 f"grounded; map_xyz=({x:.3f},{y:.3f},{z:.3f})"
+            )
+        elif self.state == TARGET_CONFIRMING:
+            tracker = self.target_tracker
+            confirmation_age = self.elapsed_since(
+                getattr(self, "target_confirmation_started", 0.0), now
+            )
+            age_text = (
+                round(confirmation_age, 3)
+                if math.isfinite(confirmation_age)
+                else "none"
+            )
+            target_status = (
+                f"confirming; progress={tracker.progress}/"
+                f"{tracker.required_frames}; age_s={age_text}; "
+                f"spatial_resets={tracker.reset_count}; "
+                f"last_jump_m={round(tracker.last_jump_distance, 3)}"
             )
         elif (
             self.last_target_grounding_error
@@ -3564,23 +3338,23 @@ class VLMNavigator(Node):
                 f"status={self.last_plan_status}"
             )
 
-        ring_stats = getattr(self, "standoff_ring_stats", [])
-        rings = ",".join(
-            f"{item['radius']:.2f}:pending{item['pending_nav2']}"
-            for item in ring_stats
-        ) or "none"
-        selected_radius = float(
-            getattr(self, "selected_standoff_radius", 0.0)
+        target_distance = float(
+            getattr(self, "easy_target_distance", math.inf)
         )
-        selected = (
-            "none"
-            if selected_radius <= 0.0
-            else (
-                f"{selected_radius:.2f};"
-                f"mode={getattr(self, 'selected_standoff_mode', 'none')}"
-            )
+        distance_text = (
+            f"{target_distance:.3f}" if math.isfinite(target_distance) else "none"
         )
-        standoff_status = f"rings={rings}; selected={selected}"
+        parameters = getattr(self, "p", SimpleNamespace())
+        approach_status = (
+            f"distance_m={distance_text}; "
+            f"limit_m={float(getattr(parameters, 'target_success_radius', 0.81)):.2f}; "
+            f"cancel_m={float(getattr(parameters, 'approach_cancel_radius', 0.89)):.2f}; "
+            f"action_terminal={bool(getattr(self, 'arrival_action_terminal', False))}; "
+            f"stationary={int(getattr(self, 'arrival_stationary_count', 0))}/"
+            f"{int(getattr(parameters, 'arrival_stationary_samples', 3))}; "
+            f"retry={int(getattr(self, 'arrival_retry_count', 0))}/"
+            f"{int(getattr(parameters, 'arrival_retry_limit', 1))}"
+        )
 
         return {
             "state": self.state,
@@ -3591,7 +3365,7 @@ class VLMNavigator(Node):
             "vlm_status": vlm_status,
             "target_status": target_status,
             "navigation_status": navigation_status,
-            "standoff_status": standoff_status,
+            "approach_status": approach_status,
             "sensor_wait_reason": self.sensor_wait_reason,
             "last_api_error": self.last_api_error,
             "last_failure_reason": self.last_failure_reason,

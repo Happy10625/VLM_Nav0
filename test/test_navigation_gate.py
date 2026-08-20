@@ -13,11 +13,13 @@ rclpy = pytest.importorskip("rclpy")
 from action_msgs.msg import GoalStatus
 from builtin_interfaces.msg import Time
 from geometry_msgs.msg import PoseStamped
+from nav_msgs.msg import Odometry
 from visualization_msgs.msg import Marker
 from tf2_ros import TransformException
 
 from vlm_nav.vlm_navigator import (
     APPROACHING,
+    APPROACH_STOPPING,
     API_ERROR,
     FAILED,
     SCANNING,
@@ -37,16 +39,54 @@ def path_pose(x, y):
     )
 
 
-def test_successful_compute_path_is_required_before_navigation_dispatch():
+class RecordingMarkerPublisher:
+    def __init__(self):
+        self.messages = []
+
+    def publish(self, message):
+        self.messages.append(message)
+
+
+def test_publish_debug_emits_annotated_target_image():
+    node = VLMNavigator.__new__(VLMNavigator)
+    node.debug_pub = RecordingMarkerPublisher()
+    snapshot = SimpleNamespace(
+        rgb=np.zeros((160, 240, 3), dtype=np.uint8),
+        stamp=Time(),
+        frame_id="camera_color_optical_frame",
+    )
+    result = VLMResult(
+        target_visible=True,
+        object_match=True,
+        qualifier_match=True,
+        relation_match=True,
+        confidence=0.9,
+        target_pixel=Pixel(180, 40),
+        evidence_pixel=Pixel(35, 50),
+    )
+
+    node.publish_debug(snapshot, result)
+
+    assert len(node.debug_pub.messages) == 1
+    message = node.debug_pub.messages[0]
+    assert (message.width, message.height, message.encoding) == (240, 160, "rgb8")
+    assert any(message.data)
+
+
+def test_successful_target_probe_path_dispatches_without_map_reclassification():
     node = VLMNavigator.__new__(VLMNavigator)
     node.plan_token = 7
     node.current_plan_pose = (1.0, 0.0, 0.0)
     node.session_origin = (0.0, 0.0)
-    node.p = SimpleNamespace(max_travel_radius=3.0)
-    node.plan_kind = "waypoint"
+    node.p = SimpleNamespace(max_travel_radius=3.0, path_horizon_segments=16)
+    node.plan_kind = "target_probe"
     node.plan_pending = True
     node.plan_handle = object()
     node.plan_candidates = []
+    node.marker_pub = None
+    node.classify_standoff_point = lambda *_args, **_kwargs: pytest.fail(
+        "ComputePathToPose is authoritative for target probes"
+    )
     dispatched = []
     node.send_navigation_goal = lambda *args: dispatched.append(args)
     wrapped = SimpleNamespace(
@@ -58,7 +98,7 @@ def test_successful_compute_path_is_required_before_navigation_dispatch():
 
     node.on_plan_result(SimpleNamespace(result=lambda: wrapped), token=7)
 
-    assert dispatched == [(1.0, 0.0, 0.0, "waypoint")]
+    assert dispatched == [(1.0, 0.0, 0.0, "target_probe")]
     assert node.plan_pending is False
 
 
@@ -67,8 +107,7 @@ def test_easy_case_confirmation_enters_target_alignment():
     node.target_tracker = SimpleNamespace(
         update=lambda _point: (2.0, 0.0, 0.5)
     )
-    node.target_position = None
-    node.pending_waypoints = []
+    node.target_reference_position = None
     node.p = SimpleNamespace(easy_case_mode=True)
     states = []
     node.cancel_motion = lambda publish_stop: None
@@ -79,7 +118,7 @@ def test_easy_case_confirmation_enters_target_alignment():
 
     assert states == [TARGET_ALIGNING]
     assert node.easy_alignment_complete is False
-    assert node.target_position == (2.0, 0.0, 0.5)
+    assert node.target_reference_position == (2.0, 0.0, 0.5)
 
 
 def test_initial_arm_costmap_clear_blocks_scan_until_services_complete():
@@ -147,7 +186,7 @@ def test_initial_arm_scan_spin_waits_for_costmap_clear_gate():
     node.goal_handle = None
     node.goal_pending = False
     node.plan_pending = False
-    node.target_position = None
+    node.target_reference_position = None
     node.scan_waiting_for_vlm = False
     node.scan_settle_until = 0.0
     node.scan_index = 0
@@ -319,21 +358,18 @@ def depth_recovery_node():
         target_probe_distance=2.0,
         target_probe_attempt_limit=3,
         max_travel_radius=3.0,
-        min_waypoint_distance=0.3,
+        target_probe_min_distance=0.3,
     )
     node.depth_reobserve_attempts = 0
     node.target_probe_attempts = 0
-    node.target_probe_candidates = []
     node.last_depth_recovery_action = "none"
     node.scan_waiting_for_vlm = True
     node.scan_request_sequence = 8
     node.scan_settle_until = 1.0
-    node.target_position = None
-    node.pending_waypoints = []
+    node.target_reference_position = None
     node.target_tracker = SimpleNamespace(reset=lambda: None)
     node.robot_pose = lambda: (0.0, 0.0, 0.0)
     node.ground_pixel = lambda *_args, **_kwargs: None
-    node.snap_free = lambda point: point
     node.cancel_motion = lambda publish_stop: None
     node.get_logger = lambda: SimpleNamespace(warn=lambda *_args: None)
     node.set_state = lambda state: setattr(node, "state", state)
@@ -346,9 +382,12 @@ def test_unreliable_target_depth_rotates_toward_vlm_pixel():
     node.send_spin = lambda angle, kind: rotations.append((angle, kind))
     result = VLMResult(
         target_visible=True,
+        object_match=True,
+        qualifier_match=True,
+        relation_match=True,
         confidence=0.9,
         target_pixel=Pixel(420, 240),
-        waypoints=(),
+        evidence_pixel=Pixel(420, 240),
     )
 
     recovered = node.recover_target_depth(
@@ -373,9 +412,12 @@ def test_out_of_range_target_uses_nav2_validated_directional_probe():
     )
     result = VLMResult(
         target_visible=True,
+        object_match=True,
+        qualifier_match=True,
+        relation_match=True,
         confidence=0.9,
         target_pixel=Pixel(320, 240),
-        waypoints=(),
+        evidence_pixel=Pixel(320, 240),
     )
 
     recovered = node.recover_target_depth(
@@ -390,6 +432,86 @@ def test_out_of_range_target_uses_nav2_validated_directional_probe():
     assert node.task_epoch == 5
     assert planned[0][1] == "target_probe"
     assert planned[0][0][0] == pytest.approx((2.0, 0.0, 0.0))
+
+
+def test_target_probe_candidates_use_only_the_target_ray_without_map_heuristics():
+    node = depth_recovery_node()
+    node.snap_free = lambda _point: pytest.fail(
+        "target probes must not snap to occupancy-grid neighbors"
+    )
+    node.classify_standoff_point = lambda *_args, **_kwargs: pytest.fail(
+        "target probes must not use footprint or N-cell map classification"
+    )
+    result = VLMResult(
+        target_visible=True,
+        object_match=True,
+        qualifier_match=True,
+        relation_match=True,
+        confidence=0.9,
+        target_pixel=Pixel(320, 240),
+        evidence_pixel=Pixel(320, 240),
+    )
+
+    candidates = node.build_target_probe_candidates(
+        depth_recovery_snapshot(), result, (0.0, 0.0, 0.0)
+    )
+
+    assert candidates == pytest.approx(
+        [(2.0, 0.0, 0.0), (1.5, 0.0, 0.0), (1.0, 0.0, 0.0)]
+    )
+
+
+def test_confirmed_target_never_reenters_target_probe_recovery():
+    node = depth_recovery_node()
+    node.target_reference_position = (4.0, 0.0, 0.5)
+    node.send_spin = lambda *_args, **_kwargs: pytest.fail(
+        "a confirmed target must continue to standoff"
+    )
+    node.plan_then_navigate = lambda *_args, **_kwargs: pytest.fail(
+        "a confirmed target must not dispatch a target probe"
+    )
+    result = VLMResult(
+        target_visible=True,
+        object_match=True,
+        qualifier_match=True,
+        relation_match=True,
+        confidence=0.9,
+        target_pixel=Pixel(320, 240),
+        evidence_pixel=Pixel(320, 240),
+    )
+
+    recovered = node.recover_target_depth(
+        depth_recovery_snapshot(),
+        result,
+        "depth_out_of_range:median_m=6.800,limit_m=6.000",
+    )
+
+    assert recovered is False
+    assert node.target_reference_position == (4.0, 0.0, 0.5)
+
+
+def test_target_probe_dispatch_refuses_an_already_confirmed_target():
+    node = depth_recovery_node()
+    node.target_reference_position = (4.0, 0.0, 0.5)
+    node.plan_then_navigate = lambda *_args, **_kwargs: pytest.fail(
+        "a confirmed target must not dispatch a target probe"
+    )
+    result = VLMResult(
+        target_visible=True,
+        object_match=True,
+        qualifier_match=True,
+        relation_match=True,
+        confidence=0.9,
+        target_pixel=Pixel(320, 240),
+        evidence_pixel=Pixel(320, 240),
+    )
+
+    started = node.start_target_probe(
+        depth_recovery_snapshot(), result, "depth_out_of_range"
+    )
+
+    assert started is False
+    assert node.target_reference_position == (4.0, 0.0, 0.5)
 
 
 def test_target_probe_arrival_waits_for_fresh_stationary_observation():
@@ -500,23 +622,11 @@ def test_approach_dispatches_the_exact_nav2_validated_candidate_without_truncati
     node.plan_attempt_count = 1
     node.current_plan_pose = (4.0, 0.0, 0.0)
     node.session_origin = (0.0, 0.0)
-    node.p = SimpleNamespace(
-        max_travel_radius=3.0,
-        path_horizon_segments=16,
-        target_clearance=0.50,
-        robot_front_extent=0.36,
-        approach_goal_margin=0.05,
-        standoff_radius_offsets=[0.0, 0.20],
-    )
+    node.p = SimpleNamespace(max_travel_radius=3.0, path_horizon_segments=16)
     node.plan_kind = "approach"
     node.plan_pending = True
     node.plan_handle = object()
     node.plan_candidates = []
-    node.standoff_candidate_radii = {
-        node.goal_key(node.current_plan_pose): 1.01,
-    }
-    node.selected_standoff_radius = 0.0
-    node.selected_standoff_mode = "none"
     node.get_logger = lambda: SimpleNamespace(
         info=lambda *_args: None,
         warn=lambda *_args: None,
@@ -542,8 +652,6 @@ def test_approach_dispatches_the_exact_nav2_validated_candidate_without_truncati
     assert node.last_plan_radius_clipped is False
     assert node.rolling_goal_is_final is True
     assert node.last_plan_commit_length == pytest.approx(4.0)
-    assert node.selected_standoff_radius == pytest.approx(1.01)
-    assert node.selected_standoff_mode == "degraded"
 
 
 def test_compute_path_and_navigate_use_the_same_approach_goal():
@@ -574,18 +682,9 @@ def test_compute_path_and_navigate_use_the_same_approach_goal():
     node.make_pose_stamped = make_pose
     node.request_next_plan(12)
 
-    node.p = SimpleNamespace(
-        max_travel_radius=3.0,
-        target_clearance=0.50,
-        robot_front_extent=0.36,
-        approach_goal_margin=0.05,
-        standoff_radius_offsets=[0.0, 0.20],
-    )
+    node.p = SimpleNamespace(max_travel_radius=3.0)
     node.plan_pending = True
     node.plan_handle = object()
-    node.standoff_candidate_radii = {node.goal_key(candidate): 0.81}
-    node.selected_standoff_radius = 0.0
-    node.selected_standoff_mode = "none"
     node.get_logger = lambda: SimpleNamespace(
         info=lambda *_args: None,
         warn=lambda *_args: None,
@@ -616,91 +715,302 @@ def test_compute_path_and_navigate_use_the_same_approach_goal():
     assert navigate_goals == [(*candidate, "approach")]
 
 
-def test_standoff_candidates_use_inner_ring_before_degraded_outer_ring():
+def arrival_node(target_distance=0.80):
     node = VLMNavigator.__new__(VLMNavigator)
-    node.target_position = (5.0, 5.0, 0.5)
+    node.state = APPROACHING
+    node.goal_token = 4
+    node.plan_token = 3
+    node.goal_handle = None
+    node.goal_pending = False
+    node.goal_kind = "approach"
+    node.goal_pose = (2.0, 0.0, 0.0)
+    node.plan_pending = False
+    node.plan_handle = None
+    node.plan_candidates = []
+    node.plan_kind = None
+    node.active_motion_origin = (0.0, 0.0)
+    node.target_reference_position = (target_distance, 0.0, 0.5)
+    node.arrival_stop_started = 0.0
+    node.arrival_cancel_requested_at = 0.0
+    node.arrival_cancel_acknowledged = False
+    node.arrival_action_terminal = False
+    node.arrival_action_terminal_at = 0.0
+    node.arrival_stationary_count = 0
+    node.arrival_last_odom_received = 0.0
+    node.arrival_linear_speed = math.inf
+    node.arrival_angular_speed = math.inf
+    node.arrival_retry_count = 0
     node.p = SimpleNamespace(
-        target_clearance=0.50,
-        robot_front_extent=0.36,
-        approach_goal_margin=0.05,
-        standoff_radius_offsets=[0.0, 0.20],
+        target_success_radius=0.81,
+        approach_cancel_radius=0.89,
+        arrival_linear_speed_tolerance=0.03,
+        arrival_angular_speed_tolerance=0.05,
+        arrival_stationary_samples=3,
+        arrival_odom_max_age=0.5,
+        arrival_cancel_timeout=3.0,
+        arrival_stop_timeout=5.0,
+        arrival_retry_limit=1,
+        publish_stop_command=False,
     )
-    node.classify_standoff_point = lambda point: pytest.fail(
-        "approach candidates must be left for Nav2 to validate"
-    )
-
-    candidates = node.evaluate_standoff_candidates(
-        pose=(3.0, 5.0, 0.0), publish=False
-    )
-
-    assert len(candidates) == 32
-    distances = [
-        math.hypot(item[0] - 5.0, item[1] - 5.0)
-        for item in candidates
-    ]
-    assert all(value == pytest.approx(0.81) for value in distances[:16])
-    assert all(value == pytest.approx(1.01) for value in distances[16:])
-    assert [item["radius"] for item in node.standoff_ring_stats] == pytest.approx(
-        [0.81, 1.01]
-    )
-    assert all(item["pending_nav2"] == 16 for item in node.standoff_ring_stats)
-
-
-def test_standoff_candidates_are_not_removed_by_legacy_map_classification():
-    node = VLMNavigator.__new__(VLMNavigator)
-    node.target_position = (5.0, 5.0, 0.5)
-    node.p = SimpleNamespace(
-        target_clearance=0.50,
-        robot_front_extent=0.36,
-        approach_goal_margin=0.05,
-        standoff_radius_offsets=[0.0, 0.20],
-    )
-
-    node.classify_standoff_point = lambda _point: ("occupied", None)
-
-    candidates = node.evaluate_standoff_candidates(
-        pose=(3.0, 5.0, 0.0), publish=False
-    )
-
-    assert len(candidates) == 32
-    assert all(
-        math.hypot(item[0] - 5.0, item[1] - 5.0) == pytest.approx(0.81)
-        for item in candidates[:16]
-    )
-    assert all(
-        math.hypot(item[0] - 5.0, item[1] - 5.0) == pytest.approx(1.01)
-        for item in candidates[16:]
-    )
-
-
-def test_selected_outer_ring_sets_degraded_success_limit_and_can_be_reset():
-    node = VLMNavigator.__new__(VLMNavigator)
-    node.p = SimpleNamespace(
-        target_clearance=0.50,
-        robot_front_extent=0.36,
-        approach_goal_margin=0.05,
-        standoff_radius_offsets=[0.0, 0.20],
-    )
-    pose = (4.0, 5.0, 0.0)
-    node.standoff_candidate_radii = {node.goal_key(pose): 1.01}
-    node.selected_standoff_radius = 0.0
-    node.selected_standoff_mode = "none"
-    warnings = []
+    node.robot_pose = lambda: (0.0, 0.0, 0.0)
     node.get_logger = lambda: SimpleNamespace(
         info=lambda *_args: None,
-        warn=warnings.append,
+        warn=lambda *_args: None,
+        error=lambda *_args: None,
+    )
+    node.publish_stop = lambda: None
+    node.publish_easy_event = lambda *_args, **_kwargs: None
+    node.set_state = lambda state: setattr(node, "state", state)
+    node.fail_safe = lambda reason: (
+        setattr(node, "last_failure_reason", reason),
+        setattr(node, "state", FAILED),
+    )
+    return node
+
+
+def stationary_odom():
+    message = Odometry()
+    message.twist.twist.linear.x = 0.02
+    message.twist.twist.angular.z = 0.04
+    return message
+
+
+def test_distance_contract_requests_cancel_without_immediate_success():
+    node = arrival_node()
+
+    class CancelFuture:
+        def add_done_callback(self, callback):
+            self.callback = callback
+
+    cancel_future = CancelFuture()
+    node.goal_handle = SimpleNamespace(
+        cancel_goal_async=lambda: cancel_future
     )
 
-    node.select_standoff_radius(pose)
+    node.begin_approach_stop("distance_contract_reached")
 
-    assert node.selected_standoff_mode == "degraded"
-    assert node.approach_success_limit() == pytest.approx(1.06)
-    assert warnings and "degraded" in warnings[0]
+    assert node.state == APPROACH_STOPPING
+    assert node.arrival_cancel_requested_at > 0.0
+    assert node.arrival_action_terminal is False
+    assert hasattr(cancel_future, "callback")
 
-    node.clear_standoff_selection()
 
-    assert node.selected_standoff_mode == "none"
-    assert node.approach_success_limit() == pytest.approx(0.86)
+def test_distance_contract_invalidates_a_pending_plan_before_success_checks():
+    node = arrival_node()
+    node.plan_pending = True
+    original_token = node.plan_token
+
+    node.begin_approach_stop("distance_contract_reached")
+
+    assert node.plan_token == original_token + 1
+    assert node.plan_pending is False
+    assert node.arrival_action_terminal is True
+    assert node.state == APPROACH_STOPPING
+
+
+@pytest.mark.parametrize("easy_case_mode", [False, True])
+def test_approach_plans_only_the_target_reference_position(easy_case_mode):
+    node = VLMNavigator.__new__(VLMNavigator)
+    node.state = APPROACHING
+    node.grid = np.zeros((2, 2), dtype=np.int8)
+    node.map_message = object()
+    node.session_origin = (0.0, 0.0)
+    node.goal_handle = None
+    node.goal_pending = False
+    node.plan_pending = False
+    node.target_reference_position = (2.0, -0.5, 0.4)
+    node.p = SimpleNamespace(
+        easy_case_mode=easy_case_mode,
+        target_success_radius=0.81,
+        approach_cancel_radius=0.89,
+    )
+    node.get_parameter = lambda _name: SimpleNamespace(value=True)
+    node.robot_pose = lambda: (0.0, 0.0, 0.35)
+    node.publish_easy_case_markers = lambda _pose: None
+    node.publish_easy_event = lambda *_args, **_kwargs: None
+    planned = []
+    node.plan_then_navigate = lambda candidates, kind: planned.append(
+        (candidates, kind)
+    )
+
+    node.navigation_tick()
+
+    expected_kind = "easy_approach" if easy_case_mode else "approach"
+    assert planned == [([(2.0, -0.5, 0.35)], expected_kind)]
+
+
+def test_approach_requests_stop_at_the_089_cancel_boundary():
+    node = VLMNavigator.__new__(VLMNavigator)
+    node.state = APPROACHING
+    node.grid = np.zeros((2, 2), dtype=np.int8)
+    node.map_message = object()
+    node.session_origin = (0.0, 0.0)
+    node.goal_handle = None
+    node.goal_pending = False
+    node.plan_pending = False
+    node.target_reference_position = (0.85, 0.0, 0.4)
+    node.p = SimpleNamespace(
+        easy_case_mode=False,
+        target_success_radius=0.81,
+        approach_cancel_radius=0.89,
+    )
+    node.get_parameter = lambda _name: SimpleNamespace(value=True)
+    node.robot_pose = lambda: (0.0, 0.0, 0.0)
+    reasons = []
+    node.begin_approach_stop = reasons.append
+    node.plan_then_navigate = lambda *_args: pytest.fail(
+        "the goal must be canceled before entering the success radius"
+    )
+
+    node.navigation_tick()
+
+    assert reasons == ["distance_contract_reached"]
+
+
+def test_cancel_result_and_three_stationary_odom_frames_are_required_for_success():
+    node = arrival_node()
+    node.state = APPROACH_STOPPING
+    node.arrival_stop_started = time.monotonic()
+    node.goal_handle = object()
+    wrapped = SimpleNamespace(status=GoalStatus.STATUS_CANCELED)
+
+    node.on_navigation_result(
+        SimpleNamespace(result=lambda: wrapped), token=4, kind="approach"
+    )
+
+    assert node.state == APPROACH_STOPPING
+    assert node.arrival_action_terminal is True
+    node.on_arrival_odom(stationary_odom())
+    node.on_arrival_odom(stationary_odom())
+    node.advance_approach_stop(time.monotonic())
+    assert node.state == APPROACH_STOPPING
+    node.on_arrival_odom(stationary_odom())
+    node.advance_approach_stop(time.monotonic())
+    assert node.state == "SUCCEEDED"
+
+
+def test_nav2_success_still_enters_stop_confirmation():
+    node = arrival_node()
+    node.goal_handle = object()
+    wrapped = SimpleNamespace(status=GoalStatus.STATUS_SUCCEEDED)
+
+    node.on_navigation_result(
+        SimpleNamespace(result=lambda: wrapped), token=4, kind="approach"
+    )
+
+    assert node.state == APPROACH_STOPPING
+    assert node.arrival_action_terminal is True
+
+
+def test_moving_odom_resets_the_consecutive_stationary_count():
+    node = arrival_node()
+    node.state = APPROACH_STOPPING
+    node.on_arrival_odom(stationary_odom())
+    node.on_arrival_odom(stationary_odom())
+    moving = stationary_odom()
+    moving.twist.twist.linear.x = 0.04
+
+    node.on_arrival_odom(moving)
+
+    assert node.arrival_stationary_count == 0
+
+
+def test_pending_action_that_never_accepts_hits_cancel_timeout():
+    node = arrival_node()
+    node.goal_pending = True
+    node.begin_approach_stop("distance_contract_reached")
+
+    node.advance_approach_stop(
+        node.arrival_stop_started + node.p.arrival_cancel_timeout + 0.01
+    )
+
+    assert node.state == FAILED
+    assert "terminal" in node.last_failure_reason
+
+
+def test_stale_odom_cannot_complete_stop_confirmation():
+    node = arrival_node()
+    node.begin_approach_stop("nav2_action_succeeded", action_terminal=True)
+    node.arrival_stationary_count = 3
+    node.arrival_last_odom_received = node.arrival_stop_started
+
+    node.advance_approach_stop(
+        node.arrival_stop_started + node.p.arrival_stop_timeout + 0.01
+    )
+
+    assert node.state == FAILED
+    assert "fresh odometry" in node.last_failure_reason
+
+
+def test_motion_stop_timeout_starts_after_the_action_becomes_terminal():
+    node = arrival_node()
+    node.state = APPROACH_STOPPING
+    node.arrival_stop_started = time.monotonic() - 2.9
+    node.arrival_action_terminal = True
+    node.arrival_action_terminal_at = time.monotonic()
+
+    node.advance_approach_stop(
+        node.arrival_action_terminal_at + node.p.arrival_stop_timeout - 0.01
+    )
+    assert node.state == APPROACH_STOPPING
+
+    node.advance_approach_stop(
+        node.arrival_action_terminal_at + node.p.arrival_stop_timeout + 0.01
+    )
+    assert node.state == FAILED
+
+
+def test_stopped_outside_contract_replans_once_then_fails():
+    node = arrival_node(target_distance=0.82)
+    node.state = APPROACH_STOPPING
+    node.arrival_stop_started = time.monotonic()
+    node.arrival_action_terminal = True
+    node.arrival_stationary_count = 3
+    node.arrival_last_odom_received = time.monotonic()
+
+    node.advance_approach_stop(time.monotonic())
+
+    assert node.state == APPROACHING
+    assert node.arrival_retry_count == 1
+
+    node.begin_approach_stop("nav2_action_succeeded", action_terminal=True)
+    node.arrival_stationary_count = 3
+    node.arrival_last_odom_received = time.monotonic()
+    node.advance_approach_stop(time.monotonic())
+
+    assert node.state == FAILED
+    assert "outside" in node.last_failure_reason
+
+
+def test_retry_inside_cancel_boundary_is_allowed_to_drive_to_success_radius():
+    node = VLMNavigator.__new__(VLMNavigator)
+    node.state = APPROACHING
+    node.grid = np.zeros((2, 2), dtype=np.int8)
+    node.map_message = object()
+    node.session_origin = (0.0, 0.0)
+    node.goal_handle = None
+    node.goal_pending = False
+    node.plan_pending = False
+    node.target_reference_position = (0.85, 0.0, 0.4)
+    node.arrival_retry_count = 1
+    node.p = SimpleNamespace(
+        easy_case_mode=False,
+        target_success_radius=0.81,
+        approach_cancel_radius=0.89,
+    )
+    node.get_parameter = lambda _name: SimpleNamespace(value=True)
+    node.robot_pose = lambda: (0.0, 0.0, 0.0)
+    planned = []
+    node.plan_then_navigate = lambda candidates, kind: planned.append(
+        (candidates, kind)
+    )
+    node.begin_approach_stop = lambda *_args: pytest.fail(
+        "the one allowed retry must be able to close the remaining gap"
+    )
+
+    node.navigation_tick()
+
+    assert planned == [([(0.85, 0.0, 0.0)], "approach")]
 
 
 def test_planner_action_failure_is_distinct_from_radius_rejection():
@@ -826,33 +1136,6 @@ def test_short_frontier_path_commits_to_actual_frontier():
     assert node.frontier_goal_is_final is True
 
 
-def test_rolling_waypoint_checkpoint_waits_for_a_newer_vlm_frame():
-    node = VLMNavigator.__new__(VLMNavigator)
-    node.goal_token = 9
-    node.goal_pose = (3.0, 0.0, 0.0)
-    node.goal_handle = object()
-    node.goal_pending = False
-    node.goal_kind = "waypoint"
-    node.rolling_goal_is_final = False
-    node.sequence = 42
-    node.pending_waypoints = [(4.0, 0.0, 0.0)]
-    node.active_motion_origin = (0.0, 0.0)
-    stopped = []
-    node.publish_stop = lambda: stopped.append(True)
-    node.get_logger = lambda: SimpleNamespace(info=lambda _message: None)
-    wrapped = SimpleNamespace(status=GoalStatus.STATUS_SUCCEEDED)
-
-    node.on_navigation_result(
-        SimpleNamespace(result=lambda: wrapped), token=9, kind="waypoint"
-    )
-
-    assert stopped
-    assert not node.pending_waypoints
-    assert node.rolling_reassessment_required is True
-    assert node.rolling_reassessment_after_sequence == 42
-    assert node.active_motion_origin is None
-
-
 def test_api_failure_does_not_overwrite_failed_state():
     node = VLMNavigator.__new__(VLMNavigator)
     node.state = FAILED
@@ -895,18 +1178,23 @@ def test_vlm_result_is_published_and_forwarded_to_image_recorder():
     )
     result = VLMResult(
         target_visible=True,
+        object_match=True,
+        qualifier_match=True,
+        relation_match=True,
         confidence=0.92,
         target_pixel=Pixel(640, 320),
-        waypoints=(Pixel(620, 500),),
+        evidence_pixel=Pixel(700, 250),
     )
     completed = WorkerResult(
         snapshot,
         result,
         0.75,
         raw_response=(
-            '{"target_visible":true,"confidence":0.92,'
+            '{"target_visible":true,"object_match":true,'
+            '"qualifier_match":true,"relation_match":true,'
+            '"confidence":0.92,'
             '"target_pixel":{"u":640,"v":320},'
-            '"waypoints":[{"u":620,"v":500}]}'
+            '"evidence_pixel":{"u":700,"v":250}}'
         ),
     )
 
@@ -921,13 +1209,123 @@ def test_vlm_result_is_published_and_forwarded_to_image_recorder():
     assert record["disposition"] == "accepted_target"
     assert record["accepted"] is True
     assert record["parsed_result"]["target_pixel"] == {"u": 640, "v": 320}
+    assert record["parsed_result"]["object_match"] is True
+    assert record["parsed_result"]["qualifier_match"] is True
+    assert record["parsed_result"]["relation_match"] is True
+    assert record["parsed_result"]["evidence_pixel"] == {"u": 700, "v": 250}
+    assert "waypoints" not in record["parsed_result"]
     assert record["raw_response"].startswith('{"target_visible":true')
     assert recorded[0][0] is snapshot
     assert recorded[0][1] is result
     assert recorded[0][2] == "accepted_target"
 
 
-def test_grounded_markers_include_target_label_and_ordered_path_without_deleteall():
+def semantic_gate_node():
+    node = VLMNavigator.__new__(VLMNavigator)
+    node.state = SEARCHING
+    node.task_epoch = 3
+    node.last_api_latency = 0.0
+    node.last_result_age = 0.0
+    node.last_vlm_confidence = 0.0
+    node.api_failures = 0
+    node.accepted_results = 0
+    node.rejected_results = 0
+    node.target_reference_position = None
+    node.p = SimpleNamespace(max_result_age=10.0, confidence_threshold=0.60)
+    node.get_parameter = lambda name: SimpleNamespace(
+        value=True if name == "enabled" else "放了可乐的椅子"
+    )
+    node.is_current_scan_result = lambda snapshot: False
+    node.is_current_depth_reobserve_result = lambda snapshot: False
+    node.publish_debug = lambda *_args: None
+    node.log_dispositions = []
+    node.log_worker_result = (
+        lambda _completed, _age, _state, disposition:
+        node.log_dispositions.append(disposition)
+    )
+    node.target_tracker = SimpleNamespace(reset=lambda: None)
+    node.clear_vlm_grounding_markers = lambda: None
+    return node
+
+
+def semantic_gate_completed(result):
+    snapshot = SimpleNamespace(
+        captured_monotonic=time.monotonic(),
+        request_kind="target",
+        task_epoch=3,
+        target_description="放了可乐的椅子",
+    )
+    return WorkerResult(snapshot=snapshot, result=result, latency_s=0.2)
+
+
+def test_partial_semantic_match_never_enters_target_grounding():
+    node = semantic_gate_node()
+    node.ground_pixel_with_reason = lambda *_args, **_kwargs: pytest.fail(
+        "partial semantic matches must not be projected"
+    )
+    result = VLMResult(
+        target_visible=True,
+        object_match=True,
+        qualifier_match=False,
+        relation_match=False,
+        confidence=0.95,
+        target_pixel=Pixel(640, 320),
+        evidence_pixel=Pixel(700, 250),
+    )
+
+    node.handle_worker_result(semantic_gate_completed(result))
+
+    assert node.log_dispositions == ["accepted_no_target"]
+
+
+def test_missing_semantic_evidence_never_enters_target_grounding():
+    node = semantic_gate_node()
+    node.ground_pixel_with_reason = lambda *_args, **_kwargs: pytest.fail(
+        "a complete semantic gate requires evidence_pixel"
+    )
+    result = VLMResult(
+        target_visible=True,
+        object_match=True,
+        qualifier_match=True,
+        relation_match=True,
+        confidence=0.95,
+        target_pixel=Pixel(640, 320),
+        evidence_pixel=None,
+    )
+
+    node.handle_worker_result(semantic_gate_completed(result))
+
+    assert node.log_dispositions == ["accepted_no_target"]
+
+
+def test_complete_match_projects_target_pixel_but_not_evidence_pixel():
+    node = semantic_gate_node()
+    projected = []
+    node.ground_pixel_with_reason = (
+        lambda _snapshot, pixel, require_ground:
+        projected.append((pixel, require_ground)) or ((1.0, 2.0, 0.5), "ok")
+    )
+    node.clear_target_depth_recovery = lambda: None
+    node.confirm_target = lambda target: None
+    node.easy_case_enabled = lambda: True
+    node.publish_grounded_markers = lambda *_args: None
+    result = VLMResult(
+        target_visible=True,
+        object_match=True,
+        qualifier_match=True,
+        relation_match=True,
+        confidence=0.90,
+        target_pixel=Pixel(640, 320),
+        evidence_pixel=Pixel(700, 250),
+    )
+
+    node.handle_worker_result(semantic_gate_completed(result))
+
+    assert projected == [(Pixel(640, 320), False)]
+    assert node.log_dispositions == ["accepted_target_easy_case"]
+
+
+def test_grounded_markers_include_only_target_and_label_without_deleteall():
     node = VLMNavigator.__new__(VLMNavigator)
     node.p = SimpleNamespace(global_frame="map", target_description="chair")
     node.last_vlm_confidence = 0.91
@@ -937,30 +1335,12 @@ def test_grounded_markers_include_target_label_and_ordered_path_without_deleteal
         now=lambda: SimpleNamespace(to_msg=lambda: Time())
     )
 
-    node.publish_grounded_markers(
-        target=(2.0, 0.5, 0.1),
-        waypoints=[(0.5, 0.0, 0.0), (1.2, 0.2, 0.0)],
-    )
+    node.publish_grounded_markers(target=(2.0, 0.5, 0.1))
 
     markers = published[0].markers
     assert not any(item.action == Marker.DELETEALL for item in markers)
     namespaces = {item.ns for item in markers if item.action == Marker.ADD}
-    assert {
-        "vlm_target",
-        "vlm_target_label",
-        "vlm_waypoints",
-        "vlm_path",
-    }.issubset(namespaces)
-    path = next(
-        item
-        for item in markers
-        if item.ns == "vlm_path" and item.action == Marker.ADD
-    )
-    assert [(point.x, point.y) for point in path.points] == [
-        (0.5, 0.0),
-        (1.2, 0.2),
-        (2.0, 0.5),
-    ]
+    assert namespaces == {"vlm_target", "vlm_target_label"}
 
 
 @pytest.mark.parametrize("terminal_state", [SENSOR_WAITING, FAILED])
@@ -1031,11 +1411,12 @@ def safety_test_node():
         tf_failure_timeout=3.0,
         max_travel_radius=3.0,
         target_lost_timeout=10.0,
+        target_confirmation_timeout=20.0,
         goal_timeout=120.0,
     )
     node.get_parameter = lambda name: SimpleNamespace(value=True)
     node.session_origin = None
-    node.target_position = None
+    node.target_reference_position = None
     node.goal_handle = None
     node.goal_pending = False
     node.plan_pending = False
@@ -1045,6 +1426,7 @@ def safety_test_node():
     node.last_robot_tf_success = now
     node.sensor_wait_started = 0.0
     node.sensor_wait_reason = "none"
+    node.target_confirmation_started = time.monotonic()
     return node
 
 
@@ -1063,6 +1445,23 @@ def test_safety_tick_refreshes_robot_tf_while_target_confirming():
     node.safety_tick()
 
     assert failures == []
+
+
+def test_safety_tick_fails_with_confirmation_progress_instead_of_hanging():
+    """Catch removal of the bounded TARGET_CONFIRMING watchdog."""
+    node = safety_test_node()
+    node.target_confirmation_started = time.monotonic() - 21.0
+    node.target_tracker = SimpleNamespace(progress=2, required_frames=3, reset_count=7)
+    node.robot_pose = lambda: (0.0, 0.0, 0.0)
+    failures = []
+    node.fail_safe = failures.append
+
+    node.safety_tick()
+
+    assert failures == [
+        "Target confirmation did not converge within 20.0s "
+        "(progress=2/3, spatial_resets=7)"
+    ]
 
 
 def test_safety_tick_pauses_for_camera_tf_without_failing():
@@ -1228,7 +1627,7 @@ def test_delayed_image_tf_is_retried_at_the_exact_original_stamp():
 def test_map_update_does_not_cancel_nav2_validated_approach():
     node = VLMNavigator.__new__(VLMNavigator)
     node.state = APPROACHING
-    node.target_position = (2.0, 0.0, 0.5)
+    node.target_reference_position = (2.0, 0.0, 0.5)
     node.map_revision = 3
     node.get_logger = lambda: SimpleNamespace(warn=lambda *_args: None)
     cancelled = []
@@ -1262,7 +1661,7 @@ def test_compact_diagnostics_keep_only_fault_isolation_fields():
     node.last_result_age = 0.4
     node.last_api_latency = 1.2
     node.last_vlm_disposition = "target_rejected"
-    node.target_position = None
+    node.target_reference_position = None
     node.last_target_grounding_error = "invalid_depth"
     node.plan_pending = False
     node.plan_kind = None
@@ -1285,7 +1684,7 @@ def test_compact_diagnostics_keep_only_fault_isolation_fields():
         "vlm_status",
         "target_status",
         "navigation_status",
-        "standoff_status",
+        "approach_status",
         "sensor_wait_reason",
         "last_api_error",
         "last_failure_reason",
@@ -1296,3 +1695,49 @@ def test_compact_diagnostics_keep_only_fault_isolation_fields():
         "waiting_vlm; heading=2/3; retry=1"
     )
     assert values["target_status"] == "rejected; invalid_depth"
+
+
+def test_compact_diagnostics_expose_target_confirmation_resets():
+    """Catch diagnostics that collapse a non-converging tracker to target_found."""
+    now = time.monotonic()
+    node = VLMNavigator.__new__(VLMNavigator)
+    node.state = TARGET_CONFIRMING
+    node.sequence = 8
+    node.last_camera_tf_success = now
+    node.last_robot_tf_success = now
+    node.last_image_tf_error = "none"
+    node.scan_headings = []
+    node.scan_index = 0
+    node.scan_waiting_for_vlm = False
+    node.scan_retry_count = 0
+    node.scan_settle_until = 0.0
+    node.goal_kind = None
+    node.last_failure_reason = "none"
+    node.last_result_age = 0.2
+    node.last_api_latency = 1.0
+    node.last_vlm_disposition = "accepted_target"
+    node.target_reference_position = None
+    node.last_target_grounding_error = "none"
+    node.target_confirmation_started = now - 6.25
+    node.target_tracker = SimpleNamespace(
+        progress=2,
+        required_frames=3,
+        reset_count=4,
+        last_jump_distance=0.62,
+    )
+    node.plan_pending = False
+    node.plan_kind = None
+    node.goal_pending = False
+    node.goal_handle = None
+    node.last_plan_rejection_reason = "none"
+    node.last_plan_kind = "none"
+    node.last_plan_status = -1
+    node.sensor_wait_reason = "none"
+    node.last_api_error = "none"
+
+    values = node.compact_diagnostic_values(now, worker_busy=False)
+
+    assert values["target_status"] == (
+        "confirming; progress=2/3; age_s=6.25; "
+        "spatial_resets=4; last_jump_m=0.62"
+    )

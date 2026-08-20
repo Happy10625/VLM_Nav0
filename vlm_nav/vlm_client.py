@@ -23,6 +23,9 @@ RESPONSE_SCHEMA: Dict[str, Any] = {
         "type": "object",
         "properties": {
             "target_visible": {"type": "boolean"},
+            "object_match": {"type": "boolean"},
+            "qualifier_match": {"type": "boolean"},
+            "relation_match": {"type": "boolean"},
             "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
             "target_pixel": {
                 "anyOf": [
@@ -38,22 +41,30 @@ RESPONSE_SCHEMA: Dict[str, Any] = {
                     {"type": "null"},
                 ]
             },
-            "waypoints": {
-                "type": "array",
-                "minItems": 0,
-                "maxItems": 3,
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "u": {"type": "integer"},
-                        "v": {"type": "integer"},
+            "evidence_pixel": {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "u": {"type": "integer"},
+                            "v": {"type": "integer"},
+                        },
+                        "required": ["u", "v"],
+                        "additionalProperties": False,
                     },
-                    "required": ["u", "v"],
-                    "additionalProperties": False,
-                },
+                    {"type": "null"},
+                ]
             },
         },
-        "required": ["target_visible", "confidence", "target_pixel", "waypoints"],
+        "required": [
+            "target_visible",
+            "object_match",
+            "qualifier_match",
+            "relation_match",
+            "confidence",
+            "target_pixel",
+            "evidence_pixel",
+        ],
         "additionalProperties": False,
     },
 }
@@ -67,13 +78,28 @@ def validate_vlm_result(
 ) -> VLMResult:
     if not isinstance(payload, dict) or set(payload) != {
         "target_visible",
+        "object_match",
+        "qualifier_match",
+        "relation_match",
         "confidence",
         "target_pixel",
-        "waypoints",
+        "evidence_pixel",
     }:
         raise ValueError("response must contain exactly the documented fields")
     if not isinstance(payload["target_visible"], bool):
         raise ValueError("target_visible must be boolean")
+    semantic_fields = (
+        "object_match",
+        "qualifier_match",
+        "relation_match",
+    )
+    if any(not isinstance(payload[field], bool) for field in semantic_fields):
+        raise ValueError("semantic match fields must be boolean")
+    semantic_match = all(payload[field] for field in semantic_fields)
+    if payload["target_visible"] != semantic_match:
+        raise ValueError(
+            "target_visible must agree with all semantic match fields"
+        )
     confidence = payload["confidence"]
     if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
         raise ValueError("confidence must be numeric")
@@ -85,9 +111,12 @@ def validate_vlm_result(
         raise ValueError(f"unsupported coordinate mode: {coordinate_mode}")
 
     def parse_pixel(value: Any) -> Pixel:
-        if not isinstance(value, dict) or set(value) != {"u", "v"}:
+        if isinstance(value, dict) and set(value) == {"u", "v"}:
+            u, v = value["u"], value["v"]
+        elif isinstance(value, (list, tuple)) and len(value) == 2:
+            u, v = value
+        else:
             raise ValueError("pixel must contain exactly u and v")
-        u, v = value["u"], value["v"]
         if isinstance(u, bool) or isinstance(v, bool) or not isinstance(u, int) or not isinstance(v, int):
             raise ValueError("pixel coordinates must be integers")
         if coordinate_mode == "normalized_1000":
@@ -105,17 +134,18 @@ def validate_vlm_result(
     target = None if raw_target is None else parse_pixel(raw_target)
     if payload["target_visible"] != (target is not None):
         raise ValueError("target_visible and target_pixel disagree")
-    raw_waypoints = payload["waypoints"]
-    if not isinstance(raw_waypoints, list) or len(raw_waypoints) > 3:
-        raise ValueError("waypoints must be an array with at most three entries")
-    waypoints = tuple(parse_pixel(item) for item in raw_waypoints)
-    if not payload["target_visible"] and waypoints:
-        raise ValueError("waypoints must be empty when target is not visible")
+    raw_evidence = payload["evidence_pixel"]
+    evidence = None if raw_evidence is None else parse_pixel(raw_evidence)
+    if payload["target_visible"] != (evidence is not None):
+        raise ValueError("target_visible and evidence_pixel disagree")
     return VLMResult(
         target_visible=payload["target_visible"],
+        object_match=payload["object_match"],
+        qualifier_match=payload["qualifier_match"],
+        relation_match=payload["relation_match"],
         confidence=confidence,
         target_pixel=target,
-        waypoints=waypoints,
+        evidence_pixel=evidence,
         coordinate_mode=coordinate_mode,
     )
 
@@ -147,71 +177,59 @@ def validate_frontier_decision(payload: Any, valid_ids: Iterable[int]) -> Fronti
     return FrontierDecision(selected, confidence, reason.strip()[:199])
 
 
-def overlay_coordinate_grid(
-    rgb: np.ndarray, spacing: int = 80, normalized_1000: bool = False
-) -> np.ndarray:
-    """Draw a sparse coordinate grid on a copy, retaining original dimensions."""
-    image = np.ascontiguousarray(rgb.copy())
-    height, width = image.shape[:2]
-    color = (255, 215, 0)
-    if normalized_1000:
-        for value in range(0, 1001, 100):
-            x = int(round(value * max(0, width - 1) / 1000.0))
-            y = int(round(value * max(0, height - 1) / 1000.0))
-            cv2.line(image, (x, 0), (x, height - 1), color, 1, cv2.LINE_AA)
-            cv2.putText(
-                image,
-                str(value),
-                (min(x + 2, max(0, width - 38)), 16),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.40,
-                color,
-                1,
-            )
-            cv2.line(image, (0, y), (width - 1, y), color, 1, cv2.LINE_AA)
-            cv2.putText(
-                image,
-                str(value),
-                (2, min(y + 15, max(0, height - 3))),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.40,
-                color,
-                1,
-            )
-    else:
-        for x in range(0, width, max(20, spacing)):
-            cv2.line(image, (x, 0), (x, height - 1), color, 1, cv2.LINE_AA)
-            cv2.putText(image, str(x), (min(x + 2, width - 35), 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1)
-        for y in range(0, height, max(20, spacing)):
-            cv2.line(image, (0, y), (width - 1, y), color, 1, cv2.LINE_AA)
-            cv2.putText(image, str(y), (2, min(y + 15, height - 3)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1)
-    return image
-
-
 def build_prompt(
     target: str, width: int, height: int, normalized_1000: bool = False
 ) -> str:
     coordinate_instruction = (
-        "Qwen coordinate mode is required: express every target_pixel and waypoint on a "
-        "normalized 1000x1000 grid with integer u,v in [0,1000], regardless of the "
-        f"actual {width}x{height} image size. (0,0) is top-left and (1000,1000) is "
-        "bottom-right. The drawn grid labels use this normalized coordinate system. "
+        "Use the normalized 1000x1000 output coordinate system for every "
+        "target_pixel and evidence_pixel while preserving the original "
+        f"{width}x{height} image and its aspect ratio. (0,0) is top-left and "
+        "(1000,1000) is bottom-right. "
         if normalized_1000
         else (
             f"Use actual {width}x{height} image pixel coordinates with origin (0,0) "
-            "at top-left. "
+            f"at top-left: u must be in [0,{max(0, width - 1)}] and v must be in "
+            f"[0,{max(0, height - 1)}]. "
         )
+    )
+    target_lower = target.lower()
+    cola_hard_negative = (
+        "For a cola qualifier, cola means a visually identifiable cola drink such as "
+        "Coca-Cola or Pepsi; a transparent kettle or ordinary water bottle on a chair "
+        "is a hard negative, not a cola-chair match. "
+        if any(token in target_lower for token in ("可乐", "cola", "coke"))
+        else ""
     )
     return (
         f"Find this static navigation target: {target!r}. The submitted RGB image is "
-        f"{width}x{height} pixels. {coordinate_instruction}Only set target_visible=true "
-        "when the target is clearly visible. target_pixel must be a pixel on the visible target. "
-        "The JSON object must contain exactly these four fields: target_visible (boolean), "
-        "confidence (number from 0.0 to 1.0), target_pixel ({u: integer, v: integer} or null), "
-        "and waypoints (an array of {u: integer, v: integer}). "
-        "When visible, return 1 to 3 traversable ground pixels leading toward it, ordered nearest "
-        "to farthest. Choose clear floor, not walls, objects, stairs, ledges, or the target itself. "
-        "When not visible return target_pixel=null and waypoints=[]. Never output velocities, "
+        f"{width}x{height} pixels. {coordinate_instruction}Interpret every explicit object, "
+        "attribute, associated object, identity, and spatial relation in the target description "
+        "as constraints joined by logical AND. Examine every plausible main-object candidate; "
+        "do not stop at the first object of the right category. Set object_match=true only when "
+        "the main object category matches. Set qualifier_match=true only when every required "
+        "attribute, identity, or associated object is clearly and specifically visible; set it "
+        "to true when the description has no qualifier. Set relation_match=true only when every "
+        "required relation is visibly satisfied; set it to true when no relation is required. "
+        "If you cannot reliably identify the qualifier because it is small, occluded, ambiguous, "
+        "or unreadable, set qualifier_match=false. Never guess from a similar container, color, "
+        "shape, or scene context. target_pixel and evidence_pixel must belong to the same candidate "
+        "combination and visibly satisfy the required relation. They may be on distinct objects and image regions "
+        "when those exact instances visibly satisfy the requested relation. Never pair the main object from "
+        "one candidate combination with a qualifier from another. "
+        f"{cola_hard_negative}target_visible must equal the logical AND of object_match, "
+        "qualifier_match, and relation_match: set target_visible=true if and only if all three are true. "
+        "confidence is the confidence that the complete target "
+        "description is simultaneously satisfied, not confidence in the main object category alone. "
+        "target_pixel must be on solid visible material of the main navigation object. evidence_pixel "
+        "must be on solid visible material of the most discriminative required qualifier, or on the "
+        "main object when no qualifier exists. Never place either pixel in holes, cutouts, gaps, or openings, "
+        "or on background visible through the target. "
+        "The JSON object must contain exactly these seven fields: target_visible (boolean), "
+        "object_match (boolean), qualifier_match (boolean), relation_match (boolean), confidence "
+        "(number from 0.0 to 1.0), target_pixel ({u: integer, v: integer} or null), evidence_pixel "
+        "({u: integer, v: integer} or null). Each non-null pixel must be a JSON object "
+        "with exactly the keys u and v, never an array. When not visible return target_pixel=null and "
+        "evidence_pixel=null. Never output velocities, "
         "steering commands, prose, or fields outside the schema. Return exactly one valid JSON "
         "object matching the requested fields."
     )
@@ -303,17 +321,8 @@ class OpenAICompatibleVLMClient:
         # DashScope documents json_object, but not OpenAI's json_schema form.
         self._structured_output_supported = not self._is_qwen
 
-    def _image_content(
-        self,
-        rgb: np.ndarray,
-        add_grid: bool = False,
-        normalized_grid: bool = False,
-    ):
-        image = (
-            overlay_coordinate_grid(rgb, normalized_1000=normalized_grid)
-            if add_grid
-            else np.ascontiguousarray(rgb)
-        )
+    def _image_content(self, rgb: np.ndarray):
+        image = np.ascontiguousarray(rgb)
         ok, encoded = cv2.imencode(
             ".jpg",
             cv2.cvtColor(image, cv2.COLOR_RGB2BGR),
@@ -376,9 +385,7 @@ class OpenAICompatibleVLMClient:
                             target, width, height, normalized_1000=self._is_qwen
                         ),
                     },
-                    self._image_content(
-                        rgb, add_grid=True, normalized_grid=self._is_qwen
-                    ),
+                    self._image_content(rgb),
                 ],
             },
         ]

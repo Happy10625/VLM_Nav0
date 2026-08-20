@@ -30,14 +30,17 @@ def test_recorder_retains_only_latest_three_arm_sessions(tmp_path):
     assert len(list(tmp_path.glob("arm_*"))) == 3
 
 
-def test_target_record_draws_ordered_vlm_path(tmp_path):
+def test_target_record_draws_only_target_and_semantic_evidence(tmp_path):
     recorder = ArmImageRecorder(tmp_path)
     recorder.start_arm(datetime(2026, 1, 1, 10, 0, 0))
     result = VLMResult(
-        True,
-        0.9,
-        Pixel(180, 40),
-        (Pixel(80, 130), Pixel(130, 90)),
+        target_visible=True,
+        object_match=True,
+        qualifier_match=True,
+        relation_match=True,
+        confidence=0.9,
+        target_pixel=Pixel(180, 40),
+        evidence_pixel=Pixel(200, 30),
     )
 
     saved = recorder.record(target_snapshot(), result, "accepted_target")
@@ -48,6 +51,34 @@ def test_target_record_draws_ordered_vlm_path(tmp_path):
     image = cv2.imread(saved[0])
     assert image is not None
     assert np.count_nonzero(image) > 0
+
+
+def test_failed_target_record_preserves_frame_without_coordinate_grid(tmp_path):
+    recorder = ArmImageRecorder(tmp_path, jpeg_quality=100)
+    recorder.start_arm(datetime(2026, 1, 1, 10, 0, 0))
+
+    saved = recorder.record(target_snapshot(), None, "api_error")
+
+    image = cv2.imread(saved[0])
+    assert image is not None
+    assert np.count_nonzero(image) == 0
+
+
+def test_target_annotation_marks_semantic_evidence_pixel():
+    image = np.zeros((160, 240, 3), dtype=np.uint8)
+    result = VLMResult(
+        target_visible=True,
+        object_match=True,
+        qualifier_match=True,
+        relation_match=True,
+        confidence=0.9,
+        target_pixel=Pixel(180, 40),
+        evidence_pixel=Pixel(35, 50),
+    )
+
+    ArmImageRecorder.draw_target_annotation(image, result)
+
+    assert np.count_nonzero(image[40:61, 25:46]) > 0
 
 
 def test_frontier_record_saves_both_inputs_and_marks_selected_path(tmp_path):

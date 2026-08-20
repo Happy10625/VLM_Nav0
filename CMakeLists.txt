@@ -97,6 +97,7 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_pipeline test/test_pipeline.py)
   ament_add_pytest_test(test_vlm_client test/test_vlm_client.py)
   ament_add_pytest_test(test_obstacle_chain_config test/test_obstacle_chain_config.py)
+  ament_add_pytest_test(test_obstacle_cloud_filter_runtime test/test_obstacle_cloud_filter_runtime.py TIMEOUT 20)
 endif()
 
 ament_package()

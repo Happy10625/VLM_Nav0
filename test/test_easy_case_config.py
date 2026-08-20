@@ -73,7 +73,7 @@ def test_rviz_keeps_core_views_on_and_auxiliary_views_off():
         "2D Obstacles (/scan, cyan)",
         "FAST_LIO Live Body Cloud (/cloud_registered_body)",
         "Nav2 Global Plan",
-        "VLM TARGET / PATH (red / green)",
+        "VLM TARGET (red)",
         "VLM Annotated Image",
     ):
         assert displays[name]["Enabled"] is True
@@ -112,3 +112,41 @@ def test_mapping_and_nav2_use_the_standard_filtered_cloud():
     ]["fastlio_cloud"]
     assert global_cloud["topic"] == expected_topic
     assert local_cloud["topic"] == expected_topic
+
+
+def test_arrival_stop_confirmation_uses_fastlio_odometry_contract():
+    robot = yaml.safe_load((ROOT / "config" / "robot.yaml").read_text())
+
+    params = robot["vlm_nav"]["ros__parameters"]
+    assert params["arrival_odom_topic"] == "/fastlio/odom"
+    assert params["arrival_linear_speed_tolerance"] == 0.03
+    assert params["arrival_angular_speed_tolerance"] == 0.05
+    assert params["arrival_stationary_samples"] == 3
+    assert params["arrival_odom_max_age"] == 0.5
+
+
+def test_target_reference_navigation_uses_native_nav2_tolerance_budget():
+    robot = yaml.safe_load((ROOT / "config" / "robot.yaml").read_text())
+    nav2 = yaml.safe_load((ROOT / "config" / "nav2_overrides.yaml").read_text())
+    easy = yaml.safe_load((ROOT / "config" / "nav2_easy_case.yaml").read_text())
+
+    params = robot["vlm_nav"]["ros__parameters"]
+    assert params["target_success_radius"] == 0.81
+    assert params["approach_cancel_radius"] == 0.89
+    for removed in (
+        "standoff_radius_offsets",
+        "debug_show_standoff_candidates",
+        "easy_case_standoff_distance",
+    ):
+        assert removed not in params
+
+    for profile in (nav2, easy):
+        planner = profile["planner_server"]["ros__parameters"]["GridBased"]
+        controller = profile["controller_server"]["ros__parameters"]
+        assert planner["tolerance"] == 0.76
+        assert planner["use_final_approach_orientation"] is True
+        assert (
+            controller["general_goal_checker"]["plugin"]
+            == "nav2_controller::PositionGoalChecker"
+        )
+        assert controller["general_goal_checker"]["xy_goal_tolerance"] == 0.05

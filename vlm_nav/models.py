@@ -15,9 +15,12 @@ class Pixel:
 @dataclass(frozen=True)
 class VLMResult:
     target_visible: bool
+    object_match: bool
+    qualifier_match: bool
+    relation_match: bool
     confidence: float
     target_pixel: Optional[Pixel]
-    waypoints: Tuple[Pixel, ...]
+    evidence_pixel: Optional[Pixel]
     coordinate_mode: str = "pixels"
 
 

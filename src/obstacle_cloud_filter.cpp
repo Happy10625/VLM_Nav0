@@ -18,6 +18,7 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <tf2/time.hpp>
 #include <tf2_ros/buffer.h>
+#include <tf2_ros/create_timer_ros.h>
 #include <tf2_ros/message_filter.h>
 #include <tf2_ros/transform_listener.h>
 
@@ -53,6 +54,8 @@ public:
 
     publisher_ = create_publisher<Cloud>(output_topic_, rclcpp::SensorDataQoS());
     tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
+    tf_buffer_->setCreateTimerInterface(std::make_shared<tf2_ros::CreateTimerROS>(
+      get_node_base_interface(), get_node_timers_interface()));
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
     cloud_subscriber_ = std::make_shared<message_filters::Subscriber<Cloud>>(
