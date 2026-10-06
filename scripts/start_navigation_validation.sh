@@ -29,16 +29,22 @@ wait_for_topic_type() {
 run_component() {
   local component="$1"
   local target_description="${2:-chair}"
+  local localization_mode="${3:-slam}"
+  local map_yaml="${4:-}"
+  local amcl_scan_topic="${5:-/scan}"
 
   source "${script_dir}/common.sh"
   unset ALL_PROXY all_proxy
 
   case "$component" in
     system)
-      echo "[导航验证] 启动建图、Nav2 和 VLM_Nav（enabled=false）"
+      echo "[导航验证] 启动 ${localization_mode} 定位、Nav2 和 VLM_Nav（enabled=false）"
       exec ros2 launch vlm_nav "${VLM_NAV_SYSTEM_LAUNCH:-system.launch.py}" \
         enabled:=false \
-        target_description:="$target_description"
+        target_description:="$target_description" \
+        localization_mode:="$localization_mode" \
+        map:="$map_yaml" \
+        amcl_scan_topic:="$amcl_scan_topic"
       ;;
     rviz)
       exec "${script_dir}/start_rviz.sh"
@@ -67,13 +73,18 @@ if [[ "${1:-}" == "--component" ]]; then
     echo "错误：--component 后缺少组件名称。" >&2
     exit 2
   fi
-  run_component "$2" "${3:-chair}"
+  run_component "$2" "${3:-chair}" "${4:-slam}" "${5:-}" "${6:-/scan}"
 fi
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   cat <<'EOF'
 用法：
-  start_navigation_validation.sh [TARGET_DESCRIPTION]
+  start_navigation_validation.sh [OPTIONS] [TARGET_DESCRIPTION]
+
+选项：
+  --localization-mode slam|amcl  定位模式，默认 slam
+  --map MAP.yaml                 AMCL 模式必需的地图 YAML
+  --amcl-scan-topic TOPIC        AMCL LaserScan，默认 /scan
 
 分别打开四个终端：
   1. 建图、Nav2 和 VLM_Nav（始终以 enabled=false 启动）
@@ -84,13 +95,64 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 示例：
   ./VLM_Nav/scripts/start_navigation_validation.sh
   ./VLM_Nav/scripts/start_navigation_validation.sh "red chair"
+  ./VLM_Nav/scripts/start_navigation_validation.sh \
+    --localization-mode amcl --map /absolute/path/lab.yaml "red chair"
 EOF
   exit 0
 fi
 
-if (( $# > 1 )); then
-  echo "错误：只接受一个可选的目标描述参数。" >&2
+localization_mode="slam"
+map_yaml=""
+amcl_scan_topic="/scan"
+target_description="chair"
+target_seen=false
+while (( $# > 0 )); do
+  case "$1" in
+    --localization-mode)
+      [[ $# -ge 2 ]] || { echo "错误：--localization-mode 缺少值。" >&2; exit 2; }
+      localization_mode="$2"
+      shift 2
+      ;;
+    --map)
+      [[ $# -ge 2 ]] || { echo "错误：--map 缺少值。" >&2; exit 2; }
+      map_yaml="$2"
+      shift 2
+      ;;
+    --amcl-scan-topic)
+      [[ $# -ge 2 ]] || { echo "错误：--amcl-scan-topic 缺少值。" >&2; exit 2; }
+      amcl_scan_topic="$2"
+      shift 2
+      ;;
+    --*)
+      echo "错误：未知参数 $1" >&2
+      exit 2
+      ;;
+    *)
+      if [[ "$target_seen" == true ]]; then
+        echo "错误：只接受一个可选的目标描述参数。" >&2
+        exit 2
+      fi
+      target_description="$1"
+      target_seen=true
+      shift
+      ;;
+  esac
+done
+
+if [[ "$localization_mode" != "slam" && "$localization_mode" != "amcl" ]]; then
+  echo "错误：--localization-mode 必须是 slam 或 amcl。" >&2
   exit 2
+fi
+if [[ "$localization_mode" == "amcl" ]]; then
+  if [[ -z "$map_yaml" ]]; then
+    echo "错误：AMCL 模式必须提供 --map MAP.yaml。" >&2
+    exit 2
+  fi
+  if [[ ! -r "$map_yaml" ]]; then
+    echo "错误：地图 YAML 不可读：${map_yaml}" >&2
+    exit 2
+  fi
+  map_yaml="$(realpath -e "$map_yaml")"
 fi
 
 if ! command -v gnome-terminal >/dev/null 2>&1; then
@@ -137,18 +199,20 @@ fi
 # socks:// ALL_PROXY value is unsupported by the installed HTTP client.
 unset ALL_PROXY all_proxy
 
-target_description="${1:-chair}"
-
 open_component() {
   local title="$1"
   local component="$2"
   gnome-terminal --window --title="$title" -- \
     bash "${script_dir}/terminal_runner.sh" \
     "${script_dir}/start_navigation_validation.sh" \
-    --component "$component" "$target_description"
+    --component "$component" "$target_description" \
+    "$localization_mode" "$map_yaml" "$amcl_scan_topic"
 }
 
-echo "${VLM_NAV_VALIDATION_LABEL:-启动导航验证}，目标：${target_description}"
+echo "${VLM_NAV_VALIDATION_LABEL:-启动导航验证}，目标：${target_description}，定位：${localization_mode}"
+if [[ "$localization_mode" == "amcl" ]]; then
+  echo "固定地图：${map_yaml}；AMCL scan：${amcl_scan_topic}"
+fi
 echo "VLM_Nav 保持 enabled=false，不会自动执行导航。"
 
 open_component "VLM Navigation System" system

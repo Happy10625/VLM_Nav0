@@ -93,7 +93,7 @@ def test_rviz_keeps_core_views_on_and_auxiliary_views_off():
     assert "Tool Properties" not in panel_names
 
     tool_classes = {item["Class"] for item in manager["Tools"]}
-    assert "rviz_default_plugins/SetInitialPose" not in tool_classes
+    assert "rviz_default_plugins/SetInitialPose" in tool_classes
     assert "rviz_default_plugins/PublishPoint" not in tool_classes
 
 

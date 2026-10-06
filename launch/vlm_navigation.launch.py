@@ -6,6 +6,7 @@ from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -17,6 +18,10 @@ def generate_launch_description():
             DeclareLaunchArgument("enabled", default_value="false"),
             DeclareLaunchArgument("target_description", default_value="chair"),
             DeclareLaunchArgument("easy_case_mode", default_value="false"),
+            DeclareLaunchArgument("scan_first", default_value="true"),
+            DeclareLaunchArgument(
+                "allow_frontier_after_scan", default_value="true"
+            ),
             DeclareLaunchArgument("enable_odom_adapter", default_value="true"),
             DeclareLaunchArgument("publish_camera_tf", default_value="true"),
             Node(
@@ -65,9 +70,21 @@ def generate_launch_description():
                 parameters=[
                     LaunchConfiguration("params_file"),
                     {
-                        "enabled": LaunchConfiguration("enabled"),
+                        "enabled": ParameterValue(
+                            LaunchConfiguration("enabled"), value_type=bool
+                        ),
                         "target_description": LaunchConfiguration("target_description"),
-                        "easy_case_mode": LaunchConfiguration("easy_case_mode"),
+                        "easy_case_mode": ParameterValue(
+                            LaunchConfiguration("easy_case_mode"), value_type=bool
+                        ),
+                        "scan_first": ParameterValue(
+                            LaunchConfiguration("scan_first"), value_type=bool
+                        ),
+                        "allow_frontier_after_scan": ParameterValue(
+                            LaunchConfiguration("allow_frontier_after_scan"),
+                            value_type=bool,
+                        ),
+                        "arrival_odom_topic": "/fastlio/odom",
                     },
                 ],
             ),

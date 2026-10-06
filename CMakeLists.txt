@@ -69,7 +69,14 @@ install(DIRECTORY launch config behavior_trees DESTINATION share/${PROJECT_NAME}
 install(
   DIRECTORY scripts/
   DESTINATION share/${PROJECT_NAME}/scripts
-  FILES_MATCHING PATTERN "*.sh" PATTERN "*.py"
+  FILES_MATCHING
+    PATTERN "*.sh"
+    PATTERN "*.py"
+    PATTERN "start_fixed_map_navigation.sh" EXCLUDE
+)
+install(
+  PROGRAMS scripts/start_fixed_map_navigation.sh
+  DESTINATION share/${PROJECT_NAME}/scripts
 )
 install(FILES package.xml pytest.ini DESTINATION share/${PROJECT_NAME})
 
@@ -91,6 +98,7 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_arm_image_recorder test/test_arm_image_recorder.py)
   ament_add_pytest_test(test_easy_case_config test/test_easy_case_config.py)
   ament_add_pytest_test(test_exploration test/test_exploration.py)
+  ament_add_pytest_test(test_fixed_map_config test/test_fixed_map_config.py)
   ament_add_pytest_test(test_geometry test/test_geometry.py)
   ament_add_pytest_test(test_latest_frame_worker test/test_latest_frame_worker.py)
   ament_add_pytest_test(test_navigation_gate test/test_navigation_gate.py)

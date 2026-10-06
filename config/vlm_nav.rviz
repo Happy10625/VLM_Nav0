@@ -235,6 +235,8 @@ Visualization Manager:
     - Class: rviz_default_plugins/Select
     - Class: rviz_default_plugins/FocusCamera
     - Class: rviz_default_plugins/Measure
+    - Class: rviz_default_plugins/SetInitialPose
+      Topic: /initialpose
     - Class: nav2_rviz_plugins/GoalTool
   Transformation:
     Current:

@@ -146,6 +146,7 @@ def test_every_python_test_is_registered_with_ament_cmake_pytest():
         "test_arm_image_recorder.py",
         "test_easy_case_config.py",
         "test_exploration.py",
+        "test_fixed_map_config.py",
         "test_geometry.py",
         "test_latest_frame_worker.py",
         "test_navigation_gate.py",

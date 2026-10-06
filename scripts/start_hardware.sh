@@ -132,3 +132,5 @@ echo
 echo "相机、Ranger、Livox 和 FAST_LIO 已就绪。"
 echo "下一步启动 VLM_Nav（仍保持 enabled=false）："
 echo "  ros2 launch vlm_nav system.launch.py enabled:=false"
+echo "固定地图模式请使用现有导航验证入口："
+echo "  scripts/start_navigation_validation.sh --localization-mode amcl --map /absolute/path/map.yaml [TARGET]"

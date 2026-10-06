@@ -2,6 +2,7 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${script_dir}/common.sh"
 "${script_dir}/check_system.sh"
 read -r -p "确认实体急停可用、场地封闭且有人监护。输入大写 ARM： " answer
 if [[ "$answer" != "ARM" ]]; then

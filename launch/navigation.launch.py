@@ -10,6 +10,8 @@ from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, Opaq
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 
+from vlm_nav.fixed_map import validate_localization_mode
+
 
 def deep_merge(destination, source):
     for key, value in source.items():
@@ -22,7 +24,14 @@ def deep_merge(destination, source):
 def configure_navigation(context):
     bringup = get_package_share_directory("nav2_bringup")
     default_params = os.path.join(bringup, "params", "nav2_params.yaml")
-    overrides = LaunchConfiguration("overrides_file").perform(context)
+    mode = validate_localization_mode(
+        LaunchConfiguration("localization_mode").perform(context)
+    )
+    overrides = LaunchConfiguration("overrides_file").perform(context).strip()
+    if not overrides:
+        overrides = LaunchConfiguration(
+            "amcl_overrides_file" if mode == "amcl" else "slam_overrides_file"
+        ).perform(context)
     with open(default_params, encoding="utf-8") as stream:
         params = yaml.safe_load(stream)
     with open(overrides, encoding="utf-8") as stream:
@@ -71,7 +80,18 @@ def generate_launch_description():
         [
             DeclareLaunchArgument(
                 "overrides_file",
+                default_value="",
+            ),
+            DeclareLaunchArgument("localization_mode", default_value="slam"),
+            DeclareLaunchArgument(
+                "slam_overrides_file",
                 default_value=os.path.join(share, "config", "nav2_overrides.yaml"),
+            ),
+            DeclareLaunchArgument(
+                "amcl_overrides_file",
+                default_value=os.path.join(
+                    share, "config", "nav2_amcl_overrides.yaml"
+                ),
             ),
             OpaqueFunction(function=configure_navigation),
         ]

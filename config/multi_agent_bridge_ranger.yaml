@@ -1,0 +1,22 @@
+name: ranger_multi_agent_bridge
+from_domain: 0
+to_domain: 40
+
+# Explicit allowlist: bridge only the two multi-agent state topics below.
+topics:
+  /multi_agent/agents/ranger/state:
+    type: multi_agent_msgs/msg/AgentState
+    qos:
+      history: keep_last
+      depth: 1
+      reliability: best_effort
+      durability: volatile
+
+  /multi_agent/agents/go2/state:
+    type: multi_agent_msgs/msg/AgentState
+    reversed: true
+    qos:
+      history: keep_last
+      depth: 1
+      reliability: best_effort
+      durability: volatile
