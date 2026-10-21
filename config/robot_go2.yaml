@@ -1,0 +1,63 @@
+obstacle_cloud_filter:
+  ros__parameters:
+    input_topic: /cloud_registered_base
+    output_topic: /vlm_nav/obstacle_cloud
+    target_frame: base_link
+    tf_queue_size: 20
+    use_sim_time: false
+    # Live XT16 ground returns peak at z=-0.28..-0.24 m in base_link.
+    min_height: -0.20
+    max_height: 0.20
+    # Measured relative to base_link; source values were in centimetres.
+    self_crop_min_x: -0.45
+    self_crop_max_x: 0.45
+    # Live self returns extend to y=-0.239..+0.219 m.
+    self_crop_min_y: -0.25
+    self_crop_max_y: 0.25
+    self_crop_min_z: -0.40
+    self_crop_max_z: 0.20
+    voxel_leaf_size: 0.05
+    # Current Go2 single-robot field profile; threshold applies after voxel averaging.
+    intensity_filter_enabled: true
+    intensity_threshold: 3.0
+    diagnostic_updater.period: 1.0
+
+vlm_nav:
+  ros__parameters:
+    enabled: false
+    target_description: chair
+    global_frame: map
+    base_frame: base_link
+    camera_frame: camera_color_optical_frame
+    map_topic: /map
+    rgb_topic: /camera/camera/color/image_raw
+    camera_preview_topic: /vlm_nav/camera_preview
+    camera_preview_rate: 1.0
+    depth_topic: /camera/camera/depth/image_rect_raw
+    camera_info_topic: /camera/camera/color/camera_info
+    depth_camera_info_topic: /camera/camera/depth/camera_info
+    raw_depth_mode: true
+    depth_units_report: ~/.config/vlm_nav/raw_depth_units_verified.json
+    expected_device_depth_scale: 0.0010000000474974513
+    camera_profile_width: 640
+    camera_profile_height: 480
+    camera_profile_fps: 15
+    rgbd_sync_slop: 0.05
+    rgbd_sync_window: 30
+    rgbd_sync_minimum_samples: 10
+    rgbd_sync_minimum_rate: 0.90
+    navigate_action: /navigate_to_pose
+    compute_path_action: /compute_path_to_pose
+    spin_action: /spin
+    stop_cmd_topic: /cmd_vel_bridge
+    arrival_odom_topic: /odometry
+    require_camera_calibration: true
+    camera_extrinsic_calibrated: true
+    require_external_safety_gates: true
+    nav_ready_topic: /vlm_nav/nav_ready
+    control_armed_topic: /vlm_nav/control_armed
+    vlm_api_ready_topic: /vlm_nav/vlm_api_ready
+    external_gate_timeout: 2.0
+    publish_stop_command: true
+    vlm_image_record_path: ~/unitree_ros2/log/VLM_feedback
+    vlm_image_record_keep_arms: 5

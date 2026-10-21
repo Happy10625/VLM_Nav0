@@ -1,0 +1,21 @@
+# Schema v1: task coordinates are lab_ref; stamp is trace-only.
+uint64 schema_version
+string task_id
+string robot_id
+string observation_id
+string viewpoint_id
+string scan_id
+uint64 view_index
+string target_id
+float64 stamp
+float64 image_stamp
+string local_map_id
+string map_version
+string common_frame_id
+string alignment_id
+bool simulation
+string status
+float64 confidence
+geometry_msgs/Pose2D common_position
+bool position_valid
+string reason

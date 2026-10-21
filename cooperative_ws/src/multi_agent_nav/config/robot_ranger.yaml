@@ -1,0 +1,68 @@
+# Ranger local interfaces; verification flags require field evidence.
+# /plan source and stop margin remain field checks; no extra motion-permission gate.
+robot_id: ranger
+adapter: ranger
+local_map_id: lab_ranger_20261006
+map_version: sha256:3bebc0aad79b9e3add860b33c59a1c7f98231341182103c8a20f1cdd9b43badb
+map_path: /home/isee601/ws/VLM_Nav/shared_maps/lab_ranger_20261006/lab.yaml
+map_digest: 3bebc0aad79b9e3add860b33c59a1c7f98231341182103c8a20f1cdd9b43badb
+domain_id: 0
+observer_config_file: /home/isee601/ws/VLM_Nav/config/robot.yaml
+footprint:
+- - 0.36
+  - 0.25
+- - 0.36
+  - -0.25
+- - -0.36
+  - -0.25
+- - -0.36
+  - 0.25
+footprint_padding: 0.03
+path_topic: /plan
+path_source_verified: false
+path_start_timeout: 1.0
+path_receive_timeout: 5.0
+pose_max_age: 1.0
+costmap_topic: /local_costmap/costmap_raw
+goal_costmap_topic: /global_costmap/costmap_raw
+costmap_source_verified: false
+costmap_max_age: 1.0
+goal_costmap_max_age: 3.0
+costmap_blocked_cost: 253
+stop_margin: 0.20
+stationary_linear_speed: 0.03
+stationary_angular_speed: 0.05
+stationary_duration: 0.5
+odom_max_age: 0.5
+odom_topic: /odom
+cancel_timeout: 5.0
+scan_angles:
+- 0.7853981633974483
+- 1.5707963267948966
+- 2.356194490192345
+- 3.141592653589793
+- 3.9269908169872414
+- 4.71238898038469
+- 5.497787143782138
+- 6.283185307179586
+scan_timeout: 240.0
+standoff_distance: 0.81
+arrival_config_files:
+- /home/isee601/ws/VLM_Nav/config/robot.yaml
+model: null
+endpoint: null
+api_key_env: DASHSCOPE_API_KEY
+api_timeout: 15.0
+vision_mode: abc
+camera_calibrated: false
+vision_validated: false
+peer_obstacle_verified: false
+exploration_strategy: generated_candidates_vlm
+experiment_records_root: /home/isee601/ws/VLM_Nav/build/ranger-local/experiments
+generated_candidates:
+  semantic_yaml: ''
+  observation_distance: 1.0
+semantic_search:
+  observation_points: ''
+  current_room: null
+nav2_profile: /home/isee601/ws/VLM_Nav/config/nav2_ranger_local.yaml

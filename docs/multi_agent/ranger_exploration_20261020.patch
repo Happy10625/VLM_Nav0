@@ -1,0 +1,379 @@
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/adapters/vision.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/adapters/vision.py
+@@ -135,6 +135,7 @@
+         messages=[dict(role='system',content=(
+             '根据搜索目标、地图、蓝色机器人位置和已观察记录，选择图中下一橙色观察点。'
+             '有家具标注时可参考；未标注时不得推断家具名称或位置。'
++            '空地观察点同样可选，不要求在家具周围探索。'
+             '仅允许本轮 allowed_candidate_ids；灰色已观察点不可选。'
+             '历史P编号仅对应历史决策，不代表本轮同名点。'
+             '只返回JSON，字段恰为candidate_id和reason。不要生成坐标，不判断运动安全，不宣布目标不存在。'
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/generated_candidates.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/generated_candidates.py
+@@ -52,9 +52,14 @@
+         if (info['map_digest']!=robot['map_digest'] or identity['map_version']!='sha256:'+info['map_digest']):
+             raise ValueError('generated map identity mismatch')
+         source=yaml.safe_load(self.map_path.read_text())
+-        semantic={'furniture':[]}
++        semantic_bytes=None
+         if self.semantic_path is not None:
+-            semantic=yaml.safe_load(self.semantic_path.read_text())
++            try:semantic_bytes=self.semantic_path.read_bytes()
++            except FileNotFoundError:pass
++        self.furniture=[]
++        if semantic_bytes is not None:
++            try:semantic=yaml.safe_load(semantic_bytes)
++            except yaml.YAMLError as error:raise ValueError('invalid semantic YAML') from error
+             if (not isinstance(semantic,dict) or semantic.get('schema_version')!=1 or semantic.get('source_robot')!=robot_id
+                     or semantic.get('frame_id')!='map' or semantic.get('units')!='meters'):
+                 raise ValueError('invalid semantic map frame/schema')
+@@ -63,6 +68,7 @@
+             for key,other in (('yaml','yaml_path'),('image','image_path')):
+                 if Path(semantic['source_map'][key]).resolve()!=Path(info[other]):
+                     raise ValueError('semantic source path mismatch')
++            self.furniture=semantic['furniture']
+         if (source.get('mode','trinary')!='trinary' or source.get('negate') not in (0,1)
+                 or not valid_numbers(source.get('origin'),3)
+                 or not valid_numbers([source.get('resolution')],1) or source['resolution']<=0
+@@ -76,7 +82,6 @@
+         self.raw=np.flipud(np.where(occupancy<source['free_thresh'],0,
+                                    np.where(occupancy>source['occupied_thresh'],254,255))).copy()
+         self.source=dict(source,image=info['image_path'],width=pixels.shape[1],height=pixels.shape[0])
+-        self.furniture=semantic['furniture']
+         if not isinstance(self.furniture,list):raise ValueError('furniture list required')
+         self.points=[];ids=set()
+         for item in self.furniture:
+@@ -109,23 +114,31 @@
+                 if any(math.hypot(x-p['pose'][0],y-p['pose'][1])<source['resolution'] for p in self.points):continue
+                 self.points.append(dict(id=f'{fid}/edge_{index}',furniture_id=fid,
+                                         pose=[x,y,math.atan2(-ny,-nx)],side=index))
+-        if not self.furniture:
+-            resolution=source['resolution']
+-            stride=max(1,math.ceil(max(distance,2*self.radius)/resolution))
+-            edge=math.ceil(self.radius/resolution)
+-            ox,oy,yaw=source['origin'];c,s=math.cos(yaw),math.sin(yaw)
+-            # shortcut: fixed spacing may miss narrow pockets; sample more densely if field coverage requires it.
+-            for gy in range(edge,self.raw.shape[0]-edge,stride):
+-                for gx in range(edge,self.raw.shape[1]-edge,stride):
+-                    mx,my=(gx+.5)*resolution,(gy+.5)*resolution
+-                    if not circle_free(self.raw,mx,my,self.radius,resolution,lambda cells:cells>=253):continue
+-                    self.points.append(dict(id=f'free/{gx}/{gy}',furniture_id='free_space',
+-                        pose=[ox+c*mx-s*my,oy+s*mx+c*my,yaw],side=0))
+-        self.digests={path:hashlib.sha256(path.read_bytes()).hexdigest()
+-                      for path in (self.map_path,Path(info['image_path']),self.semantic_path) if path is not None}
++        resolution=source['resolution']
++        step=math.ceil(max(1.,2*self.radius)/resolution)
++        spacing=step*resolution
++        ox,oy,yaw=source['origin'];c,s=math.cos(yaw),math.sin(yaw)
++        furniture_points=list(self.points)
++        # shortcut: fixed spacing can miss narrow pockets; refine sampling if field coverage requires it.
++        for row in range(step//2,self.raw.shape[0],step):
++            for col in range(step//2,self.raw.shape[1],step):
++                mx,my=(col+.5)*resolution,(row+.5)*resolution
++                if not circle_free(self.raw,mx,my,self.radius,resolution,lambda a:a>=253):continue
++                x,y=ox+c*mx-s*my,oy+s*mx+c*my
++                if any(path_intersects([Pose2D(x,y)],f['polygon'],self.radius) for f in self.furniture):continue
++                if any(math.hypot(x-p['pose'][0],y-p['pose'][1])<spacing/2 for p in furniture_points):continue
++                self.points.append(dict(id=f'free/{row}/{col}',furniture_id='',pose=[x,y,yaw]))
++        self.digests={self.map_path:info['yaml_sha256'],Path(info['image_path']):info['image_sha256']}
++        if self.semantic_path is not None:
++            self.digests[self.semantic_path]=hashlib.sha256(semantic_bytes).hexdigest() if semantic_bytes is not None else None
+ 
+     def unchanged(self):
+-        return all(hashlib.sha256(path.read_bytes()).hexdigest()==digest for path,digest in self.digests.items())
++        for path,digest in self.digests.items():
++            try:actual=hashlib.sha256(path.read_bytes()).hexdigest()
++            except FileNotFoundError:actual=None
++            except OSError:return False
++            if actual!=digest:return False
++        return True
+ 
+     def map_xy(self,x,y):
+         ox,oy,yaw=self.source['origin'];c,s=math.cos(yaw),math.sin(yaw)
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/go2_check.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/go2_check.py
+@@ -136,7 +136,7 @@
+         from .generated_candidates import GeneratedCandidates
+         try:
+             geometry=GeneratedCandidates(config,robot_id)
+-            semantic_report=dict(points=geometry.points, semantic_yaml=str(geometry.semantic_path),
++            semantic_report=dict(points=geometry.points, semantic_yaml=str(geometry.semantic_path) if geometry.semantic_path else None,
+                                  rotation_radius=geometry.radius, max_candidates_per_request=12)
+         except (OSError, KeyError, TypeError, ValueError) as error:
+             semantic_report={'error':str(error)}
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/go2_exploration.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/go2_exploration.py
+@@ -102,7 +102,7 @@
+     decision_id = None
+     if generated:
+         record(dict(state='CANDIDATE_GEOMETRY',task_id=state.task_id,candidates=points,
+-                    rotation_radius=geometry.radius,semantic_yaml=str(geometry.semantic_path)))
++                    rotation_radius=geometry.radius,semantic_yaml=str(geometry.semantic_path) if geometry.semantic_path else None))
+ 
+     def catalog_unchanged():
+         return geometry.unchanged() if generated else load_catalog(config,robot_id) == catalog
+@@ -328,10 +328,8 @@
+         epoch = getattr(adapter, 'selection_epoch', 0)
+         if not catalog_unchanged():raise ExplorationStopped('selection map assets changed')
+         candidates = []
+-        ordered=points
+-        if generated and not geometry.furniture:
+-            pose=adapter.get_health().pose
+-            ordered=sorted(points,key=lambda p:math.hypot(p['pose'][0]-pose.x,p['pose'][1]-pose.y))
++        health, _ = health_check()
++        ordered=sorted(points,key=lambda p:(math.hypot(p['pose'][0]-health.pose.x,p['pose'][1]-health.pose.y),p['id'])) if generated else points
+         for candidate in ordered:
+             if candidate['id'] not in state.eligible(clock()):
+                 continue
+--- /dev/null
++++ b/cooperative_ws/src/multi_agent_nav/tests/test_free_space_candidates.py
+@@ -0,0 +1,144 @@
++"""Shared free-space exploration without ROS nodes or provider requests."""
++from copy import deepcopy
++from pathlib import Path
++import math
++
++import numpy as np
++from PIL import Image
++import pytest
++import yaml
++
++from test_generated_candidates import generated_config, run_generated
++from multi_agent_nav.generated_candidates import GeneratedCandidates, circle_free
++
++
++@pytest.mark.parametrize('mode', ['missing', 'unset', 'empty'])
++def test_optional_labels_keep_stable_free_candidates(generated_config, mode):
++    options = generated_config['robot_go2']['generated_candidates']
++    path = Path(options['semantic_yaml'])
++    if mode == 'empty':
++        doc = yaml.safe_load(path.read_text())
++        doc['furniture'] = []
++        path.write_text(yaml.safe_dump(doc))
++    else:
++        path.unlink()
++        if mode == 'unset':
++            del options['semantic_yaml']
++    catalog = GeneratedCandidates(generated_config)
++    assert catalog.points and not catalog.furniture
++    assert catalog.points == GeneratedCandidates(generated_config).points
++    assert all(p['id'].startswith('free/') and p['furniture_id'] == '' for p in catalog.points)
++    for p in catalog.points:
++        x, y = catalog.map_xy(*p['pose'][:2])
++        assert circle_free(catalog.raw, x, y, catalog.radius, .1, lambda cells: cells >= 253)
++    assert path.exists() == (mode == 'empty')
++
++
++def test_furniture_supplements_free_space_and_excludes_occupied_geometry(generated_config):
++    catalog = GeneratedCandidates(generated_config)
++    furniture = [p for p in catalog.points if p['furniture_id']]
++    free = [p for p in catalog.points if not p['furniture_id']]
++    assert len(furniture) == 4 and free
++    assert len({p['id'] for p in catalog.points}) == len(catalog.points)
++    assert all(math.hypot(p['pose'][0] - f['pose'][0], p['pose'][1] - f['pose'][1]) >= .5
++               for p in free for f in furniture)
++    assert all(math.hypot(max(abs(p['pose'][0]) - 1., 0.), max(abs(p['pose'][1]) - 1., 0.)) > catalog.radius
++               for p in free)
++
++
++@pytest.mark.parametrize('distance', [.2, 2.])
++def test_furniture_observation_distance_does_not_change_free_grid(generated_config, distance):
++    robot = generated_config['robot_go2']
++    robot['generated_candidates']['semantic_yaml'] = ''
++    before = GeneratedCandidates(generated_config).points
++    robot['generated_candidates']['observation_distance'] = distance
++    assert GeneratedCandidates(generated_config).points == before
++
++
++def test_optional_asset_creation_and_deletion_invalidate_selection(generated_config):
++    path = Path(generated_config['robot_go2']['generated_candidates']['semantic_yaml'])
++    content = path.read_bytes()
++    path.unlink()
++    catalog = GeneratedCandidates(generated_config)
++    assert catalog.unchanged()
++    path.write_bytes(content)
++    assert not catalog.unchanged()
++    catalog = GeneratedCandidates(generated_config)
++    path.unlink()
++    assert not catalog.unchanged()
++
++
++def test_existing_invalid_labels_are_rejected(generated_config):
++    from multi_agent_nav.go2_exploration import exploration_gates
++    path = Path(generated_config['robot_go2']['generated_candidates']['semantic_yaml'])
++    path.write_text('invalid: [')
++    assert any('generated candidates invalid' in e for e in exploration_gates(generated_config))
++
++
++@pytest.mark.parametrize('asset', ['image', 'yaml'])
++def test_deleted_map_asset_invalidates_selection(generated_config, asset):
++    catalog = GeneratedCandidates(generated_config)
++    path = catalog.map_path if asset == 'yaml' else Path(catalog.source['image'])
++    path.unlink()
++    assert not catalog.unchanged()
++
++
++def test_rotated_ranger_map_uses_own_footprint_and_grid_centers(generated_config):
++    from multi_agent_nav.config import map_file_info
++    cfg = generated_config
++    robot = deepcopy(cfg['robot_go2'])
++    robot['generated_candidates']['semantic_yaml'] = ''
++    robot['footprint'] = [[-.8, -.4], [.8, -.4], [.8, .4], [-.8, .4]]
++    path = Path(robot['map_path'])
++    doc = yaml.safe_load(path.read_text())
++    doc['origin'] = [100., 200., math.pi / 2]
++    path.write_text(yaml.safe_dump(doc))
++    info = map_file_info(path)
++    robot['map_digest'] = info['map_digest']
++    cfg['robot_ranger'] = robot
++    cfg['alignment']['robots']['ranger'] = dict(local_map_id='ranger', map_version='sha256:' + info['map_digest'])
++    catalog = GeneratedCandidates(cfg, 'ranger')
++    assert catalog.points
++    # A 1.8 m grid starts at local (0.95, 0.95), then applies the map rotation.
++    assert catalog.points[0]['pose'] == pytest.approx([99.05, 200.95, math.pi / 2])
++    for p in catalog.points:
++        x, y = catalog.map_xy(*p['pose'][:2])
++        assert circle_free(catalog.raw, x, y, catalog.radius, .1, lambda cells: cells >= 253)
++
++
++@pytest.mark.parametrize('annotated', [False, True])
++def test_vlm_shortlist_is_nearby_first_even_with_furniture(generated_config, tmp_path, annotated):
++    if not annotated:
++        generated_config['robot_go2']['generated_candidates']['semantic_yaml'] = ''
++    adapter, events, requests, outcome = run_generated(generated_config, tmp_path, 'found')
++    assert outcome == 'TARGET_FOUND' and len(requests) == 1
++    candidates = requests[0]['candidates']
++    assert len(candidates) == 12
++    order = [(math.hypot(*p['pose'][:2]), p['id']) for p in candidates]
++    assert order == sorted(order)
++    assert len(requests[0]['images']) == 2 and adapter.scans == 1
++
++
++def test_no_label_images_are_identical_and_leave_map_unchanged(generated_config, tmp_path):
++    from multi_agent_nav.generated_candidates import render_selection
++    from multi_agent_nav.models import Pose2D
++    generated_config['robot_go2']['generated_candidates']['semantic_yaml'] = ''
++    catalog = GeneratedCandidates(generated_config)
++    original = Path(catalog.source['image']).read_bytes()
++    images = render_selection(catalog, [dict(catalog.points[0], display_id='P1')], {}, Pose2D(), tmp_path / 'images')
++    assert len(images) == 2
++    assert np.array_equal(np.asarray(Image.open(images[0])), np.asarray(Image.open(images[1])))
++    assert Path(catalog.source['image']).read_bytes() == original
++
++
++def test_offline_report_uses_null_for_unconfigured_labels(generated_config, monkeypatch, capsys):
++    import json
++    from multi_agent_nav import go2_check
++    generated_config['robot_go2']['generated_candidates']['semantic_yaml'] = ''
++    monkeypatch.setattr(go2_check, 'load_config', lambda *_: generated_config)
++    monkeypatch.setattr(go2_check, 'live_gates', lambda *_: [])
++    monkeypatch.setattr(go2_check, 'run_ros', lambda *_: pytest.fail('offline initialized ROS'))
++    assert go2_check.main(['--offline', '--strategy', 'generated_candidates_vlm']) == 0
++    report = json.loads(capsys.readouterr().out)
++    assert report['semantic_search']['semantic_yaml'] is None
++    assert report['semantic_search']['points'] and not report['motion_sent']
+--- a/cooperative_ws/src/multi_agent_nav/tests/test_generated_candidates.py
++++ b/cooperative_ws/src/multi_agent_nav/tests/test_generated_candidates.py
+@@ -41,12 +41,13 @@
+             doc=yaml.safe_load(path.read_text());doc['furniture'][0]['polygon'].reverse()
+             path.write_text(yaml.safe_dump(doc))
+         catalog=GeneratedCandidates(generated_config)
+-        positions={tuple(p['pose'][:2]) for p in catalog.points}
++        furniture=[p for p in catalog.points if p['furniture_id']]
++        positions={tuple(p['pose'][:2]) for p in furniture}
+         assert positions=={(0.,-2.),(2.,0.),(0.,2.),(-2.,0.)}
+-        for point in catalog.points:
++        for point in furniture:
+             x,y,yaw=point['pose']
+             assert x*math.cos(yaw)+y*math.sin(yaw)<-1.99
+-        assert len({p['id'] for p in catalog.points})==4
++        assert len({p['id'] for p in furniture})==4
+ 
+ 
+ def test_static_filter_rejects_unknown_occupied_bounds_and_scan_corner(generated_config):
+@@ -65,9 +66,9 @@
+     doc['source_map'].update(yaml_sha256=info['yaml_sha256'],image_sha256=info['image_sha256'])
+     path.write_text(yaml.safe_dump(doc))
+     catalog=GeneratedCandidates(generated_config)
+-    assert [p['pose'][:2] for p in catalog.points]==[[-2.,0.]]
++    assert [p['pose'][:2] for p in catalog.points if p['furniture_id']]==[[-2.,0.]]
+     generated_config['robot_go2']['generated_candidates']['observation_distance']=10.
+-    assert not GeneratedCandidates(generated_config).points
++    assert not any(p['furniture_id'] for p in GeneratedCandidates(generated_config).points)
+ 
+ 
+ @pytest.mark.parametrize('fault',['distance','polygon','digest'])
+@@ -104,10 +105,11 @@
+     assert not catalog.unchanged()
+ 
+ 
+-def test_explicit_missing_annotation_is_not_silently_ignored(generated_config,tmp_path):
++def test_missing_optional_annotation_uses_free_candidates(generated_config,tmp_path):
+     from multi_agent_nav.generated_candidates import GeneratedCandidates
+     generated_config['robot_go2']['generated_candidates']['semantic_yaml']=str(tmp_path/'missing.yaml')
+-    with pytest.raises(OSError):GeneratedCandidates(generated_config)
++    catalog=GeneratedCandidates(generated_config)
++    assert catalog.points and not catalog.furniture and catalog.unchanged()
+ 
+ 
+ def test_dual_images_have_identical_marks_and_do_not_write_map(generated_config,tmp_path):
+@@ -165,10 +167,10 @@
+             if mode=='cancel':adapter.selection_epoch=1
+             if mode=='late':now[0]=2.
+             pending.set_result(pending.work())
+-    def stop():adapter.stop_motion('stop');adapter.advance(now[0]+1);return True
++    def stop():adapter.stop_motion('stop');adapter.advance(now[0]);return True
+     try:
+         outcome=explore(adapter,spin,config,FrameAdapter('fixture','1','lab_ref' if robot_id=='go2' else 'ranger_local_map','',[0,0,0]),
+-                        60.,'target',events.append,lambda:[],stop,lambda:None,clock=lambda:now[0],robot_id=robot_id,target_id=target_id)
++                        600.,'target',events.append,lambda:[],stop,lambda:None,clock=lambda:now[0],robot_id=robot_id,target_id=target_id)
+     except Exception:
+         if mode in ('invalid','late','cancel'):assert not adapter.calls
+         raise
+@@ -177,9 +179,16 @@
+ 
+ def test_fake_select_observe_next_and_current_id_mapping(generated_config,tmp_path):
+     adapter,events,requests,outcome=run_generated(generated_config,tmp_path)
+-    assert outcome=='EXHAUSTED' and adapter.scans==4 and len(requests)==4
+-    assert [(c[1].x,c[1].y) for c in adapter.calls]==[(0.,-2.),(2.,0.),(0.,2.),(-2.,0.)]
+-    assert len({r['decision_id'] for r in requests})==4
++    from multi_agent_nav.generated_candidates import GeneratedCandidates
++    points=GeneratedCandidates(generated_config).points
++    assert outcome=='EXHAUSTED' and adapter.scans==len(points) and len(requests)==len(points)
++    assert {(c[1].x,c[1].y) for c in adapter.calls}=={tuple(p['pose'][:2]) for p in points}
++    assert len({r['decision_id'] for r in requests})==len(points)
++    origin=(0.,0.)
++    for request in requests:
++        order=[(math.hypot(p['pose'][0]-origin[0],p['pose'][1]-origin[1]),p['id']) for p in request['candidates']]
++        assert order==sorted(order)
++        origin=request['candidates'][0]['pose'][:2]
+     assert requests[0]['task_id']==next(e['task_id'] for e in events if e['state']=='NAVIGATING')
+     assert requests[1]['candidates'][0]['display_id']=='P1'
+     assert requests[1]['candidates'][0]['id']!=requests[0]['candidates'][0]['id']
+@@ -288,7 +297,8 @@
+     doc['furniture'].append(dict(doc['furniture'][0],id='disabled',enabled=False))
+     path.write_text(yaml.safe_dump(doc))
+     catalog=GeneratedCandidates(generated_config)
+-    assert len(catalog.points)==4 and catalog.unchanged()
++    assert len([p for p in catalog.points if p['furniture_id']])==4 and catalog.unchanged()
++    assert len({p['id'] for p in catalog.points})==len(catalog.points)
+     path.write_text(path.read_text()+'\n')
+     assert not catalog.unchanged()
+ 
+@@ -302,7 +312,8 @@
+             polygon=[[x-.4,y-.4],[x+.4,y-.4],[x+.4,y+.4],[x-.4,y+.4]]))
+     path.write_text(yaml.safe_dump(doc))
+     adapter,events,requests,outcome=run_generated(generated_config,tmp_path)
+-    assert outcome=='EXHAUSTED' and adapter.scans==16
++    from multi_agent_nav.generated_candidates import GeneratedCandidates
++    assert outcome=='EXHAUSTED' and adapter.scans==len(GeneratedCandidates(generated_config).points)
+     assert len(requests[0]['candidates'])==12
+     seen=set()
+     for request in requests:
+@@ -324,4 +335,5 @@
+     monkeypatch.setattr(go2_check,'run_ros',lambda *_:pytest.fail('offline initialized ROS'))
+     assert go2_check.main(['--offline','--strategy','generated_candidates_vlm'])==0
+     report=json.loads(capsys.readouterr().out)
+-    assert len(report['semantic_search']['points'])==4 and not report['motion_sent']
++    assert len([p for p in report['semantic_search']['points'] if p['furniture_id']])==4
++    assert any(not p['furniture_id'] for p in report['semantic_search']['points']) and not report['motion_sent']

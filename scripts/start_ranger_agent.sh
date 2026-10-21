@@ -4,7 +4,7 @@ set -euo pipefail
 # ROS setup scripts inspect optional variables that may be unset.
 set +u
 source /opt/ros/humble/setup.bash
-source /home/isee-cdh/ws/install/setup.bash
+source /home/isee601/ws/install/setup.bash
 set -u
 
 export ROS_DOMAIN_ID=0

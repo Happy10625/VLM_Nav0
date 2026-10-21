@@ -1,0 +1,661 @@
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/agent.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/agent.py
+@@ -34,8 +34,6 @@
+         self.transit_goal = None
+         self.private = context.common_frame_id == context.alignment_id == ''
+         self.local_observations = {}
+-        self.deposit_observation = None
+-        self.deposit_command_id = ''
+         self.task_started_at = 0.
+ 
+     def state(self):
+@@ -95,7 +93,6 @@
+             self._state.reply = ''
+             self.command = None
+             self.local_observations.clear()
+-            self.deposit_observation=None;self.deposit_command_id=''
+             self.effects.clear()
+             self.selected_goal=self.transit_goal=None
+             self.last_sequence = 0
+@@ -140,11 +137,13 @@
+             return CommandReply(False, 'phase must be synchronized before execution')
+         if command.kind == 'APPROACH_PICKUP' and (self.phase != 'SEARCH_AB' or self._state.ready):
+             return CommandReply(False, 'pickup phase/READY mismatch')
+-        if self.private and command.kind=='SEARCH_VIEWPOINT' and (self.phase!='SEARCH_C' or not self._state.ready):
+-            return CommandReply(False,'C search requires READY and search C phase')
++        if self.private and command.kind=='SEARCH_VIEWPOINT' and (self.phase not in ('SEARCH_C','DEPOSIT') or not self._state.ready):
++            return CommandReply(False,'C search requires READY and C phase')
+         if self.private and command.kind=='APPROACH_DEPOSIT':
+             observation=self.local_observations.get(command.observation_id)
+-            if not observation or observation.target_id!='C' or not observation.navigable:
++            if (not observation or observation.target_id!='C' or not observation.navigable or
++                    (observation.task_id,observation.robot_id,observation.local_map_id,observation.map_version)!=
++                    (self.context.task_id,self.context.robot_id,self.context.local_map_id,self.context.map_version)):
+                 return CommandReply(False,'local C observation missing/invalid')
+         if command.kind in ('APPROACH_DEPOSIT','EXIT') and (self.phase != 'DEPOSIT' or not self._state.ready):
+             return CommandReply(False, 'deposit requires READY and deposit phase')
+@@ -155,13 +154,10 @@
+         if not self._state.stopped or not self.health.motion_terminal:
+             return CommandReply(False, 'previous motion not stopped')
+         if command.kind == 'EXIT':
+-            parent=self.deposit_command_id if self.private else self._state.permit_command_id
++            parent=self._state.permit_command_id
+             if (not self._state.deposited or command.token != self._state.token or
+                     command.parent_command_id != parent or command.resource_id != self._state.resource_id):
+                 return CommandReply(False, 'EXIT must preserve deposit identity')
+-        if self.private and command.kind=='APPROACH_DEPOSIT':
+-            self.deposit_observation=self.local_observations[command.observation_id]
+-            self.deposit_command_id=command.command_id
+         self.command, self.last_sequence = command, command.sequence
+         self.retry, self.excluded = 0, []
+         self._state.command_id, self._state.sequence = command.command_id, command.sequence
+@@ -253,16 +249,16 @@
+ 
+     def on_observation(self, observation, now):
+         if not self.paused and self.command and observation.scan_id == self.command.command_id:
++            observation=replace(observation,task_id=self.context.task_id,robot_id=self.context.robot_id,
++                local_map_id=self.context.local_map_id,map_version=self.context.map_version,
++                common_frame_id=self.context.common_frame_id,alignment_id=self.context.alignment_id,
++                viewpoint_id=self.command.viewpoint_id,simulation=self.context.simulation)
+             if self.private:
+                 if observation.navigable and observation.observation_id:
+                     self.local_observations[observation.observation_id]=observation
+                 observation=replace(observation,status='CACHED' if observation.target_id=='C' and observation.navigable
+                     else observation.status,common_position=Pose2D(),position_valid=False)
+-            self.effects.append(Effect('OBSERVATION', replace(observation,
+-                task_id=self.context.task_id, robot_id=self.context.robot_id,
+-                local_map_id=self.context.local_map_id, map_version=self.context.map_version,
+-                common_frame_id=self.context.common_frame_id, alignment_id=self.context.alignment_id,
+-                viewpoint_id=self.command.viewpoint_id, simulation=self.context.simulation)))
++            self.effects.append(Effect('OBSERVATION',observation))
+         return []
+ 
+     def scan_completed(self, observations, now):
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/coordinator.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/coordinator.py
+@@ -17,6 +17,7 @@
+         self.releases = {}
+         self.started = 0.0
+         self.c_observation = ''
++        self.local_c = {}
+         self.lost_timeout = scene.get('lost_timeout', 3.0)
+         self.task_timeout = scene.get('task_timeout', 600.0)
+         self.private = scene.get('share_c_coordinates',True) is False
+@@ -52,8 +53,13 @@
+         if self.private and (observation.position_valid or observation.common_position!=Pose2D() or
+                 observation.status=='CACHED' and observation.target_id!='C'):return
+         if not self.private and observation.status=='CACHED':return
+-        if observation.observation_id and observation.observation_id not in self.observations:
++        previous=self.observations.get(observation.observation_id)
++        recovered=self.private and observation.status=='CACHED' and previous and (
++            previous.robot_id==observation.robot_id and previous.status!='CACHED')
++        if observation.observation_id and (previous is None or recovered):
+             self.observations[observation.observation_id] = observation
++            if self.private and observation.status=='CACHED':
++                self.local_c.setdefault(observation.robot_id,observation.observation_id)
+ 
+     def start(self, scenario_id, now):
+         if self.phase not in ('IDLE', 'PAUSED', 'DONE', 'FAILED'):
+@@ -74,6 +80,7 @@
+         self.sequence = {r:0 for r in ROBOTS}
+         self.acked = {r:0 for r in ROBOTS}
+         self.c_observation = ''
++        self.local_c = {}
+         return StartReply(True, self.task_id)
+ 
+     def control(self, robot, action, **kwargs):
+@@ -136,22 +143,28 @@
+         if self.phase == 'SEARCH_AB' and all(self.states[r].ready for r in ROBOTS) and not self.commands:
+             self.phase = 'SEARCH_C'
+         if self.phase == 'SEARCH_C':
+-            if not self.private and ('basket' not in self.scene['resources'] or any(r not in self.scene['exit_points'] for r in ROBOTS)):
+-                return output+self.pause('C region or exit geometry missing')
+-            clue = next((o for o in self.observations.values() if o.target_id=='C' and o.navigable), None)
+-            cached=all(any(o.robot_id==r and o.target_id=='C' and o.status=='CACHED' for o in self.observations.values()) for r in ROBOTS)
+-            if (cached if self.private else bool(clue)) and not self.commands:
+-                if not self.private:
+-                    self.c_observation = clue.observation_id
+-                    self.scene['bound_c'] = clue.observation_id
+-                self.phase = 'DEPOSIT'
+-        if self.phase == 'DEPOSIT' and all(self.states[r].deposited and self.states[r].exited and not self.states[r].token for r in ROBOTS) and not self.resources.held:
+-            self.phase = 'DONE'
+-            return output
++            if self.private:
++                if self.local_c:self.phase='DEPOSIT'
++            else:
++                if 'basket' not in self.scene['resources'] or any(r not in self.scene['exit_points'] for r in ROBOTS):
++                    return output+self.pause('C region or exit geometry missing')
++                clue=next((o for o in self.observations.values() if o.target_id=='C' and o.navigable),None)
++                if clue and not self.commands:
++                    self.c_observation=clue.observation_id
++                    self.scene['bound_c']=clue.observation_id
++                    self.phase='DEPOSIT'
++        if self.phase=='DEPOSIT':
++            if self.private:
++                complete=not self.commands and all(self.states[r].deposited and self.states[r].stopped for r in ROBOTS)
++            else:
++                complete=all(self.states[r].deposited and self.states[r].exited and not self.states[r].token for r in ROBOTS) and not self.resources.held
++            if complete:
++                self.phase='DONE'
++                return output
+         if self.resources and not self.private:
+             output += self._resource_commands(now)
+         snapshot = Snapshot(self.phase, self.states, self.observations, self.reservations,
+-            self.resources, self.commands, self.scene, now, self.received_at, self.rejected)
++            self.resources, self.commands, self.scene, now, self.received_at, self.rejected, self.local_c)
+         actions = self.planner.decide(snapshot)
+         for action in actions:
+             if action.robot_id in self.commands or not self.private and (action.goal is None or not action.goal.valid):
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/models.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/models.py
+@@ -193,6 +193,7 @@
+     now: float
+     received_at: dict = field(default_factory=dict)
+     rejected: set = field(default_factory=set)
++    local_c: dict = field(default_factory=dict)
+ 
+ @dataclass
+ class PlannedAction:
+@@ -241,6 +242,8 @@
+             return CommandReply(False, 'wrong deposit target')
+         if private and command.kind == 'SEARCH_VIEWPOINT' and command.target_id != 'C':
+             return CommandReply(False, 'private search target must be C')
++        if private and command.kind == 'EXIT':
++            return CommandReply(False, 'private C completes at the approach pose without EXIT')
+         if private and command.kind == 'WAIT':
+             return CommandReply(False, 'private READY waits locally')
+     return CommandReply(True)
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/planner.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/planner.py
+@@ -57,15 +57,10 @@
+             if robot in snapshot.commands or not state.stopped:continue
+             if snapshot.phase=='SEARCH_AB' and not state.ready:
+                 actions.append(PlannedAction(robot,'APPROACH_PICKUP',target_id={'go2':'A','ranger':'B'}[robot]))
+-            elif snapshot.phase=='SEARCH_C':
+-                cached=any(o.robot_id==robot and o.target_id=='C' and o.status=='CACHED' for o in snapshot.observations.values())
+-                if not cached:actions.append(PlannedAction(robot,'SEARCH_VIEWPOINT',target_id='C'))
+-            elif snapshot.phase=='DEPOSIT' and not state.exited:
+-                if robot=='ranger' and (not snapshot.states['go2'].exited or snapshot.states['go2'].token):continue
+-                if state.deposited:
+-                    actions.append(PlannedAction(robot,'EXIT',target_id='C',parent_command_id=state.command_id))
+-                else:
+-                    clue=next(o for o in snapshot.observations.values() if o.robot_id==robot and o.target_id=='C' and o.status=='CACHED')
+-                    actions.append(PlannedAction(robot,'APPROACH_DEPOSIT',target_id='C',
+-                        observation_id=clue.observation_id))
++            elif snapshot.phase in ('SEARCH_C','DEPOSIT') and not state.deposited:
++                observation_id=snapshot.local_c.get(robot)
++                if not observation_id:
++                    actions.append(PlannedAction(robot,'SEARCH_VIEWPOINT',target_id='C'))
++                elif snapshot.phase=='DEPOSIT' and (robot,observation_id) not in snapshot.rejected:
++                    actions.append(PlannedAction(robot,'APPROACH_DEPOSIT',target_id='C',observation_id=observation_id))
+         return actions
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/runner.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/runner.py
+@@ -60,9 +60,6 @@
+         machine=self.machine;command=machine.command
+         self.local_identity=(command.task_id,command.command_id)
+         machine._state.run_state='LOCAL_EXECUTING'
+-        if command.kind=='EXIT':
+-            self.local_steps=self._exit_steps()
+-            return
+         config=dict(self.config)
+         robot=dict(config['robot_'+machine.context.robot_id])
+         robot['approach_on_detection']=command.kind!='SEARCH_VIEWPOINT'
+@@ -76,59 +73,6 @@
+             task_id=command.task_id,command_id=command.command_id,on_observation=self._local_observation,
+             initial_observation=machine.local_observations.get(command.observation_id) if command.kind=='APPROACH_DEPOSIT' else None)
+ 
+-    def _exit_steps(self):
+-        from .generated_candidates import rotation_radius
+-        from .config import valid_numbers
+-        machine=self.machine;command=machine.command
+-        robot=self.config['robot_'+machine.context.robot_id]
+-        target=machine.deposit_observation.common_position
+-        required=self.success_radius+rotation_radius(self.adapter.get_health().footprint,
+-            robot.get('footprint_padding',0.))+robot['stop_margin']
+-        def wait(future):
+-            expires=self.now+15.
+-            while not future.done():
+-                if self.now>=expires:
+-                    future.cancel();raise RuntimeError('exit planning timeout')
+-                yield None
+-            return future.result()
+-        parameters=yield from wait(self.adapter.read_approach_parameters())
+-        values=[parameters.get('xy_goal_tolerance'),parameters.get('planner_tolerance')]
+-        safety=robot.get('approach_safety_margin',.02)
+-        if not valid_numbers(values,2) or min(values)<0 or not valid_numbers([safety],1) or safety<0:
+-            raise RuntimeError('invalid actual exit tolerances')
+-        budget=required+values[0]+safety
+-        def path_accept(result):
+-            return (result.reachable and bool(result.path) and all(p.valid for p in result.path) and
+-                math.hypot(result.path[-1].x-target.x,result.path[-1].y-target.y)>=budget and
+-                self.adapter.approach_candidate_free(result.path[-1]))
+-        # Sample just outside the budget so floating-point subtraction cannot move it inside.
+-        approach=yield from wait(self.adapter.select_approach(target,[],standoff_distance=budget+1e-6,path_accept=path_accept))
+-        if approach.goal is None:raise RuntimeError('no reachable local exit')
+-        result=yield from wait(self.adapter.compute_path(approach.goal))
+-        health=self.adapter.get_health()
+-        if not path_accept(result) or not health.stopped or not health.motion_terminal:
+-            raise RuntimeError('exit path/stop prerequisites invalid')
+-        goal_id=self.adapter.start_navigation(approach.goal,command.task_id,command.command_id,'EXIT_NAV')
+-        machine.navigation_started(goal_id,'EXIT_NAV',self.now)
+-        expires=self.now+self.config['scene'].get('task_timeout',600.)
+-        terminal=None
+-        while terminal is None:
+-            if self.now>=expires:raise RuntimeError('exit navigation timeout')
+-            yield None
+-            while self.adapter.results:
+-                result=self.adapter.results.popleft()
+-                if (result.task_id,result.command_id,result.goal_id,result.goal_kind)==(
+-                        command.task_id,command.command_id,goal_id,'EXIT_NAV'):terminal=result.status
+-        if terminal!='SUCCEEDED':raise RuntimeError('exit navigation: '+terminal)
+-        while True:
+-            health=self.adapter.get_health()
+-            if health.stopped and health.motion_terminal:break
+-            if self.now>=expires:raise RuntimeError('exit stop unconfirmed')
+-            yield None
+-        if not health.pose.valid or math.hypot(health.pose.x-target.x,health.pose.y-target.y)<required:
+-            raise RuntimeError('actual local exit clearance not reached')
+-        return 'EXITED'
+-
+     def _advance_local(self):
+         machine=self.machine;command=machine.command
+         if machine.paused or not command or self.local_identity!=(command.task_id,command.command_id):
+@@ -141,9 +85,7 @@
+             self.local_steps=None
+             health=self.adapter.get_health()
+             if not health.stopped or not health.motion_terminal:machine.stop('local completion stop unconfirmed');return
+-            if completed.value=='EXITED' and command.kind=='EXIT':
+-                machine._state.exited=True
+-            elif completed.value=='TARGET_APPROACHED' and command.kind in ('APPROACH_PICKUP','APPROACH_DEPOSIT'):
++            if completed.value=='TARGET_APPROACHED' and command.kind in ('APPROACH_PICKUP','APPROACH_DEPOSIT'):
+                 if command.kind=='APPROACH_PICKUP':machine._state.ready=True
+                 else:machine._state.deposited=True
+             elif completed.value!='TARGET_FOUND' or command.kind!='SEARCH_VIEWPOINT':
+--- /dev/null
++++ b/cooperative_ws/src/multi_agent_nav/tests/test_independent_c.py
+@@ -0,0 +1,223 @@
++"""Private C tasks progress independently and finish at C, without EXIT."""
++from concurrent.futures import Future
++from dataclasses import replace
++
++import pytest
++
++from multi_agent_nav.mock import MockMission
++from multi_agent_nav.models import Observation, Pose2D, ROBOTS, validate_command
++from multi_agent_nav.runner import AgentRunner
++from test_private_c import private_config, local_agent
++
++
++def independent_mission():
++    cfg = private_config()
++    cfg['scene']['resources'] = {}
++    cfg['scene']['exit_points'] = {}
++    return MockMission(cfg)
++
++
++def cached_c(coordinator, robot, oid=None, **changes):
++    state = coordinator.states[robot]
++    return replace(Observation(task_id=coordinator.task_id, robot_id=robot,
++        local_map_id=state.local_map_id, map_version=state.map_version,
++        common_frame_id='', alignment_id='', observation_id=oid or robot + '/C',
++        target_id='C', status='CACHED', simulation=True), **changes)
++
++
++def ready_coordinator():
++    mission = independent_mission()
++    assert mission.start().accepted
++    coordinator = mission.coordinator
++    for robot in ROBOTS:
++        coordinator.ingest_state(replace(coordinator.states[robot], task_id=coordinator.task_id, ready=True), 0.)
++    return coordinator
++
++
++def test_private_c_completion_stays_at_c_without_exit_or_permits():
++    mission = independent_mission()
++    assert mission.start().accepted
++    mission.run(400)
++    assert mission.coordinator.phase == 'DONE', mission.coordinator.reason
++    assert {r for r, c in mission.executed if c.kind == 'APPROACH_DEPOSIT'} == set(ROBOTS)
++    assert all(c.kind != 'EXIT' and not c.resource_id and not c.token for _, c in mission.executed)
++    for robot in ROBOTS:
++        state = mission.machines[robot].state()
++        health = mission.adapters[robot].get_health()
++        assert state.ready and state.deposited and state.stopped and not state.exited
++        assert not state.token and not state.requested_resource
++        assert health.motion_terminal
++        assert ((health.pose.x - 9.) ** 2 + (health.pose.y - 1.) ** 2) ** .5 <= 1.
++
++
++@pytest.mark.parametrize('delayed_robot', ROBOTS)
++def test_peer_search_does_not_delay_own_approach(delayed_robot):
++    mission = independent_mission()
++    adapter = mission.adapters[delayed_robot]
++    del adapter.detections['C']
++    original_scan = adapter.start_scan
++    pending = Future()
++    calls = []
++    def delayed_scan(descriptions, scan_id, **options):
++        if mission.coordinator.phase in ('SEARCH_C', 'DEPOSIT'):
++            calls.append((descriptions, scan_id, options))
++            return pending
++        return original_scan(descriptions, scan_id, **options)
++    adapter.start_scan = delayed_scan
++    assert mission.start().accepted
++    mission.run(180)
++    other = 'ranger' if delayed_robot == 'go2' else 'go2'
++    assert calls and mission.machines[other].state().deposited
++    assert not mission.machines[delayed_robot].state().deposited
++    assert mission.coordinator.phase != 'DONE'
++    adapter.detections['C'] = Pose2D(9., 1.)
++    descriptions, scan_id, options = calls[0]
++    pending.set_result(original_scan(descriptions, scan_id, **options).result())
++    mission.run(180)
++    assert mission.coordinator.phase == 'DONE', mission.coordinator.reason
++    assert len([c for r, c in mission.executed if r == delayed_robot and c.kind == 'SEARCH_VIEWPOINT']) == 1
++
++
++def test_both_c_approaches_can_be_outstanding_together():
++    mission = independent_mission()
++    for adapter in mission.adapters.values():
++        adapter.delay = 1.
++    assert mission.start().accepted
++    together = False
++    for _ in range(400):
++        mission.step()
++        commands = mission.coordinator.commands
++        together |= all(r in commands and commands[r].kind == 'APPROACH_DEPOSIT' for r in ROBOTS)
++    assert together and mission.coordinator.phase == 'DONE'
++
++
++def test_search_in_progress_survives_transition_to_deposit():
++    mission = independent_mission()
++    pending = {r: Future() for r in ROBOTS}
++    calls = {}
++    scans = {}
++    for robot in ROBOTS:
++        adapter = mission.adapters[robot]
++        del adapter.detections['C']
++        scans[robot] = adapter.start_scan
++        def delayed(descriptions, scan_id, robot=robot, **options):
++            if mission.coordinator.phase in ('SEARCH_C', 'DEPOSIT'):
++                calls[robot] = (descriptions, scan_id, options)
++                return pending[robot]
++            return scans[robot](descriptions, scan_id, **options)
++        adapter.start_scan = delayed
++    assert mission.start().accepted
++    mission.run(100)
++    assert set(calls) == set(ROBOTS) and mission.coordinator.phase == 'SEARCH_C'
++    def release(robot):
++        mission.adapters[robot].detections['C'] = Pose2D(9., 1.)
++        descriptions, scan_id, options = calls[robot]
++        pending[robot].set_result(scans[robot](descriptions, scan_id, **options).result())
++    release('go2')
++    mission.run(100)
++    assert mission.machines['go2'].state().deposited
++    peer = mission.machines['ranger']
++    assert peer.phase == 'DEPOSIT' and peer.command.phase == 'SEARCH_C'
++    assert not pending['ranger'].done() and not peer.paused
++    release('ranger')
++    mission.run(100)
++    assert mission.coordinator.phase == 'DONE', mission.coordinator.reason
++
++
++def test_c_cache_does_not_bypass_ab_ready_barrier():
++    coordinator = ready_coordinator()
++    coordinator.states['ranger'].ready = False
++    coordinator.ingest_observation(cached_c(coordinator, 'go2'), 0.)
++    coordinator.ingest_observation(cached_c(coordinator, 'ranger'), 0.)
++    actions = [c for c in coordinator.tick(0.) if c.action == 'EXECUTE']
++    assert coordinator.phase == 'SEARCH_AB'
++    assert actions and all(c.kind == 'APPROACH_PICKUP' and c.recipient_id == 'ranger' for c in actions)
++
++
++def test_done_requires_current_matching_terminal_commands_and_both_stopped():
++    coordinator = ready_coordinator()
++    for robot in ROBOTS:
++        coordinator.ingest_observation(cached_c(coordinator, robot), 0.)
++    commands = [c for c in coordinator.tick(0.) if c.action == 'EXECUTE']
++    assert len(commands) == 2 and all(c.kind == 'APPROACH_DEPOSIT' for c in commands)
++    for command in commands:
++        robot = command.recipient_id
++        coordinator.ingest_state(replace(coordinator.states[robot], command_id=command.command_id,
++            sequence=command.sequence, reply='SUCCEEDED', deposited=True, stopped=False), .1)
++    coordinator.tick(.1)
++    assert coordinator.phase == 'DEPOSIT' and len(coordinator.commands) == 2
++    for robot in ROBOTS:
++        coordinator.ingest_state(replace(coordinator.states[robot], stopped=True, command_id='old-command'), .2)
++    coordinator.tick(.2)
++    assert coordinator.phase == 'DEPOSIT' and len(coordinator.commands) == 2
++    for command in commands:
++        coordinator.ingest_state(replace(coordinator.states[command.recipient_id], command_id=command.command_id), .3)
++    coordinator.tick(.3)
++    assert coordinator.phase == 'DONE' and not coordinator.commands
++
++
++def test_cache_upgrade_is_task_local_and_ignores_invalid_coordinates():
++    coordinator = ready_coordinator()
++    observation = cached_c(coordinator, 'ranger')
++    coordinator.ingest_observation(replace(observation, status='NOT_DETECTED'), 0.)
++    coordinator.ingest_observation(replace(observation, task_id='old'), 0.)
++    coordinator.ingest_observation(replace(observation, position_valid=True, common_position=Pose2D(4, 5)), 0.)
++    coordinator.ingest_observation(observation, .1)
++    actions = [c for c in coordinator.tick(.1) if c.action == 'EXECUTE']
++    assert any(c.recipient_id == 'ranger' and c.kind == 'APPROACH_DEPOSIT' for c in actions)
++    assert any(c.recipient_id == 'go2' and c.kind == 'SEARCH_VIEWPOINT' for c in actions)
++    coordinator.pause('new task')
++    assert coordinator.start(coordinator.scene['scenario_id'], .1).accepted
++    assert not coordinator.local_c and not coordinator.observations
++
++
++def test_private_agent_accepts_c_search_during_deposit_but_rejects_exit():
++    _, machine, _, command = local_agent()
++    machine._state.ready = True
++    machine.phase = 'DEPOSIT'
++    search = replace(command, phase='DEPOSIT', kind='SEARCH_VIEWPOINT', target_id='C')
++    assert not validate_command(replace(search, kind='EXIT'), machine.context).accepted
++    assert not machine.accept(replace(search, kind='EXIT'), 0.).accepted
++    assert machine.accept(search, 0.).accepted
++
++
++@pytest.mark.parametrize('fault', ['moving', 'far', 'aborted', 'cancel'])
++def test_independent_c_requires_current_success_and_actual_stopped_distance(fault):
++    config, machine, adapter, command = local_agent()
++    machine._state.ready = True
++    machine.phase = 'DEPOSIT'
++    machine.local_observations['own-c'] = Observation(task_id='t', robot_id='ranger',
++        local_map_id=machine.context.local_map_id, map_version=machine.context.map_version,
++        target_id='C', observation_id='own-c', status='DETECTED', position_valid=True, common_position=Pose2D(9., 1.))
++    command = replace(command, phase='DEPOSIT', kind='APPROACH_DEPOSIT', target_id='C', observation_id='own-c')
++    assert machine.accept(command, 0.).accepted
++    runner = AgentRunner(machine, adapter, config['scene']['targets'], lambda _: None, config=config)
++    original_advance = adapter.advance
++    def advance(now):
++        if fault == 'aborted' and any(row[2].goal_kind == 'DEPOSIT_NAV' for row in adapter.active.values()):
++            adapter.aborts = 10
++        original_advance(now)
++    adapter.advance = advance
++    injected = False
++    for index in range(240):
++        now = index * .05
++        machine.peer_received = machine.sync_received = now
++        if not injected and any(kind == 'DEPOSIT_NAV' for kind, _, _ in adapter.calls):
++            injected = True
++            health = adapter.get_health
++            if fault == 'moving': adapter.get_health = lambda: replace(health(), stopped=False)
++            if fault == 'far': adapter.get_health = lambda: replace(health(), pose=Pose2D(-100, -100))
++            if fault == 'cancel': machine.stop('cancel')
++        runner.tick(now)
++    assert injected and not machine.state().deposited and not machine.state().exited
++
++
++def test_deposit_rejects_other_task_or_robot_local_cache():
++    _, machine, _, command = local_agent()
++    machine._state.ready = True
++    machine.phase = 'DEPOSIT'
++    for changes in (dict(task_id='old', robot_id='ranger'), dict(task_id='t', robot_id='go2')):
++        machine.local_observations['wrong-c'] = Observation(target_id='C', status='DETECTED',
++            position_valid=True, common_position=Pose2D(9, 1), **changes)
++        assert not machine.accept(replace(command, phase='DEPOSIT', kind='APPROACH_DEPOSIT',
++            target_id='C', observation_id='wrong-c'), 0.).accepted
+--- a/cooperative_ws/src/multi_agent_nav/tests/test_private_c.py
++++ b/cooperative_ws/src/multi_agent_nav/tests/test_private_c.py
+@@ -1,4 +1,4 @@
+-"""Private local maps, strict arrival and shared resource ordering, without ROS."""
++"""Private local maps, strict arrival and independent C completion, without ROS."""
+ from dataclasses import replace
+ from concurrent.futures import Future
+ import pytest
+@@ -91,24 +91,23 @@
+     assert machine.state().token==machine.state().resource_id==''
+ 
+ 
+-def test_full_private_mission_keeps_ready_barrier_and_order_without_coordinate_messages():
++def test_full_private_mission_keeps_ready_barrier_without_coordinate_messages():
+     mission=MockMission(private_config())
+     assert mission.start().accepted
+     mission.run(800)
+     assert mission.coordinator.phase=='DONE', (mission.coordinator.reason,mission.coordinator.states)
+     deposits=[(r,c) for r,c in mission.executed if c.kind=='APPROACH_DEPOSIT']
+-    assert [r for r,c in deposits]==['go2','ranger']
++    assert {r for r,c in deposits}==set(ROBOTS) and len(deposits)==2
+     assert deposits[0][1].observation_id != deposits[1][1].observation_id
+     for robot,deposit in deposits:
+         assert deposit.observation_id.startswith(robot+'/')
+-        exit_command=next(c for r,c in mission.executed if r==robot and c.kind=='EXIT')
+-        assert exit_command.parent_command_id == deposit.command_id and exit_command.token==''
+     assert not mission.coordinator.resources.held
++    assert not any(c.kind=='EXIT' for _,c in mission.executed)
+     for robot,command in mission.executed:
+         assert not command.position_valid and command.common_goal==command.object_position==Pose2D()
+         assert command.common_frame_id==command.alignment_id==command.viewpoint_id==''
+     for state in mission.coordinator.states.values():
+-        assert state.ready and state.deposited and state.exited
++        assert state.ready and state.deposited and state.stopped and not state.exited
+         assert state.localization_valid and not state.pose_valid and state.common_pose==Pose2D()
+     assert all(not o.position_valid and o.common_position==Pose2D() for o in mission.coordinator.observations.values())
+ 
+@@ -174,6 +173,7 @@
+     assert 'DOOR_TRANSIT' not in [kind for kind,_,_ in calls]
+     assert any(kind=='DEPOSIT_NAV' for kind,_,_ in calls)
+     assert not mission.coordinator.resources.held
++    assert not any(c.kind=='EXIT' for _,c in mission.executed)
+ 
+ 
+ def test_slow_local_vision_does_not_block_tick_or_pause():
+@@ -213,14 +213,18 @@
+     assert machine.state().ready,machine.state().reason
+ 
+ 
+-def test_private_heartbeat_loss_pauses_without_granting_ranger():
++def test_private_heartbeat_loss_pauses_both_independent_agents():
+     mission=MockMission(private_config());assert mission.start().accepted
+     for _ in range(600):
+         mission.step()
+         if any(kind=='DEPOSIT_NAV' for kind,_,_ in mission.adapters['go2'].calls):break
+     mission.online['go2']=False;mission.run(60)
+     assert mission.coordinator.phase=='PAUSED'
+-    assert not any(r=='ranger' and c.kind=='APPROACH_DEPOSIT' for r,c in mission.executed)
++    assert all(m.paused for m in mission.machines.values())
++    assert all(not a.active for a in mission.adapters.values())
++    before={r:len(a.calls) for r,a in mission.adapters.items()}
++    mission.run(20)
++    assert before=={r:len(a.calls) for r,a in mission.adapters.items()}
+ 
+ 
+ def test_peer_private_state_uses_local_receipt_and_pauses_on_map_change():
+@@ -270,6 +274,7 @@
+     else:pytest.fail('deposit did not start')
+     assert not mission.machines['go2'].state().token
+     assert not mission.coordinator.resources.held
++    assert not any(c.kind=='EXIT' for _,c in mission.executed)
+ 
+ 
+ def test_motion_ownership_is_local_and_allows_only_one_agent_observer():
+--- a/cooperative_ws/src/multi_agent_nav/tests/test_simplified_mission.py
++++ b/cooperative_ws/src/multi_agent_nav/tests/test_simplified_mission.py
+@@ -1,58 +1,4 @@
+-"""Unannotated exploration and ordered C mission without protected regions."""
+-from dataclasses import replace
+-import math
+-import pytest
+-from multi_agent_nav.mock import MockMission
+-from multi_agent_nav.models import Pose2D
+-from test_private_c import private_config
+-
+-
+-def simple_config():
+-    config=private_config()
+-    config['scene']['resources']={};config['scene']['exit_points']={}
+-    return config
+-
+-
+-def test_no_region_no_exit_points_mission_preserves_ready_and_deposit_order():
+-    mission=MockMission(simple_config())
+-    assert mission.start().accepted
+-    go2_exited=False
+-    for _ in range(800):
+-        mission.step()
+-        go2_exited=go2_exited or mission.machines['go2'].state().exited
+-        if any(robot=='ranger' and command.kind=='APPROACH_DEPOSIT' for robot,command in mission.executed):
+-            assert go2_exited
+-        assert all(not m.state().token and not m.state().requested_resource for m in mission.machines.values())
+-    assert mission.coordinator.phase=='DONE',mission.coordinator.reason
+-    deposits=[(r,c) for r,c in mission.executed if c.kind=='APPROACH_DEPOSIT']
+-    assert [r for r,c in deposits]==['go2','ranger']
+-    for robot,deposit in deposits:
+-        exit_command=next(c for r,c in mission.executed if r==robot and c.kind=='EXIT')
+-        assert exit_command.parent_command_id==deposit.command_id
+-        assert exit_command.resource_id==exit_command.token==''
+-        health=mission.adapters[robot].get_health()
+-        radius=max(math.hypot(*p) for p in health.footprint)
+-        assert math.hypot(health.pose.x-9.,health.pose.y-1.)>=1.+radius+.1
+-
+-
+-@pytest.mark.parametrize('fault',['far_not_reached','moving','aborted'])
+-def test_exit_requires_actual_clearance_success_and_stopped_before_ranger(fault):
+-    mission=MockMission(simple_config());adapter=mission.adapters['go2']
+-    original=adapter.advance;health=adapter.get_health
+-    def advance(now):
+-        exiting=any(row[2].goal_kind=='EXIT_NAV' for row in adapter.active.values())
+-        if exiting and fault=='aborted':adapter.aborts=10
+-        original(now)
+-        if exiting and not adapter.active:
+-            adapter.path=[]
+-            if fault=='far_not_reached':adapter.pose=Pose2D(8.3,1.)
+-            if fault=='moving':adapter.get_health=lambda:replace(health(),stopped=False)
+-    adapter.advance=advance
+-    assert mission.start().accepted
+-    mission.run(500)
+-    assert any(kind=='EXIT_NAV' for kind,_,_ in adapter.calls)
+-    assert not mission.machines['go2'].state().exited
+-    assert not any(r=='ranger' and c.kind=='APPROACH_DEPOSIT' for r,c in mission.executed)
++"""Configuration gates retained alongside independent C completion."""
+ 
+ 
+ def test_camera_confirmation_is_evidence_not_startup_gate():
+@@ -73,24 +19,3 @@
+     monkeypatch.setattr(core,'exploration_gates',lambda *args:[])
+     monkeypatch.setattr(settings,'map_file_gates',lambda *args,**kwargs:[])
+     assert private_live_gates(config,'ranger')==[]
+-
+-
+-def test_exit_sampling_does_not_lose_the_only_safe_direction_to_roundoff():
+-    from test_private_c import local_agent
+-    from multi_agent_nav.models import Observation
+-    from multi_agent_nav.runner import AgentRunner
+-    config,machine,adapter,command=local_agent()
+-    config['robot_ranger'].update(stop_margin=.2,footprint_padding=.03)
+-    health=adapter.get_health
+-    adapter.get_health=lambda:replace(health(),footprint=[[.36,.25],[.36,-.25],[-.36,-.25],[-.36,.25]])
+-    adapter.pose=Pose2D(8.19,1.)
+-    adapter.approach_candidate_free=lambda point:point.y==1.
+-    machine.phase='DEPOSIT';machine._state.ready=machine._state.deposited=True
+-    machine.deposit_observation=Observation(target_id='C',status='DETECTED',position_valid=True,common_position=Pose2D(9,1))
+-    machine.deposit_command_id='deposit'
+-    command=replace(command,kind='EXIT',target_id='C',phase='DEPOSIT',command_id='exit',parent_command_id='deposit')
+-    assert machine.accept(command,0).accepted
+-    runner=AgentRunner(machine,adapter,config['scene']['targets'],lambda _:None,config=config)
+-    for index in range(100):
+-        now=index*.05;machine.sync_received=machine.peer_received=now;runner.tick(now)
+-    assert machine.state().exited,machine.state().reason

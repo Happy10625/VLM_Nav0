@@ -8,6 +8,33 @@
 本目录借鉴 `Co-NavGPT2` 和其中的 `co_nav2_nav`，但运行和构建不要求修改
 那些源码。Livox、FAST_LIO、RealSense 和 Ranger 驱动仍由现有工作空间提供。
 
+协作 Ranger 可用一条命令按顺序启动硬件、Nav2、轻量RViz和R5只读诊断终端：
+
+```bash
+source /home/isee601/ws/VLM_Nav/RangerVLM_env.bash
+bash "$REPO/scripts/start_ranger_stack.sh"
+```
+
+启动后保留各组件终端，在RViz设置真实初始位姿，再执行下面的只读检查；已有完整实例时复用，不自动开始探索。
+
+协作 Ranger 单机验收使用中文只读检查入口，完整诊断保存在日志文件中：
+
+```bash
+source /home/isee601/ws/VLM_Nav/RangerVLM_env.bash
+bash "$REPO/scripts/check_ranger.sh" --offline       # 仅配置
+bash "$REPO/scripts/check_ranger.sh" --hardware-only # 仅硬件，尚未启动Nav2时使用
+bash "$REPO/scripts/check_ranger.sh"                # 配置、硬件及定位/Nav2
+```
+
+任务状态和结果使用简明诊断面板，默认自动跟随当前实验；需要单次摘要时加 `--once`：
+
+```bash
+source /home/isee601/ws/VLM_Nav/RangerVLM_env.bash
+bash "$REPO/scripts/monitor_ranger.sh"
+```
+
+按当前验收阶段选择其中一条命令。入口不发送运动或VLM请求；输出每项通过/失败及处理建议，退出0表示所选范围全部通过，退出1表示有失败项。步骤见 [协作Ranger单机验收](docs/协作Ranger单机验收.md#25-配置与只读健康检查r0自动退出)。
+
 ## 数据流
 
 ```text
@@ -36,7 +63,7 @@ Livox → FAST_LIO → /cloud_registered_body → tf2 转到 base_link
 ## 安装与构建
 
 ```bash
-cd /home/isee-cdh/ws
+cd /home/isee601/ws
 python3 -m pip install -r VLM_Nav/requirements.txt
 source /opt/ros/humble/setup.bash
 colcon --log-base VLM_Nav/log build \
@@ -46,7 +73,7 @@ colcon --log-base VLM_Nav/log build \
 source VLM_Nav/install/setup.bash
 ```
 
-启动脚本使用 `/home/isee-cdh/ws/VLM_Nav/install`。修改源码后必须重新构建该
+启动脚本使用 `/home/isee601/ws/VLM_Nav/install`。修改源码后必须重新构建该
 安装目录并重启旧的 launch 进程；启动器会在打开终端前检查
 `obstacle_cloud_filter` 是否存在，避免旧 overlay 静默覆盖新版本。
 
@@ -67,6 +94,8 @@ test -n "${DASHSCOPE_API_KEY:-}" && echo "API key 已设置"
 export DASHSCOPE_BASE_URL="https://你的业务空间ID.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
 ```
 
+目前通过设置~/.bashrc来配置环境变量,从而不需要每次运行脚本时输入APIkey等信息.
+
 客户端通过 OpenAI Python SDK 的 `chat.completions` 接口调用
 `qwen3-vl-flash`，使用非流式 JSON 输出并显式设置
 `enable_thinking=false`，避免推理内容增加导航延迟。旧的
@@ -81,8 +110,8 @@ Qwen 偶发返回的严格二元素坐标数组 `[u,v]`，换算后仍执行整�
 
 ```bash
 source /opt/ros/humble/setup.bash
-source /home/isee-cdh/ws/VLM_Nav/install/setup.bash
-python3 /home/isee-cdh/ws/VLM_Nav/scripts/qwen_latency_probe.py \
+source /home/isee601/ws/VLM_Nav/install/setup.bash
+python3 /home/isee601/ws/VLM_Nav/scripts/qwen_latency_probe.py \
   --samples 5 --timeout 8.0 --target chair --mode both
 ```
 
@@ -114,7 +143,7 @@ VLM_Nav/scripts/04_fastlio.sh
 FAST_LIO 初始位置，但不会 ARM 或驱动小车：
 
 ```bash
-cd /home/isee-cdh/ws
+cd /home/isee601/ws
 ./VLM_Nav/scripts/start_hardware.sh
 ```
 
@@ -126,7 +155,7 @@ cd /home/isee-cdh/ws
 **一键打开**系统、RViz、状态和诊断四个终端：
 
 ```bash
-cd /home/isee-cdh/ws
+cd /home/isee601/ws
 unset ALL_PROXY all_proxy
 ./VLM_Nav/scripts/start_navigation_validation.sh "放置了可乐的椅子"
 ```
@@ -311,7 +340,7 @@ ros2 param get /behavior_server costmap_topic
 不需要硬件的测试：
 
 ```bash
-cd /home/isee-cdh/ws/VLM_Nav
+cd /home/isee601/ws/VLM_Nav
 ./scripts/test_no_hardware.sh
 ```
 
@@ -323,8 +352,8 @@ cd /home/isee-cdh/ws/VLM_Nav
 
 ```bash
 source /opt/ros/humble/setup.bash
-source /home/isee-cdh/ws/VLM_Nav/install/setup.bash
-cd /home/isee-cdh/ws/VLM_Nav
+source /home/isee601/ws/VLM_Nav/install/setup.bash
+cd /home/isee601/ws/VLM_Nav
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   PYTHONPATH=.:${PYTHONPATH:-} \
   python3 -m pytest -q test

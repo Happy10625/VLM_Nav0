@@ -1,0 +1,1940 @@
+--- a/cooperative_ws/src/multi_agent_nav/config/scene.yaml
++++ b/cooperative_ws/src/multi_agent_nav/config/scene.yaml
+@@ -1,6 +1,7 @@
+ scenario_id: lab
+ enabled: false
+ simulation: false
++share_c_coordinates: false
+ targets:
+   A: 灭火器
+   B: 水杯
+--- /dev/null
++++ b/cooperative_ws/src/multi_agent_nav/launch/ranger_cooperative.launch.py
+@@ -0,0 +1,21 @@
++"""Attach Ranger's task agent to its existing local perception and Nav2 stack."""
++from pathlib import Path
++from ament_index_python.packages import get_package_share_directory
++from launch import LaunchDescription
++from launch.actions import DeclareLaunchArgument,OpaqueFunction,SetEnvironmentVariable
++from launch.substitutions import LaunchConfiguration
++from launch_ros.actions import Node
++
++
++def build(context):
++    return [Node(package='multi_agent_nav',executable='multi_agent_agent_node',
++        name='multi_agent_ranger_agent',output='screen',parameters=[dict(robot_id='ranger',
++            simulation=False,topic_prefix='/multi_agent',
++            config_dir=LaunchConfiguration('config_dir').perform(context))])]
++
++
++def generate_launch_description():
++    return LaunchDescription([
++        DeclareLaunchArgument('config_dir',default_value=str(Path(get_package_share_directory('multi_agent_nav'))/'config')),
++        SetEnvironmentVariable('ROS_DOMAIN_ID','0'),
++        OpaqueFunction(function=build)])
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/adapters/base.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/adapters/base.py
+@@ -5,7 +5,12 @@
+     """Planning/scanning return Futures; motion results enter the results queue."""
+     def get_health(self) -> Health: ...
+     def compute_path(self, local_goal: Pose2D): ...
+-    def select_approach(self, local_object: Pose2D, excluded_candidates): ...
++    def select_approach(self, local_object: Pose2D, excluded_candidates, *, standoff_distance=None,path_accept=None): ...
++    def read_approach_parameters(self): ...
++    def costmap_transform(self,global_goal=False): ...
++    def costmap_candidate_free(self,candidate,global_goal=False): ...
++    def observation_candidate_free(self,candidate): ...
++    def approach_candidate_free(self,candidate): ...
+     def start_navigation(self, local_goal, task_id, command_id, goal_kind) -> str: ...
+     def cancel_navigation(self, goal_id): ...
+     def start_scan(self, target_descriptions, scan_id, *, stop_on_target=None): ...
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/adapters/factory.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/adapters/factory.py
+@@ -1,19 +1,21 @@
+ """Select a known local runtime; importing this module does not initialize ROS."""
++import math
+ 
+ def create_runtime(robot_id,config,*,read_only=False,global_goal_checks=False,node_name=None):
+     if robot_id not in ('go2','ranger'):
+         raise ValueError('unknown robot_id: '+str(robot_id))
+-    from ..frame_adapter import FrameAdapter
+-    entry=config['alignment']['robots'][robot_id]
+-    frame=FrameAdapter(entry['local_map_id'],entry['map_version'],config['alignment']['common_frame_id'],
+-        config['alignment']['alignment_id'],entry['transform'])
++    from ..frame_adapter import configured_frame
++    frame=configured_frame(config,robot_id)
+     if robot_id=='go2':
+         from .go2 import make_observer,Go2Adapter as Adapter
+     else:
+         from .ranger import make_observer,RangerAdapter as Adapter
+-    observer=make_observer(config['robot_'+robot_id],read_only=read_only,node_name=node_name)
++    robot_config=dict(config['robot_'+robot_id])
++    if config['scene'].get('share_c_coordinates',True) is False and config.get('coordinate_mode')!='local_only':
++        robot_config['scan_angles']=[-(i+1)*math.pi/4 for i in range(8)]
++    observer=make_observer(robot_config,read_only=read_only,node_name=node_name)
+     try:
+-        return observer,Adapter(observer,config['robot_'+robot_id],frame,read_only=read_only,
++        return observer,Adapter(observer,robot_config,frame,read_only=read_only,
+             global_goal_checks=global_goal_checks)
+     except BaseException:
+         observer.destroy_node()
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/adapters/fake.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/adapters/fake.py
+@@ -31,11 +31,23 @@
+         return completed(PathResult(not self.unreachable, [self.pose, local_goal],
+                                     'unreachable' if self.unreachable else ''))
+ 
+-    def select_approach(self, local_object, excluded_candidates):
+-        offset = .8 if self.robot_id == 'go2' else 1.0
++    def read_approach_parameters(self):
++        return completed(dict(xy_goal_tolerance=.05,planner_tolerance=.76))
++
++    def costmap_transform(self,global_goal=False):
++        return Pose2D() if self.online else None
++
++    def costmap_candidate_free(self,candidate,global_goal=False):
++        return self.online and candidate.valid
++
++    observation_candidate_free=approach_candidate_free=costmap_candidate_free
++
++    def select_approach(self, local_object, excluded_candidates, *, standoff_distance=None,path_accept=None):
++        offset = standoff_distance if standoff_distance is not None else (.8 if self.robot_id == 'go2' else 1.0)
+         candidates = [Pose2D(local_object.x-offset, local_object.y, 0),
+                       Pose2D(local_object.x, local_object.y-offset, 1.5707963267948966)]
+-        goal = next((p for p in candidates if p not in excluded_candidates), None)
++        goal = next((p for p in candidates if p not in excluded_candidates and
++            (path_accept is None or path_accept(PathResult(True,[self.pose,p])))), None)
+         return completed(ApproachResult(goal if not self.unreachable else None, 'no approach candidate'))
+ 
+     def start_navigation(self, local_goal, task_id, command_id, goal_kind):
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/adapters/nav2.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/adapters/nav2.py
+@@ -18,6 +18,7 @@
+         from rclpy.qos import qos_profile_sensor_data,QoSProfile,DurabilityPolicy
+         self.node,self.config,self.frame=observer,config,frame
+         self.read_only=read_only
++        self.global_goal_checks=global_goal_checks
+         self.results=deque()
+         self.motions={}
+         self.last_action_uuid=''
+@@ -130,7 +131,7 @@
+             details.update(reason='tf_unavailable',error_type=type(error).__name__)
+             return None
+ 
+-    def costmap_candidate_free(self,candidate,global_goal=False):
++    def costmap_candidate_free(self,candidate,global_goal=False,*,allow_outside=False):
+         from vlm_nav.vlm_navigator import quaternion_yaw
+         transform=self.costmap_transform(global_goal=True) if global_goal else self.costmap_transform()
+         if transform is None:return False
+@@ -146,9 +147,10 @@
+         local_yaw=normalize_angle(candidate.yaw+transform.yaw-yaw)
+         footprint=self.config['footprint']
+         # Conservative centered rectangle also covers asymmetric footprints.
+-        length,width=2*max(abs(p[0]) for p in footprint),2*max(abs(p[1]) for p in footprint)
++        padding=self.config.get('footprint_padding',0.)
++        length,width=2*(max(abs(p[0]) for p in footprint)+padding),2*(max(abs(p[1]) for p in footprint)+padding)
+         c,s=math.cos(local_yaw),math.sin(local_yaw)
+-        if any(not (0<=x+c*px-s*py<meta.size_x*meta.resolution and 0<=y+s*px+c*py<meta.size_y*meta.resolution)
++        if not allow_outside and any(not (0<=x+c*px-s*py<meta.size_x*meta.resolution and 0<=y+s*px+c*py<meta.size_y*meta.resolution)
+             for px in (-length/2,length/2) for py in (-width/2,width/2)):return False
+         raw=np.asarray(message.data,dtype=np.int16).reshape(meta.size_y,meta.size_x)
+         # Nav2 253/254 are inscribed/lethal and 255 unknown. Unknown body cells veto too.
+@@ -158,21 +160,35 @@
+         dx,dy=(gx+.5)*meta.resolution-x,(gy+.5)*meta.resolution-y
+         half_cell=meta.resolution*(abs(c)+abs(s))/2
+         body=(np.abs(c*dx+s*dy)<=length/2+half_cell) & (np.abs(-s*dx+c*dy)<=width/2+half_cell)
+-        return bool(body.any()) and not np.any(body & (raw>=self.config.get('costmap_blocked_cost',253)))
++        return (allow_outside or bool(body.any())) and not np.any(body & (raw>=self.config.get('costmap_blocked_cost',253)))
+ 
+     def observation_candidate_free(self,candidate):
++        return self._rotation_free(candidate,True) and self._rotation_free(candidate,False,allow_outside=True)
++
++    def approach_candidate_free(self,candidate):
++        return (self.costmap_candidate_free(candidate,global_goal=True) and
++            self.costmap_candidate_free(candidate,allow_outside=True) and self.observation_candidate_free(candidate))
++
++    def _rotation_free(self,candidate,global_goal,allow_outside=False):
+         from vlm_nav.vlm_navigator import quaternion_yaw
+         from ..generated_candidates import circle_free, rotation_radius
+-        transform=self.costmap_transform(global_goal=True)
++        transform=self.costmap_transform(global_goal=global_goal)
+         if transform is None:return False
+-        meta=self.global_costmap.metadata
++        message=self.global_costmap if global_goal else self.costmap
++        meta=message.metadata
+         c,s=math.cos(transform.yaw),math.sin(transform.yaw)
+         x=c*candidate.x-s*candidate.y+transform.x-meta.origin.position.x
+         y=s*candidate.x+c*candidate.y+transform.y-meta.origin.position.y
+         yaw=quaternion_yaw(meta.origin.orientation);c,s=math.cos(yaw),math.sin(yaw)
+-        raw=np.asarray(self.global_costmap.data,dtype=np.int16).reshape(meta.size_y,meta.size_x)
+-        return circle_free(raw,c*x+s*y,-s*x+c*y,
+-            rotation_radius(self.config['footprint'],self.config.get('footprint_padding',0.)),
++        raw=np.asarray(message.data,dtype=np.int16).reshape(meta.size_y,meta.size_x)
++        x,y=c*x+s*y,-s*x+c*y
++        radius=rotation_radius(self.config['footprint'],self.config.get('footprint_padding',0.))
++        if allow_outside:
++            gy,gx=np.indices(raw.shape)
++            dx=np.maximum(np.abs((gx+.5)*meta.resolution-x)-meta.resolution/2,0)
++            dy=np.maximum(np.abs((gy+.5)*meta.resolution-y)-meta.resolution/2,0)
++            return not np.any((dx*dx+dy*dy<=radius*radius) & (raw>=self.config.get('costmap_blocked_cost',253)))
++        return circle_free(raw,x,y,radius,
+             meta.resolution,lambda cells:cells>=self.config.get('costmap_blocked_cost',253))
+ 
+     def _motion_event(self,event,goal_id=None,motion=None,**fields):
+@@ -261,6 +277,7 @@
+             depth_units_verified=bool(self.node.depth_units_verified),rgbd_ready=bool(self.node.vlm_input_ready(now)),
+             odom_fresh=bool(self.odom_at and now-self.odom_at<=self.config['odom_max_age']),
+             local_costmap=self.costmap_transform() is not None)
++        if hasattr(self,'task_map_ready'):checks['active_task_map']=self.task_map_ready
+         ready=all(checks.values())
+         snapshot=getattr(self.node,'latest_snapshot',None)
+         camera_tf_at=getattr(self.node,'last_camera_tf_success',None)
+@@ -301,8 +318,10 @@
+                     try:
+                         value=completed.result()
+                         if value.status!=4 or not value.result.path.poses:raise ValueError('no local path')
++                        if value.result.path.header.frame_id!='map':raise ValueError('wrong path frame')
+                         from vlm_nav.vlm_navigator import quaternion_yaw
+                         path=[Pose2D(p.pose.position.x,p.pose.position.y,quaternion_yaw(p.pose.orientation)) for p in value.result.path.poses]
++                        if not all(p.valid for p in path):raise ValueError('nonfinite path')
+                         future.set_result(PathResult(True,path))
+                     except Exception:future.set_result(PathResult(False,reason='local path failed'))
+                 handle.get_result_async().add_done_callback(result)
+@@ -312,12 +331,50 @@
+         request.add_done_callback(response)
+         return future
+ 
+-    def select_approach(self,local_object,excluded_candidates,*,standoff_distance=None):
++    def read_approach_parameters(self):
++        from rcl_interfaces.srv import GetParameters
++        from rcl_interfaces.msg import ParameterType
++        output=Future();values={}
++        if not hasattr(self,'approach_parameter_clients'):
++            self.approach_parameter_clients={name:self.node.create_client(GetParameters,'/'+name+'/get_parameters')
++                for name in ('controller_server','planner_server')}
++        def request(server,names,consume):
++            client=self.approach_parameter_clients[server]
++            if not client.service_is_ready():
++                if not output.done():output.set_exception(RuntimeError(server+' parameter service unavailable'))
++                return
++            def completed(done):
++                if output.done():return
++                try:consume(done.result().values)
++                except Exception as error:output.set_exception(error)
++            client.call_async(GetParameters.Request(names=names)).add_done_callback(completed)
++        def plugins(server,field,parameter,label):
++            def selected(parameters):
++                if len(parameters)!=1 or parameters[0].type!=ParameterType.PARAMETER_STRING_ARRAY or not parameters[0].string_array_value:
++                    raise ValueError('missing active '+field)
++                names=[name+'.'+parameter for name in parameters[0].string_array_value]
++                def read(parameters):
++                    if len(parameters)!=len(names) or any(p.type!=ParameterType.PARAMETER_DOUBLE or
++                            not math.isfinite(p.double_value) or p.double_value<0 for p in parameters):
++                        raise ValueError('invalid actual '+label)
++                    values[label]=max(p.double_value for p in parameters)
++                    if len(values)==2:output.set_result(values)
++                request(server,names,read)
++            request(server,[field],selected)
++        try:
++            plugins('controller_server','goal_checker_plugins','xy_goal_tolerance','xy_goal_tolerance')
++            plugins('planner_server','planner_plugins','tolerance','planner_tolerance')
++        except Exception as error:
++            if not output.done():output.set_exception(error)
++        return output
++
++    def select_approach(self,local_object,excluded_candidates,*,standoff_distance=None,path_accept=None):
+         output=Future()
+         if self.costmap_transform() is None:
+             output.set_result(ApproachResult(reason='local map/costmap unavailable'))
+             return output
+         candidates=[]
++        free=self.approach_candidate_free if getattr(self,'global_goal_checks',False) else self.costmap_candidate_free
+         distance=self.config['standoff_distance'] if standoff_distance is None else standoff_distance
+         if isinstance(distance,bool) or not isinstance(distance,(int,float)) or not math.isfinite(distance) or distance<=0:
+             output.set_result(ApproachResult(reason='invalid standoff distance'))
+@@ -325,7 +382,7 @@
+         for angle in np.linspace(-math.pi,math.pi,8,endpoint=False):
+             candidate=Pose2D(local_object.x+distance*math.cos(angle),local_object.y+distance*math.sin(angle),normalize_angle(angle+math.pi))
+             if candidate in excluded_candidates:continue
+-            if self.costmap_candidate_free(candidate):candidates.append(candidate)
++            if free(candidate):candidates.append(candidate)
+         health=self.get_health()
+         candidates.sort(key=lambda p:math.hypot(p.x-health.pose.x,p.y-health.pose.y))
+         def attempt():
+@@ -334,18 +391,23 @@
+                 output.set_result(ApproachResult(reason='no locally reachable candidate'))
+                 return
+             candidate=candidates.pop(0)
+-            if not self.costmap_candidate_free(candidate):attempt();return
++            if not free(candidate):attempt();return
+             future=self.compute_path(candidate)
+             def done(f):
+                 if output.done():return
+-                if f.result().reachable and self.costmap_candidate_free(candidate):output.set_result(ApproachResult(candidate))
+-                else:attempt()
++                try:
++                    result=f.result()
++                    if result.reachable and result.path and free(candidate) and (path_accept is None or path_accept(result)):
++                        output.set_result(ApproachResult(candidate))
++                    else:attempt()
++                except Exception as error:output.set_exception(error)
+             future.add_done_callback(done)
+         attempt()
+         return output
+ 
+     def _motion(self,client,goal,task_id,command_id,kind,target=None):
+         if getattr(self,'read_only',False):raise RuntimeError('read-only adapter cannot send motion goals')
++        if getattr(self,'motion_guard',None):self.motion_guard()
+         goal_id=uuid.uuid4().hex
+         motion={'handle':None,'cancel':False,'reply':Future(),'task':task_id,'command':command_id,'kind':kind,'since':time.monotonic(),
+                 'native_uuid':'','target':target}
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/agent.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/agent.py
+@@ -32,6 +32,10 @@
+         self.health = Health()
+         self.guard = None
+         self.transit_goal = None
++        self.private = context.common_frame_id == context.alignment_id == ''
++        self.local_observations = {}
++        self.exit_point = None
++        self.task_started_at = 0.
+ 
+     def state(self):
+         return replace(self._state)
+@@ -40,7 +44,29 @@
+         effects, self.effects = self.effects, []
+         return effects
+ 
++    def receive_peer(self,state,entry,now):
++        expected='ranger' if self.context.robot_id=='go2' else 'go2'
++        if state.robot_id!=expected or state.task_id!=self.context.task_id or state.simulation!=self.context.simulation:
++            return False
++        identity=(state.local_map_id,state.map_version,state.common_frame_id,state.alignment_id)
++        if state.schema_version!=SCHEMA_VERSION or identity!=(entry['local_map_id'],entry['map_version'],
++                self.context.common_frame_id,self.context.alignment_id):
++            self.stop('peer map/mode identity changed');return False
++        if self.private and (state.pose_valid or state.common_pose!=Pose2D()):
++            self.stop('private peer published coordinates');return False
++        if not state.localization_valid or not state.nav_ready or not self.private and not state.pose_valid:
++            self.stop('peer localization/navigation invalid');return False
++        self.peer_received=now
++        return True
++
+     def _plan(self):
++        if self.private and self.command.kind != 'EXIT':
++            self.effects.append(Effect('LOCAL_EXECUTE'))
++            return
++        if self.private:
++            self.selected_goal=Pose2D(*self.exit_point)
++            self.effects.append(Effect('PLAN',self.selected_goal))
++            return
+         if self.command.kind.startswith('APPROACH'):
+             self.effects.append(Effect('APPROACH', (self.frame.to_local(self.command.object_position), list(self.excluded))))
+         else:
+@@ -61,10 +87,19 @@
+             if self.context.task_id:
+                 self.retired_tasks.add(self.context.task_id)
+             self.context = candidate
++            self.task_started_at=now
++            self.peer_received=None
+             self._state.task_id = command.task_id
+             self._state.ready = self._state.deposited = self._state.exited = False
++            self._state.sequence=0
++            self._state.command_id=self._state.goal_id=''
++            self._state.requested_resource=self._state.requested_command_id=''
++            self._state.run_state,self._state.reason='IDLE',''
+             self._state.reply = ''
+             self.command = None
++            self.local_observations.clear()
++            self.effects.clear()
++            self.selected_goal=self.transit_goal=None
+             self.last_sequence = 0
+             self.paused = False
+         reply = validate_command(command, self.context)
+@@ -80,18 +115,25 @@
+             self.stop('coordinator pause/cancel')
+             return reply
+         if command.action == 'GRANT_RESOURCE':
+-            if command.kind == 'RELEASE' and command.token == self._state.token and command.parent_command_id == self._state.permit_command_id:
++            if command.kind == 'RELEASE':
++                if not command.token or (command.resource_id,command.token,command.parent_command_id)!=(
++                        self._state.resource_id,self._state.token,self._state.permit_command_id):
++                    return CommandReply(False,'release permit identity mismatch')
+                 self._state.token = self._state.resource_id = self._state.permit_command_id = self._state.resource_status = ''
+                 return reply
++            if self._state.token and (command.resource_id,command.token,command.parent_command_id)!=(
++                    self._state.resource_id,self._state.token,self._state.permit_command_id):
++                return CommandReply(False,'cannot replace held permit')
+             owner = self.command.parent_command_id if self.command and self.command.kind == 'EXIT' else (self.command.command_id if self.command else '')
+             if not command.token or command.parent_command_id != owner or command.resource_id != self._state.requested_resource:
+                 # Repeated grants for an already-held token are harmless.
+-                return CommandReply(command.token == self._state.token and command.parent_command_id == self._state.permit_command_id, 'permit mismatch')
++                return CommandReply(bool(command.token) and (command.resource_id,command.token,command.parent_command_id)==(
++                    self._state.resource_id,self._state.token,self._state.permit_command_id), 'permit mismatch')
+             self._state.resource_id, self._state.token = command.resource_id, command.token
+             self._state.permit_command_id = owner
+             self._state.resource_status = 'RESERVED'
+             self._state.requested_resource = ''
+-            if self.selected_goal:
++            if self.selected_goal and not (self.private and self.command.kind!='EXIT'):
+                 self.effects.append(Effect('PLAN', self.selected_goal))
+             return reply
+         if command.sequence <= self.last_sequence:
+@@ -100,6 +142,14 @@
+             return CommandReply(False, 'phase must be synchronized before execution')
+         if command.kind == 'APPROACH_PICKUP' and (self.phase != 'SEARCH_AB' or self._state.ready):
+             return CommandReply(False, 'pickup phase/READY mismatch')
++        if self.private and command.kind=='SEARCH_VIEWPOINT' and (self.phase!='SEARCH_C' or not self._state.ready):
++            return CommandReply(False,'C search requires READY and search C phase')
++        if self.private and command.kind=='APPROACH_DEPOSIT':
++            observation=self.local_observations.get(command.observation_id)
++            if not observation or observation.target_id!='C' or not observation.navigable:
++                return CommandReply(False,'local C observation missing/invalid')
++        if self.private and command.kind=='EXIT' and not self.exit_point:
++            return CommandReply(False,'local exit point missing')
+         if command.kind in ('APPROACH_DEPOSIT','EXIT') and (self.phase != 'DEPOSIT' or not self._state.ready):
+             return CommandReply(False, 'deposit requires READY and deposit phase')
+         if self.paused or self._state.run_state == 'STOPPING':
+@@ -202,6 +252,11 @@
+ 
+     def on_observation(self, observation, now):
+         if not self.paused and self.command and observation.scan_id == self.command.command_id:
++            if self.private:
++                if observation.navigable and observation.observation_id:
++                    self.local_observations[observation.observation_id]=observation
++                observation=replace(observation,status='CACHED' if observation.target_id=='C' and observation.navigable
++                    else observation.status,common_position=Pose2D(),position_valid=False)
+             self.effects.append(Effect('OBSERVATION', replace(observation,
+                 task_id=self.context.task_id, robot_id=self.context.robot_id,
+                 local_map_id=self.context.local_map_id, map_version=self.context.map_version,
+@@ -236,13 +291,16 @@
+ 
+     def tick(self, now, health):
+         self.health = health
+-        self._state.pose_valid = self._state.localization_valid = health.localization_valid and health.pose.valid
++        self._state.localization_valid = health.localization_valid and health.pose.valid
++        self._state.pose_valid = self._state.localization_valid and not self.private
+         self._state.nav_ready, self._state.stopped = health.nav_ready, health.stopped
+         if self._state.pose_valid:
+             self._state.common_pose = self.frame.to_common(health.pose)
++        else:self._state.common_pose=Pose2D()
+         if self.context.task_id and not self.paused and (
+             self.sync_received is None or now-self.sync_received > self.lost_timeout or
+-            self.peer_received is None or now-self.peer_received > self.lost_timeout or
++            (self.peer_received is None and now-self.task_started_at>self.lost_timeout) or
++            (self.peer_received is not None and now-self.peer_received > self.lost_timeout) or
+             not health.localization_valid or not health.nav_ready):
+             self.stop('SYNC/peer/localization/navigation health lost')
+         if self._state.run_state == 'STOPPING':
+@@ -258,7 +316,7 @@
+             elif self._state.run_state == 'SCAN_STOP':
+                 self._state.run_state = 'SCANNING'
+                 self.effects.append(Effect('SCAN', self.command.command_id))
+-            elif self._state.run_state == 'TRANSIT_STOP' and not self._state.token:
++            elif self._state.run_state == 'TRANSIT_STOP' and not self._state.token and not self.private:
+                 self.transit_goal = None
+                 self._plan()
+             elif self._state.run_state == 'EXIT_STOP' and not self._state.token:
+@@ -277,7 +335,7 @@
+             intersects=footprint_intersects(health.pose,health.footprint,polygon)
+             if intersects:
+                 self._state.resource_status='ENTERED'
+-            elif self._state.resource_status=='ENTERED' and health.stopped and self._state.run_state in ('EXIT_STOP','TRANSIT_STOP'):
++            elif self._state.resource_status=='ENTERED' and health.stopped and health.motion_terminal and self._state.run_state in ('EXIT_STOP','TRANSIT_STOP'):
+                 self._state.resource_status='EXIT_CONFIRMED'
+         if self._state.run_state=='NAVIGATING':
+             if health.path_valid and health.path:
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/agent_node.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/agent_node.py
+@@ -1,8 +1,8 @@
+ import time
++from pathlib import Path
+ import rclpy
+ from rclpy.node import Node
+ from rclpy.executors import SingleThreadedExecutor
+-from rclpy.parameter import Parameter
+ from multi_agent_task_msgs.msg import AgentState,Observation,Command
+ from .node_common import settings,qos
+ from .mock import make_machine
+@@ -18,6 +18,7 @@
+         robot=self.get_parameter('robot_id').value
+         if robot not in ('go2','ranger'):raise ValueError('unknown robot')
+         config,simulation,prefix,gates=settings(self)
++        self.gates=gates
+         self.observer=None
+         self.blocked=bool(gates)
+         self.machine=self.adapter=self.runner=None
+@@ -31,17 +32,22 @@
+             self.adapter.pose=frame.to_local(Pose2D(-3,-3) if robot=='go2' else Pose2D(3,-3))
+             self.machine=machine
+         elif not gates:
+-            if robot!='go2':raise ValueError('Ranger live adapter must be installed on Ranger PC')
+-            from .adapters.go2 import Go2Adapter,make_observer
++            from .adapters.factory import create_runtime
+             machine,frame=make_machine(config,robot,False)
+-            self.observer=make_observer(config['robot_go2'])
+-            self.adapter=Go2Adapter(self.observer,config['robot_go2'],frame)
++            self.observer,self.adapter=create_runtime(robot,config,global_goal_checks=True)
++            self.adapter.client=self.adapter.create_vision_client(dict(config['robot_'+robot],vision_mode='abc'))
+             self.machine=machine
+         else:
+             self.get_logger().warning('Live adapter not activated: '+'; '.join(gates))
+         if self.machine:
+-            self.runner=AgentRunner(self.machine,self.adapter,config['scene']['targets'],self.publish_observation)
++            self.runner=AgentRunner(self.machine,self.adapter,config['scene']['targets'],self.publish_observation,
++                config=config,success_radius=1.,owners=self.other_owners)
+         self.robot,self.config,self.simulation=robot,config,simulation
++        self.map_probe=None;self.map_ready=False;self.map_verified_at=0.;self.next_map_probe=0.
++        if not simulation and self.adapter:
++            from rcl_interfaces.srv import GetParameters
++            self.map_client=self.create_client(GetParameters,'/map_server/get_parameters')
++            self.adapter.task_map_ready=False
+         self.get_logger().info(f'Task prefix: {prefix}; robot={robot}; simulation={simulation}')
+         self.create_subscription(Command,f'{prefix}/go2/command',self.command,qos())
+         peer='ranger' if robot=='go2' else 'go2'
+@@ -51,6 +57,26 @@
+         self.create_timer(.05,self.tick)
+         self.create_timer(1/config['scene'].get('heartbeat_hz',2.0),self.publish_state)
+ 
++    def other_owners(self):
++        from .runner import other_motion_owners
++        return other_motion_owners(self.get_node_names(),self.robot)
++
++    def poll_map(self,now):
++        if self.simulation or not self.adapter:return
++        if self.map_probe is None and now>=self.next_map_probe:
++            from rcl_interfaces.srv import GetParameters
++            from .go2_check import MapParameterRead
++            self.map_probe=MapParameterRead(self.map_client,GetParameters.Request(names=['yaml_filename']))
++        if self.map_probe is not None:
++            self.map_probe.poll(now)
++            if self.map_probe.path:
++                from .config import map_file_gates
++                expected=Path(self.config['robot_'+self.robot]['map_path']).expanduser().resolve()
++                self.map_ready=(Path(self.map_probe.path).resolve()==expected and not map_file_gates(self.config,self.robot))
++                self.map_verified_at=now
++                self.map_probe=None;self.next_map_probe=now+1.
++        self.adapter.task_map_ready=self.map_ready and now-self.map_verified_at<=3.
++
+     def command(self,message):
+         if not self.machine:return
+         reply=self.machine.accept(from_ros(message),time.monotonic())
+@@ -59,13 +85,8 @@
+         self.publish_state()
+ 
+     def peer(self,message,source):
+-        if not self.machine or message.robot_id!=source or message.simulation!=self.simulation:return
+-        entry=self.config['alignment']['robots'][source]
+-        if message.schema_version!=1 or (message.local_map_id,message.map_version,message.common_frame_id,message.alignment_id)!=(
+-            entry['local_map_id'],entry['map_version'],'lab_ref',self.config['alignment']['alignment_id']):return
+-        if message.task_id!=self.machine.context.task_id:return
+-        if message.localization_valid and message.pose_valid:self.machine.peer_received=time.monotonic()
+-        else:self.machine.stop('peer localization invalid')
++        if self.machine and message.robot_id==source:
++            self.machine.receive_peer(from_ros(message),self.config['alignment']['robots'][source],time.monotonic())
+ 
+     def peer_observation(self,message,source):
+         if message.robot_id==source and self.machine and message.task_id==self.machine.context.task_id and message.simulation==self.simulation:
+@@ -81,14 +102,17 @@
+         else:
+             from .models import AgentState as State
+             entry=self.config['alignment']['robots'][self.robot]
++            private=self.config['scene'].get('share_c_coordinates',True) is False
+             state=State(robot_id=self.robot,local_map_id=entry['local_map_id'],map_version=entry['map_version'],
+-                alignment_id=self.config['alignment']['alignment_id'],simulation=False,run_state='PAUSED',
+-                reason='live configuration gates closed')
++                common_frame_id='' if private else self.config['alignment']['common_frame_id'],
++                alignment_id='' if private else self.config['alignment']['alignment_id'],simulation=False,run_state='PAUSED',
++                reason='; '.join(self.gates))
+         state.stamp=self.get_clock().now().nanoseconds*1e-9
+         self.state_pub.publish(to_ros(state))
+ 
+     def tick(self):
+         if self.runner:
++            self.poll_map(time.monotonic())
+             before=self.machine.state()
+             self.runner.tick(time.monotonic())
+             if before!=self.machine.state():self.publish_state()
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/config.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/config.py
+@@ -55,7 +55,7 @@
+     alignment=config['alignment'];go2=config['robot_'+robot_id]
+     if alignment.get('simulation') or config['scene'].get('simulation'):
+         errors.append('synthetic configuration cannot run live')
+-    if robot_id=='go2' and (alignment.get('common_frame_id')!='lab_ref' or alignment['robots']['go2'].get('transform')!=[0.,0.,0.]):
++    if robot_id=='go2' and config['scene'].get('share_c_coordinates',True) is not False and (alignment.get('common_frame_id')!='lab_ref' or alignment['robots']['go2'].get('transform')!=[0.,0.,0.]):
+         errors.append('lab_ref must equal Go2 map numerically')
+     entry=alignment['robots'][robot_id]
+     if not entry.get('local_map_id') or not entry.get('map_version'):
+@@ -90,6 +90,8 @@
+     return robot_local_gates(config,'go2',motion,vision,check_map_files)
+ 
+ def live_gates(config,local_robot='go2'):
++    if config['scene'].get('share_c_coordinates',True) is False:
++        return private_live_gates(config,local_robot)
+     errors = go2_local_gates(config,motion=True,vision=True,check_map_files=local_robot=='go2')
+     alignment, scene = config['alignment'], config['scene']
+     if not isinstance(scene.get('resources'),dict) or 'basket' not in scene['resources']:
+@@ -139,3 +141,35 @@
+     if not go2.get('path_topic'):
+         errors.append('executing Nav2 path source missing')
+     return errors
++
++
++def private_live_gates(config,robot_id):
++    from .go2_exploration import exploration_gates
++    errors=exploration_gates(config,robot_id)
++    errors+=robot_local_gates(config,robot_id,motion=True,vision=True)
++    scene=config['scene'];robot=config['robot_'+robot_id]
++    if scene.get('enabled') is not True:errors.append('scene disabled: field coordinates missing')
++    for peer in ('go2','ranger'):
++        entry=config['alignment']['robots'][peer]
++        if not entry.get('local_map_id') or not entry.get('map_version'):errors.append(peer+': map identity/version missing')
++    if robot.get('local_map_id') and robot['local_map_id']!=config['alignment']['robots'][robot_id]['local_map_id']:
++        errors.append(robot_id+': local map identity mismatch')
++    if robot.get('map_version') and robot['map_version']!=config['alignment']['robots'][robot_id]['map_version']:
++        errors.append(robot_id+': local map version mismatch')
++    for flag in ('path_source_verified','peer_obstacle_verified'):
++        if robot.get(flag) is not True:errors.append(robot_id+' '+flag+' field verification required')
++    if not robot.get('goal_costmap_topic'):errors.append(robot_id+': global costmap topic missing')
++    if robot.get('exploration_strategy')!='generated_candidates_vlm':
++        errors.append(robot_id+': cooperative generated_candidates_vlm strategy required')
++    if not isinstance(scene.get('resources'),dict) or 'basket' not in scene['resources']:
++        errors.append('basket resource polygon missing')
++    if not valid_numbers(scene.get('exit_points',{}).get(robot_id),3):errors.append(robot_id+': local exit_points missing/invalid')
++    resources=scene.get('resources')
++    for name,region in (resources.items() if isinstance(resources,dict) else []):
++        if not isinstance(region,dict):continue
++        if name!='basket':
++            exits=region.get('transit_exits',{}).get(robot_id,[])
++            if not exits or not all(valid_numbers(p,3) for p in exits):errors.append(name+': local transit exits missing/invalid')
++    if any(not isinstance(scene.get('targets',{}).get(t),str) or not scene['targets'][t].strip() or
++            '现场填写' in scene['targets'][t] for t in ('A','B','C')):errors.append('measured A/B/C target descriptions missing')
++    return list(dict.fromkeys(errors))
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/coordinator.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/coordinator.py
+@@ -19,15 +19,18 @@
+         self.c_observation = ''
+         self.lost_timeout = scene.get('lost_timeout', 3.0)
+         self.task_timeout = scene.get('task_timeout', 600.0)
++        self.private = scene.get('share_c_coordinates',True) is False
+ 
+     def _identity(self, data):
+         return data.robot_id in ROBOTS and data.schema_version == SCHEMA_VERSION and (
+             data.local_map_id, data.map_version) == self.map_ids[data.robot_id] and (
+-            data.common_frame_id, data.alignment_id) == ('lab_ref', self.alignment_id)
++            data.common_frame_id, data.alignment_id) == (('','') if self.private else ('lab_ref', self.alignment_id))
+ 
+     def ingest_state(self, state, received_at):
+         if not self._identity(state):
+-            return
++            if self.task_id and state.robot_id in ROBOTS:self.pause('peer map/mode identity changed')
++            return
++        if self.private and (state.pose_valid or state.common_pose!=Pose2D()):return
+         if state.simulation != self.simulation:
+             if self.task_id:
+                 self.pause('simulation/live state mismatch')
+@@ -44,8 +47,11 @@
+     def ingest_observation(self, observation, received_at):
+         if not self._identity(observation) or observation.simulation != self.simulation or observation.task_id != self.task_id:
+             return
+-        if observation.target_id not in TARGETS or observation.status not in ('DETECTED','NOT_DETECTED','UNCERTAIN','API_ERROR'):
+-            return
++        if observation.target_id not in TARGETS or observation.status not in ('DETECTED','NOT_DETECTED','UNCERTAIN','API_ERROR','CACHED'):
++            return
++        if self.private and (observation.position_valid or observation.common_position!=Pose2D() or
++                observation.status=='CACHED' and observation.target_id!='C'):return
++        if not self.private and observation.status=='CACHED':return
+         if observation.observation_id and observation.observation_id not in self.observations:
+             self.observations[observation.observation_id] = observation
+ 
+@@ -59,7 +65,7 @@
+         for robot in ROBOTS:
+             state = self.states.get(robot)
+             if not state or now-self.received_at[robot] > self.lost_timeout or not (
+-                state.pose_valid and state.localization_valid and state.nav_ready and state.stopped) or state.token:
++                (self.private or state.pose_valid) and state.localization_valid and state.nav_ready and state.stopped) or state.token:
+                 return StartReply(False, reason=f'{robot}: fresh healthy stopped state required')
+         self.task_id = uuid.uuid4().hex
+         self.phase, self.started, self.reason = 'SEARCH_AB', now, ''
+@@ -71,8 +77,10 @@
+         return StartReply(True, self.task_id)
+ 
+     def control(self, robot, action, **kwargs):
++        if self.private and action=='SYNC':kwargs['kind']='SYNC_LOCAL_C'
+         return Command(task_id=self.task_id, recipient_id=robot, action=action, phase=self.phase,
+-                       alignment_id=self.alignment_id, simulation=self.simulation, **kwargs)
++                       common_frame_id='' if self.private else 'lab_ref',
++                       alignment_id='' if self.private else self.alignment_id, simulation=self.simulation, **kwargs)
+ 
+     def pause(self, reason):
+         self.phase, self.reason = 'PAUSED', reason
+@@ -91,6 +99,8 @@
+                 continue
+             self.acked[robot] = command.sequence
+             self.resources.cancel_queued(robot,command.command_id)
++            if self.private and state.reply!='SUCCEEDED':
++                self.pause(f'{robot}: local execution {state.reply.lower()}')
+             if command.kind == 'SEARCH_VIEWPOINT':
+                 self.planner.visited.add((robot, command.phase, command.viewpoint_id))
+                 self.reservations.pop(command.viewpoint_id, None)
+@@ -107,7 +117,7 @@
+             for robot in ROBOTS:
+                 state = self.states.get(robot)
+                 if not state or now-self.received_at[robot] > self.lost_timeout or not (
+-                    state.pose_valid and state.localization_valid and state.nav_ready) or state.run_state in ('STOPPING','PAUSED'):
++                    (self.private or state.pose_valid) and state.localization_valid and state.nav_ready) or state.run_state in ('STOPPING','PAUSED'):
+                     self.pause(f'{robot}: health/heartbeat lost')
+             if now-self.started > self.task_timeout:
+                 self.pause('task timeout')
+@@ -126,14 +136,16 @@
+         if self.phase == 'SEARCH_AB' and all(self.states[r].ready for r in ROBOTS) and not self.commands:
+             self.phase = 'SEARCH_C'
+         if self.phase == 'SEARCH_C':
+-            if 'basket' not in self.scene['resources'] or any(r not in self.scene['exit_points'] for r in ROBOTS):
++            if 'basket' not in self.scene['resources'] or not self.private and any(r not in self.scene['exit_points'] for r in ROBOTS):
+                 return output+self.pause('C region or exit geometry missing')
+             clue = next((o for o in self.observations.values() if o.target_id=='C' and o.navigable), None)
+-            if clue and not self.commands:
+-                self.c_observation = clue.observation_id
+-                self.scene['bound_c'] = clue.observation_id
++            cached=all(any(o.robot_id==r and o.target_id=='C' and o.status=='CACHED' for o in self.observations.values()) for r in ROBOTS)
++            if (cached if self.private else bool(clue)) and not self.commands:
++                if not self.private:
++                    self.c_observation = clue.observation_id
++                    self.scene['bound_c'] = clue.observation_id
+                 self.phase = 'DEPOSIT'
+-        if self.phase == 'DEPOSIT' and all(self.states[r].deposited and self.states[r].exited for r in ROBOTS):
++        if self.phase == 'DEPOSIT' and all(self.states[r].deposited and self.states[r].exited and not self.states[r].token for r in ROBOTS) and not self.resources.held:
+             self.phase = 'DONE'
+             return output
+         if self.resources:
+@@ -142,14 +154,15 @@
+             self.resources, self.commands, self.scene, now, self.received_at, self.rejected)
+         actions = self.planner.decide(snapshot)
+         for action in actions:
+-            if action.robot_id in self.commands or action.goal is None or not action.goal.valid:
++            if action.robot_id in self.commands or not self.private and (action.goal is None or not action.goal.valid):
+                 continue
+             robot = action.robot_id
+             self.sequence[robot] += 1
+             command = self.control(robot, 'EXECUTE', command_id=f'{self.task_id}/{robot}/{self.sequence[robot]}',
+                 sequence=self.sequence[robot], kind=action.kind, target_id=action.target_id,
+                 viewpoint_id=action.viewpoint_id, observation_id=action.observation_id,
+-                common_goal=action.goal, object_position=action.goal, position_valid=True,
++                common_goal=Pose2D() if self.private else action.goal,
++                object_position=Pose2D() if self.private else action.goal, position_valid=not self.private,
+                 resource_id=action.resource_id, token=action.token, parent_command_id=action.parent_command_id)
+             self.commands[robot] = command
+             if action.viewpoint_id:
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/frame_adapter.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/frame_adapter.py
+@@ -3,6 +3,13 @@
+ 
+ def wrap(yaw):
+     return math.atan2(math.sin(yaw), math.cos(yaw))
++
++def configured_frame(config, robot_id):
++    alignment=config['alignment'];entry=alignment['robots'][robot_id]
++    if config['scene'].get('share_c_coordinates',True) is False and config.get('coordinate_mode')!='local_only':
++        return FrameAdapter(entry['local_map_id'],entry['map_version'],'','',[0.,0.,0.])
++    return FrameAdapter(entry['local_map_id'],entry['map_version'],alignment['common_frame_id'],
++        alignment['alignment_id'],entry['transform'])
+ 
+ class FrameAdapter:
+     def __init__(self, local_map_id, map_version, common_frame_id, alignment_id, transform):
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/go2_exploration.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/go2_exploration.py
+@@ -64,6 +64,18 @@
+ 
+ def explore(adapter, spin, config, frame, deadline, target, record, owners,
+             stop, before_motion, clock=time.monotonic, *, robot_id='go2', target_id='A'):
++    steps=explore_steps(adapter,config,frame,deadline,target,record,owners,stop,before_motion,
++        clock,robot_id=robot_id,target_id=target_id)
++    while True:
++        try:next(steps)
++        except StopIteration as completed:return completed.value
++        spin()
++
++
++def explore_steps(adapter, config, frame, deadline, target, record, owners,
++            stop, before_motion, clock=time.monotonic, *, robot_id='go2', target_id='A',
++            success_radius=None, require_navigation_success=False, task_id=None, command_id=None,
++            on_observation=None, initial_observation=None, resource_permits=lambda: {}):
+     if robot_id not in ('go2','ranger') or target_id not in ('A','B','C'):
+         raise ValueError('unknown robot or target ID')
+     original_record=record
+@@ -71,7 +83,10 @@
+         original_record(dict(event,robot_id=robot_id,target_id=target_id,
+             common_frame_id=frame.ids[2],local_map_id=frame.ids[0],map_version=frame.ids[1]))
+     guard = RegionGuard(config['scene']['resources'], config['robot_'+robot_id]['stop_margin'])
+-    task_id = robot_id+'_explore/' + uuid.uuid4().hex
++    task_id = task_id or robot_id+'_explore/' + uuid.uuid4().hex
++    main_command_id = command_id
++    cooperative = require_navigation_success
++    yield None
+     current = {}
+     strategy = config['robot_'+robot_id].get('exploration_strategy', 'fixed_viewpoints')
+     generated = strategy == 'generated_candidates_vlm'
+@@ -104,6 +119,8 @@
+ 
+     def health_check(path=None, navigating=False, began=0., acquired=False):
+         health = adapter.get_health()
++        if cooperative and semantic and not catalog_unchanged():
++            raise ExplorationStopped('local map/candidate assets changed during task')
+         if clock() >= deadline:
+             raise ExplorationStopped('exploration deadline reached')
+         other=owners();local_costmap_ok=adapter.costmap_transform() is not None
+@@ -124,17 +141,55 @@
+         else:
+             checked = replace(health, path_valid=True)
+             checked_path = path if path is not None else [health.pose]
+-        decision = guard.check(health.pose, health.footprint, checked_path, {}, checked)
++        decision = guard.check(health.pose, health.footprint, checked_path, resource_permits(), checked)
+         if decision.action != 'ALLOW':
+             raise ExplorationStopped(decision.reason or 'protected resource requires coordinator permit')
+         return health, acquired
+ 
+     def stopped():
+-        if not stop():
++        result = stop() if stop else adapter.stop_motion('exploration stop')
++        expires=min(deadline,clock()+config['robot_'+robot_id].get('cancel_timeout',5.))
++        while hasattr(result,'done') and not result.done():
++            health_check()
++            if clock()>=expires:raise ExplorationStopped('native action stop timeout')
++            yield None
++        if hasattr(result,'result'):result=result.result()
++        if result is False:
+             raise ExplorationStopped('native action terminal and physical stop unconfirmed')
+-        health, _ = health_check()
+-        if not health.stopped or not health.motion_terminal:
+-            raise ExplorationStopped('stop prerequisites changed')
++        while True:
++            health,_=health_check()
++            if health.stopped and health.motion_terminal:return
++            if not cooperative or clock()>=expires:
++                raise ExplorationStopped('stop prerequisites changed')
++            yield None
++
++    def path_decision(path,health):
++        return guard.check(health.pose,health.footprint,path,resource_permits(),replace(health,path_valid=True))
++
++    def path_possible(path,health):
++        decision=path_decision(path,health)
++        return decision.action=='ALLOW' or (cooperative and decision.action=='REQUEST' and
++            (decision.resource_id!='basket' or initial_observation is not None))
++
++    def permit_path(path,goal):
++        while cooperative:
++            health,_=health_check()
++            decision=path_decision(path,health)
++            if initial_observation is not None and 'basket' not in resource_permits() and decision.action=='ALLOW':
++                yield dict(resource_id='basket',path=path,goal=goal)
++                continue
++            if decision.action=='ALLOW':return
++            if decision.action!='REQUEST' or decision.resource_id=='basket' and initial_observation is None:
++                raise ExplorationStopped(decision.reason or 'unpermitted path')
++            yield dict(resource_id=decision.resource_id,path=path,goal=goal)
++            future=adapter.compute_path(goal)
++            while not future.done():
++                health_check()
++                yield None
++            result=future.result()
++            if not result.reachable or not result.path:raise ExplorationStopped('path after permit unavailable')
++            if path_accept is not None and not path_accept(result):raise ExplorationStopped('path endpoint budget changed after permit')
++            path=result.path
+ 
+     def parking_free(goal, observation=True):
+         free=adapter.costmap_candidate_free(goal,global_goal=True)
+@@ -145,27 +200,27 @@
+ 
+     def navigate(goal, command_id, kind, target=None, radius=None):
+         before_motion()
+-        goal_id = adapter.start_navigation(goal, task_id, command_id, kind)
+-        emit('NAVIGATING', task_id=task_id, command_id=command_id, goal_id=goal_id, goal_kind=kind)
++        goal_id = adapter.start_navigation(goal, task_id, main_command_id or command_id, kind)
++        emit('NAVIGATING', task_id=task_id, command_id=main_command_id or command_id, goal_id=goal_id, goal_kind=kind)
+         began = clock(); acquired = False; terminal = None
+         while terminal is None:
+             health, acquired = health_check(navigating=True, began=began, acquired=acquired)
+-            if target is not None and target_distance((health.pose.x,health.pose.y), (target.x,target.y)) <= radius:
++            if not cooperative and target is not None and target_distance((health.pose.x,health.pose.y), (target.x,target.y)) <= radius:
+                 emit('APPROACH_DISTANCE_STOP', cancel_radius=radius)
+-                stopped()
++                (yield from stopped())
+                 return 'DISTANCE_STOPPED'
+-            spin()
++            yield None
+             while adapter.results:
+                 reply = adapter.results.popleft()
+-                if (reply.task_id, reply.command_id, reply.goal_id, reply.goal_kind) == (task_id, command_id, goal_id, kind):
++                if (reply.task_id, reply.command_id, reply.goal_id, reply.goal_kind) == (task_id, main_command_id or command_id, goal_id, kind):
+                     terminal = reply.status
+-        stopped()
++        (yield from stopped())
+         return terminal
+ 
+     def approach_attempt(observation, distance, radius):
+         epoch = getattr(adapter, 'selection_epoch', 0)
+         object_pose = frame.to_local(observation.common_position)
+-        direct = robot_id=='ranger'
++        direct = robot_id=='ranger' and not cooperative
+         method = 'target_reference' if direct else 'standoff'
+         emit('APPROACH_PLANNING', object_pose=asdict(object_pose), observation_id=observation.observation_id,
+              approach_method=method)
+@@ -174,13 +229,14 @@
+             health, _ = health_check()
+             goal = Pose2D(object_pose.x,object_pose.y,health.pose.yaw)
+         else:
+-            future = adapter.select_approach(object_pose, [], standoff_distance=distance)
++            future = adapter.select_approach(object_pose, [], standoff_distance=distance,
++                **({'path_accept':path_accept} if cooperative else {}))
+             while not future.done():
+                 health_check()
+                 if clock() >= expires:
+                     future.cancel()
+                     raise ExplorationStopped('target approach planning timeout')
+-                spin()
++                yield None
+             if clock() >= expires:
+                 raise ExplorationStopped('late target approach plan')
+             goal = future.result().goal
+@@ -193,7 +249,7 @@
+             if clock() >= expires:
+                 future.cancel()
+                 raise ExplorationStopped('target approach path timeout')
+-            spin()
++            yield None
+         result = future.result()
+         health, _ = health_check()
+         if (clock() >= expires or epoch != getattr(adapter, 'selection_epoch', 0)
+@@ -206,39 +262,65 @@
+                  if direct else 'standoff footprint/path rejected')
+             return 'APPROACH_UNREACHABLE'
+         # A target reference can lie on an object; Nav2 validates its tolerated path.
+-        if (not direct and (not parking_free(goal, observation=False) or not adapter.costmap_candidate_free(goal))
+-                or guard.check(health.pose, health.footprint, result.path, {},
+-                               replace(health, path_valid=True)).action != 'ALLOW'):
++        if (not direct and (not parking_free(goal, observation=False) or
++                not (adapter.approach_candidate_free(goal) if cooperative else adapter.costmap_candidate_free(goal)))
++                or not path_possible(result.path,health) or cooperative and not path_accept(result)):
+             emit('APPROACH_UNREACHABLE', reason='target reference path rejected' if direct else 'standoff footprint/path rejected')
+             return 'APPROACH_UNREACHABLE'
++        yield from permit_path(result.path,goal)
+         current['pose'] = [goal.x, goal.y, goal.yaw]
+         emit('APPROACH_SELECTED', approach_method=method,
+              **({'requested_goal':asdict(goal)} if direct else {'standoff_distance':distance}))
+-        return navigate(goal, uuid.uuid4().hex, 'PICKUP_NAV', object_pose, radius)
++        return (yield from navigate(goal, uuid.uuid4().hex, 'DEPOSIT_NAV' if target_id=='C' else 'PICKUP_NAV', object_pose, radius))
+ 
+     def approach_target(observation):
+-        contract = load_contract(config['robot_'+robot_id].get('arrival_config_files'))
+-        success = contract['target_success_radius']
++        contract = (dict(target_success_radius=success_radius,approach_cancel_radius=success_radius,arrival_retry_limit=1)
++            if cooperative else load_contract(config['robot_'+robot_id].get('arrival_config_files')))
++        success = contract['target_success_radius'] if success_radius is None else success_radius
+         retries = contract['arrival_retry_limit']
+         object_pose = frame.to_local(observation.common_position)
+-        distance = None if robot_id=='ranger' else min(config['robot_'+robot_id]['standoff_distance'], success)
++        nonlocal path_accept
++        distance = None if robot_id=='ranger' and not cooperative else min(config['robot_'+robot_id]['standoff_distance'], success)
++        if cooperative:
++            future=adapter.read_approach_parameters()
++            expires=min(deadline,clock()+15.)
++            while not future.done():
++                health_check()
++                if clock()>=expires:
++                    future.cancel()
++                    raise ExplorationStopped('approach parameter read timeout')
++                yield None
++            parameters=future.result()
++            values=[parameters.get('xy_goal_tolerance'),parameters.get('planner_tolerance')]
++            if not valid_numbers(values,2) or any(v<0 for v in values):
++                raise ExplorationStopped('invalid actual Nav2 approach parameters')
++            safety=config['robot_'+robot_id].get('approach_safety_margin',.02)
++            if not valid_numbers([safety],1) or safety<0:raise ExplorationStopped('invalid approach safety margin')
++            budget=success-values[0]-safety
++            if budget<=0:raise ExplorationStopped('no approach distance budget')
++            distance=min(distance,budget)
++            def path_accept(result):
++                return (result.reachable and bool(result.path) and all(p.valid for p in result.path) and
++                    target_distance((result.path[-1].x,result.path[-1].y),(object_pose.x,object_pose.y))+values[0]+safety<=success and
++                    adapter.approach_candidate_free(result.path[-1]))
++            emit('APPROACH_BUDGET',success_radius=success,safety_margin=safety,**parameters)
+         emit('ARRIVAL_CONTRACT', **contract)
+         for retry in range(retries+1):
+             health, _ = health_check()
+             if not health.stopped or not health.motion_terminal:
+                 raise ExplorationStopped('arrival verification requires confirmed stop')
+             measured = target_distance((health.pose.x,health.pose.y), (object_pose.x,object_pose.y))
+-            if measured <= success:
++            if measured <= success and not cooperative:
+                 emit('TARGET_APPROACHED', measured_distance=measured, success_radius=success,
+                      arrival_retry=retry, stop_confirmed=True)
+                 return 'TARGET_APPROACHED'
+             radius = stop_radius(success, contract['approach_cancel_radius'], retry)
+-            if robot_id=='ranger' and measured <= radius:
++            if robot_id=='ranger' and not cooperative and measured <= radius:
+                 emit('APPROACH_DISTANCE_STOP', cancel_radius=radius, measured_distance=measured)
+-                stopped()
++                (yield from stopped())
+                 terminal = 'DISTANCE_STOPPED'
+             else:
+-                terminal = approach_attempt(observation, distance, radius)
++                terminal = yield from approach_attempt(observation, distance, radius)
+             if terminal not in ('SUCCEEDED', 'DISTANCE_STOPPED'):
+                 emit('APPROACH_FAILED', navigation_status=terminal)
+                 return 'APPROACH_FAILED'
+@@ -252,7 +334,7 @@
+                 return 'TARGET_APPROACHED'
+             if decision == 'FAILED':
+                 break
+-            if robot_id!='ranger':
++            if robot_id!='ranger' or cooperative:
+                 # Compensate measured terminal overshoot for the standoff planner.
+                 distance -= measured-success
+                 if not math.isfinite(distance) or distance <= 0:
+@@ -286,12 +368,11 @@
+                 if clock() >= plan_deadline:
+                     future.cancel()
+                     raise ExplorationStopped('candidate planning timeout')
+-                spin()
++                yield None
+             result = future.result()
+             health, _ = health_check()
+             if (not result.reachable or not result.path or generated and not parking_free(goal) or
+-                    guard.check(health.pose, health.footprint, result.path, {},
+-                                replace(health, path_valid=True)).action != 'ALLOW'):
++                    not path_possible(result.path,health)):
+                 state.update(candidate['id'], 'navigation_failed', clock(), reason='no permitted path')
+                 continue
+             length = sum(math.hypot(a.x-b.x, a.y-b.y) for a,b in zip(result.path, result.path[1:]))
+@@ -331,7 +412,7 @@
+                 health_check()
+                 if clock() >= expires:
+                     raise ExplorationStopped('furniture selection timeout')
+-                spin()
++                yield None
+             if clock() >= expires:
+                 raise ExplorationStopped('late furniture selection discarded')
+             point = future.result()
+@@ -355,8 +436,12 @@
+                     reason=point['selection_reason'], task_id=state.task_id))
+         return point
+ 
++    path_accept=None
++    if initial_observation is not None:
++        return (yield from approach_target(initial_observation))
++
+     while True:
+-        point = next_point()
++        point = yield from next_point()
+         if point is None:
+             break
+         goal = Pose2D(*point['pose']) if semantic else frame.to_local(Pose2D(*point['pose']))
+@@ -379,7 +464,7 @@
+             if clock() >= plan_deadline:
+                 future.cancel()
+                 raise ExplorationStopped('path planning timeout; reachability unknown')
+-            spin()
++            yield None
+         result = future.result()
+         current['plan_reachable'] = result.reachable
+         emit('PLANNED' if result.reachable else 'PLAN_FAILED', reason=result.reason)
+@@ -389,8 +474,8 @@
+         if not result.path:
+             raise ExplorationStopped('planner returned empty path')
+         health, _ = health_check()
+-        decision = guard.check(health.pose, health.footprint, result.path, {}, replace(health, path_valid=True))
+-        if decision.action != 'ALLOW':
++        decision = path_decision(result.path,health)
++        if not path_possible(result.path,health):
+             emit('RESOURCE_BLOCKED', reason=decision.reason or 'no protected resource permit')
+             if semantic:update('navigation_failed')
+             continue
+@@ -406,7 +491,8 @@
+                          or point['id'] not in state.eligible(clock())):
+             raise ExplorationStopped('selection invalidated before navigation')
+         if semantic:update('executing')
+-        terminal = navigate(goal, command_id, 'VIEWPOINT_NAV')
++        yield from permit_path(result.path,goal)
++        terminal = yield from navigate(goal, command_id, 'VIEWPOINT_NAV')
+         emit('ARRIVED' if terminal == 'SUCCEEDED' else 'NAV_FAILED', navigation_status=terminal, stop_confirmed=True)
+         if terminal != 'SUCCEEDED':
+             if semantic:update('navigation_failed')
+@@ -419,22 +505,24 @@
+         before_motion()
+         emit('SCANNING')
+         adapter.scan_viewpoint_id=point['id']
+-        descriptions=dict(config['scene']['targets'],**{target_id:target}) if generated else {target_id:target}
+-        future = adapter.start_scan(descriptions, command_id, **({'stop_on_target':target_id} if robot_id=='ranger' else {}))
++        descriptions=dict(config['scene']['targets'],**{target_id:target}) if generated or cooperative else {target_id:target}
++        future = adapter.start_scan(descriptions, command_id, **({'stop_on_target':target_id} if robot_id=='ranger' or cooperative else {}))
+         while not future.done():
+             health_check()
+-            spin()
++            yield None
+         if future.cancelled():
+             raise ExplorationStopped('observation cancelled')
+         try:
+             scan_results = future.result()
++            if on_observation:
++                for observation in scan_results:on_observation(observation)
+             observations = [o for o in scan_results if o.target_id == target_id]
+         except Exception:
+             if not semantic:raise
+-            stopped()
++            (yield from stopped())
+             update('observation_failed', reason='scan failed')
+             continue
+-        stopped()
++        (yield from stopped())
+         incomplete_abc = generated and (len(scan_results)!=len(descriptions)*len(config['robot_'+robot_id]['scan_angles'])
+                 or {(o.target_id,o.view_index) for o in scan_results} !=
+                    {(t,i) for t in descriptions for i in range(len(config['robot_'+robot_id]['scan_angles']))}
+@@ -445,7 +533,7 @@
+             # A valid detection survives errors in other views/targets; the point stays unfinished.
+             observations=[o for o in observations if o.status=='DETECTED']
+         detections = [o for o in observations if o.status == 'DETECTED']
+-        early_detection = robot_id=='ranger' and bool(detections)
++        early_detection = (robot_id=='ranger' or cooperative) and bool(detections)
+         complete_scan = {o.view_index for o in observations} == set(range(len(config['robot_'+robot_id]['scan_angles']))) and all(
+             o.status in ('DETECTED','NOT_DETECTED','UNCERTAIN') for o in observations)
+         emit('SCAN_RESULT', observations=[asdict(o) for o in observations], stop_confirmed=True,
+@@ -470,7 +558,7 @@
+             outcome = 'TARGET_FOUND' if any(o.navigable for o in detections) else 'TARGET_DETECTED_UNLOCATED'
+             emit(outcome)
+             if outcome == 'TARGET_FOUND' and config['robot_'+robot_id].get('approach_on_detection', False):
+-                return approach_target(max((o for o in detections if o.navigable), key=lambda o:o.confidence))
++                return (yield from approach_target(max((o for o in detections if o.navigable), key=lambda o:o.confidence)))
+             return outcome
+         emit('NOT_DETECTED' if all(o.status == 'NOT_DETECTED' for o in observations) else 'UNCERTAIN')
+     if semantic and (any(row['status'] != 'observed' for row in state.records.values()) or generated and not points):
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/local_context.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/local_context.py
+@@ -6,6 +6,7 @@
+     if robot_id not in ('go2','ranger'):
+         raise ValueError('unknown robot_id: '+str(robot_id))
+     result=deepcopy(config)
++    result['coordinate_mode']='local_only'
+     if robot_id=='go2':
+         return result
+     robot=result['robot_'+robot_id]
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/mock.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/mock.py
+@@ -1,7 +1,7 @@
+ """Synthetic fixtures and deterministic dual-fake harness; never loads live interfaces."""
+ from dataclasses import replace
+ from .models import *
+-from .frame_adapter import FrameAdapter
++from .frame_adapter import configured_frame
+ from .agent import AgentMachine
+ from .coordinator import Coordinator
+ from .region_guard import RegionGuard
+@@ -23,8 +23,8 @@
+ 
+ def make_machine(config,robot,simulation):
+     alignment=config['alignment'];entry=alignment['robots'][robot]
+-    context=AgentContext(robot,'',entry['local_map_id'],entry['map_version'],alignment['common_frame_id'],alignment['alignment_id'],simulation)
+-    frame=FrameAdapter(entry['local_map_id'],entry['map_version'],alignment['common_frame_id'],alignment['alignment_id'],entry['transform'])
++    frame=configured_frame(config,robot)
++    context=AgentContext(robot,'',*frame.ids,simulation)
+     machine=AgentMachine(context,frame,config['scene'].get('lost_timeout',3.0),
+         config[f'robot_{robot}'].get('path_start_timeout',1.0))
+     regions={}
+@@ -34,6 +34,7 @@
+                                  for r,points in region.get('transit_exits',{}).items()}
+         regions[key]=value
+     machine.guard=RegionGuard(regions,config[f'robot_{robot}'].get('stop_margin'))
++    machine.exit_point=config['scene'].get('exit_points',{}).get(robot)
+     return machine,frame
+ 
+ def make_coordinator(config,simulation,gates=None):
+@@ -55,12 +56,14 @@
+             # Ranger detects A and shares its common physical location to Go2.
+             detections={'C':Pose2D(9,1)}
+             if robot=='ranger':detections.update(A=Pose2D(-3,-3),B=Pose2D(3,-3))
++            if not machine.context.common_frame_id:
++                detections.update({{'go2':'A','ranger':'B'}[robot]:Pose2D(-3,-3) if robot=='go2' else Pose2D(3,-3)})
+             adapter=FakeAdapter(robot,detections)
+             common_initial=Pose2D(-3,-3) if robot=='go2' else Pose2D(3,-3)
+             adapter.pose=frame.to_local(common_initial)
+             self.adapters[robot]=adapter
+             self.runners[robot]=AgentRunner(machine,adapter,self.config['scene']['targets'],
+-                lambda obs:self.coordinator.ingest_observation(obs,self.now))
++                lambda obs:self.coordinator.ingest_observation(obs,self.now),config=self.config,success_radius=1.)
+             machine.tick(0,adapter.get_health())
+             self.coordinator.ingest_state(machine.state(),0)
+ 
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/models.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/models.py
+@@ -216,12 +216,18 @@
+     for name in ('task_id', 'common_frame_id', 'alignment_id', 'simulation'):
+         if getattr(command, name) != getattr(context, name):
+             return CommandReply(False, f'{name} mismatch')
++    private = context.common_frame_id == context.alignment_id == ''
++    if command.action == 'SYNC' and (command.kind == 'SYNC_LOCAL_C') != private:
++        return CommandReply(False, 'coordinate mode mismatch')
+     if command.action not in ('EXECUTE', 'SYNC', 'PAUSE', 'CANCEL', 'GRANT_RESOURCE'):
+         return CommandReply(False, 'unknown action')
+     if command.action == 'EXECUTE':
+         if command.kind not in KINDS or command.phase not in PHASES:
+             return CommandReply(False, 'unknown kind/phase')
+-        if not command.position_valid:
++        if private and (command.position_valid or command.common_goal != Pose2D() or
++                command.object_position != Pose2D() or command.viewpoint_id):
++            return CommandReply(False, 'private command must contain intent only')
++        if not private and not command.position_valid:
+             return CommandReply(False, 'position invalid')
+         pose = command.object_position if command.kind.startswith('APPROACH') else command.common_goal
+         if not pose.valid:
+@@ -231,4 +237,8 @@
+             return CommandReply(False, 'wrong pickup target')
+         if command.kind == 'APPROACH_DEPOSIT' and command.target_id != 'C':
+             return CommandReply(False, 'wrong deposit target')
++        if private and command.kind == 'SEARCH_VIEWPOINT' and command.target_id != 'C':
++            return CommandReply(False, 'private search target must be C')
++        if private and command.kind == 'WAIT':
++            return CommandReply(False, 'private READY waits locally')
+     return CommandReply(True)
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/planner.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/planner.py
+@@ -6,6 +6,8 @@
+         self.waited = set()
+ 
+     def decide(self, snapshot):
++        if snapshot.scene.get('share_c_coordinates',True) is False:
++            return self.decide_local(snapshot)
+         actions = []
+         for robot in ROBOTS:
+             state = snapshot.states[robot]
+@@ -47,3 +49,24 @@
+                                              goal=Pose2D(*point['pose'])))
+                 break
+         return actions
++
++    def decide_local(self, snapshot):
++        actions=[]
++        for robot in ROBOTS:
++            state=snapshot.states[robot]
++            if robot in snapshot.commands or not state.stopped:continue
++            if snapshot.phase=='SEARCH_AB' and not state.ready:
++                actions.append(PlannedAction(robot,'APPROACH_PICKUP',target_id={'go2':'A','ranger':'B'}[robot]))
++            elif snapshot.phase=='SEARCH_C':
++                cached=any(o.robot_id==robot and o.target_id=='C' and o.status=='CACHED' for o in snapshot.observations.values())
++                if not cached:actions.append(PlannedAction(robot,'SEARCH_VIEWPOINT',target_id='C'))
++            elif snapshot.phase=='DEPOSIT' and not state.exited:
++                if robot=='ranger' and (not snapshot.states['go2'].exited or snapshot.states['go2'].token):continue
++                if state.deposited:
++                    actions.append(PlannedAction(robot,'EXIT',resource_id=state.resource_id,
++                        token=state.token,parent_command_id=state.permit_command_id))
++                else:
++                    clue=next(o for o in snapshot.observations.values() if o.robot_id==robot and o.target_id=='C' and o.status=='CACHED')
++                    actions.append(PlannedAction(robot,'APPROACH_DEPOSIT',target_id='C',
++                        observation_id=clue.observation_id,resource_id='basket'))
++        return actions
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/runner.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/runner.py
+@@ -1,16 +1,156 @@
+ """Execute machine effects without blocking ROS callbacks; late futures are fenced."""
+-from .models import Effect, Observation, TARGETS
++from dataclasses import replace
++from pathlib import Path
++import math
++import tempfile
++from .models import Effect, Observation, TARGETS, Pose2D
++
++def other_motion_owners(names,robot_id):
++    allowed={'multi_agent_task_agent',f'multi_agent_{robot_id}_agent'}
++    blocked={'vlm_nav','multi_agent_go2_check_motion','multi_agent_ranger_check_motion',
++        'multi_agent_go2_rgbd','multi_agent_ranger_rgbd','multi_agent_go2_agent','multi_agent_ranger_agent',
++        'multi_agent_task_agent','multi_agent_coordinator'}
++    result=set(names)&(blocked-allowed-{f'multi_agent_{robot_id}_rgbd'})
++    if robot_id=='go2' and names.count('multi_agent_coordinator')<=1:result.discard('multi_agent_coordinator')
++    if sum(names.count(n) for n in allowed)>1:result.add('duplicate cooperative agent')
++    if names.count(f'multi_agent_{robot_id}_rgbd')>1:result.add('duplicate RGB-D observer')
++    return sorted(result)
+ 
+ class AgentRunner:
+-    def __init__(self,machine,adapter,descriptions,on_observation):
++    def __init__(self,machine,adapter,descriptions,on_observation,*,config=None,success_radius=1.0,owners=lambda:[]):
+         self.machine,self.adapter,self.descriptions=machine,adapter,descriptions
+         self.on_observation=on_observation
+         self.pending=[]
++        self.config,self.success_radius=config,success_radius
++        self.owners=owners
++        if not math.isfinite(success_radius) or success_radius<=0:raise ValueError('positive success radius required')
++        self.local_steps=self.transit_steps=None
++        self.local_identity=None
++        self.now=0.
++        self.adapter.motion_guard=self.motion_guard
++        if machine.private:
++            root=Path(config['robot_'+machine.context.robot_id].get('experiment_records_root',tempfile.gettempdir()))
++            self.adapter.selection_evidence_dir=root/'cooperative'/machine.context.robot_id/'selections'
++            self.adapter.scan_evidence_dir=root/'cooperative'/machine.context.robot_id/'scans'
++
++    def motion_guard(self):
++        machine=self.machine;health=self.adapter.get_health()
++        if machine.paused or not machine.command or not health.localization_valid or not health.nav_ready:
++            raise RuntimeError('motion identity/health invalid')
++        if self.owners():raise RuntimeError('another local motion owner is active')
++        if machine.sync_received is None or machine.peer_received is None or any(
++                self.now-received>machine.lost_timeout for received in (machine.sync_received,machine.peer_received)):
++            raise RuntimeError('motion heartbeat expired')
++
++    def _record_local(self,event):
++        machine=self.machine
++        if event['state']=='NAVIGATING':
++            machine.navigation_started(event['goal_id'],event['goal_kind'],self.now)
++        elif event['state'] in ('ARRIVED','NAV_FAILED','TARGET_APPROACHED','SCANNING'):
++            machine._state.goal_id=''
++            machine._state.run_state='LOCAL_EXECUTING'
++        record=getattr(self.adapter,'record_event',None)
++        if record:record(event)
++
++    def _local_observation(self,observation):
++        self.machine.on_observation(replace(observation,scan_id=self.machine.command.command_id),self.now)
++
++    def _start_local(self):
++        from .go2_exploration import explore_steps
++        machine=self.machine;command=machine.command
++        config=dict(self.config)
++        robot=dict(config['robot_'+machine.context.robot_id])
++        robot['approach_on_detection']=command.kind!='SEARCH_VIEWPOINT'
++        robot['scan_angles']=[-(i+1)*math.pi/4 for i in range(8)]
++        config['robot_'+machine.context.robot_id]=robot
++        self.local_identity=(command.task_id,command.command_id)
++        machine._state.run_state='LOCAL_EXECUTING'
++        self.local_steps=explore_steps(self.adapter,config,machine.frame,
++            self.now+config['scene'].get('task_timeout',600.),self.descriptions[command.target_id],
++            self._record_local,self.owners,None,self.motion_guard,clock=lambda:self.now,
++            robot_id=machine.context.robot_id,target_id=command.target_id,
++            success_radius=self.success_radius,require_navigation_success=True,
++            task_id=command.task_id,command_id=command.command_id,on_observation=self._local_observation,
++            initial_observation=machine.local_observations.get(command.observation_id) if command.kind=='APPROACH_DEPOSIT' else None,
++            resource_permits=lambda:{machine._state.resource_id:machine._state.token} if machine._state.token else {})
++
++    def _resource(self,request):
++        from .go2_exploration import ExplorationStopped
++        machine=self.machine;state=machine._state;command=machine.command
++        resource=request['resource_id']
++        state.requested_resource=resource;state.requested_command_id=command.command_id
++        state.run_state='WAITING_RESOURCE'
++        while state.resource_id!=resource or not state.token:yield None
++        if resource=='basket':
++            state.run_state='LOCAL_EXECUTING'
++            return
++        exit_goal=machine.guard.transit_exit(resource,machine.context.robot_id,request['path'])
++        if exit_goal is None:raise ExplorationStopped('missing local door transit exit')
++        future=self.adapter.compute_path(exit_goal)
++        while not future.done():yield None
++        result=future.result();health=self.adapter.get_health()
++        if not result.reachable or not result.path or machine.guard.check(health.pose,health.footprint,result.path,
++                {resource:state.token},replace(health,path_valid=True)).action!='ALLOW':
++            raise ExplorationStopped('door transit path rejected')
++        goal_id=self.adapter.start_navigation(exit_goal,command.task_id,command.command_id,'DOOR_TRANSIT')
++        machine.navigation_started(goal_id,'DOOR_TRANSIT',self.now)
++        terminal=None
++        while terminal is None:
++            yield None
++            while self.adapter.results:
++                reply=self.adapter.results.popleft()
++                if (reply.task_id,reply.command_id,reply.goal_id,reply.goal_kind)==(
++                        command.task_id,command.command_id,goal_id,'DOOR_TRANSIT'):terminal=reply.status
++        if terminal!='SUCCEEDED':raise ExplorationStopped('door transit failed: '+terminal)
++        state.goal_id='';state.run_state='TRANSIT_STOP'
++        while state.token or not self.adapter.get_health().stopped or not self.adapter.get_health().motion_terminal:yield None
++        state.run_state='LOCAL_EXECUTING'
++
++    def _advance_local(self):
++        machine=self.machine;command=machine.command
++        if machine.paused or not command or self.local_identity!=(command.task_id,command.command_id):
++            self.local_steps.close();self.local_steps=None
++            if self.transit_steps:self.transit_steps.close();self.transit_steps=None
++            return
++        if machine.peer_received is None:return
++        try:
++            if self.transit_steps:
++                try:next(self.transit_steps)
++                except StopIteration:self.transit_steps=None
++                return
++            request=next(self.local_steps)
++            if request:self.transit_steps=self._resource(request)
++        except StopIteration as completed:
++            self.local_steps=None
++            health=self.adapter.get_health()
++            if not health.stopped or not health.motion_terminal:machine.stop('local completion stop unconfirmed');return
++            if completed.value=='TARGET_APPROACHED' and command.kind in ('APPROACH_PICKUP','APPROACH_DEPOSIT'):
++                if command.kind=='APPROACH_PICKUP':machine._state.ready=True
++                else:machine._state.deposited=True
++            elif completed.value!='TARGET_FOUND' or command.kind!='SEARCH_VIEWPOINT':
++                machine.fail('local execution: '+str(completed.value));return
++            machine._state.reply,machine._state.run_state='SUCCEEDED','IDLE'
++            machine._state.goal_id=''
++        except Exception as error:
++            self.local_steps.close();self.local_steps=None
++            if self.transit_steps:self.transit_steps.close();self.transit_steps=None
++            machine.stop('local execution: '+str(error))
+ 
+     def tick(self,now):
+-        if hasattr(self.adapter,'advance'):self.adapter.advance(now)
+-        if hasattr(self.adapter,'tick'):self.adapter.tick()
+-        while self.adapter.results:
++        self.now=now
++        try:
++            if hasattr(self.adapter,'advance'):self.adapter.advance(now)
++            if hasattr(self.adapter,'tick'):self.adapter.tick()
++        except Exception as error:
++            self.machine.stop('adapter tick failed: '+str(error))
++            self.dispatch(self.machine.take_effects(),now)
++        if self.local_steps and self.machine._state.run_state=='NAVIGATING' and any(
++                (result.task_id,result.command_id,result.goal_id,result.goal_kind)==(
++                    self.machine.context.task_id,self.machine.command.command_id,
++                    self.machine._state.goal_id,self.machine.goal_kind) for result in self.adapter.results):
++            # Native terminal clears its executing path before the core consumes the result.
++            self.machine._state.run_state='LOCAL_STOP'
++        while self.adapter.results and self.local_steps is None:
+             self.machine.on_goal_result(self.adapter.results.popleft(),now)
+         effects=self.machine.tick(now,self.adapter.get_health())
+         for item in list(self.pending):
+@@ -32,11 +172,16 @@
+                 else:self.machine.fail(f'{kind.lower()} operation failed')
+         effects+=self.machine.take_effects()
+         self.dispatch(effects,now)
++        if self.local_steps:
++            self._advance_local()
++            self.dispatch(self.machine.take_effects(),now)
+ 
+     def dispatch(self,effects,now):
+         for effect in effects:
+             command=self.machine.command
+             if effect.kind=='STOP':
++                if self.local_steps:self.local_steps.close();self.local_steps=None
++                if self.transit_steps:self.transit_steps.close();self.transit_steps=None
+                 for future,*_ in self.pending:future.cancel()
+                 self.pending.clear()
+                 goal_id,reason=effect.payload
+@@ -45,6 +190,7 @@
+             elif effect.kind=='OBSERVATION':self.on_observation(effect.payload)
+             elif command and not self.machine.paused:
+                 try:
++                    if effect.kind=='LOCAL_EXECUTE':self._start_local();continue
+                     if effect.kind=='APPROACH':future=self.adapter.select_approach(*effect.payload);goal=None
+                     elif effect.kind in ('PLAN','PLAN_TRANSIT'):
+                         goal=effect.payload;future=self.adapter.compute_path(goal)
+--- a/cooperative_ws/src/multi_agent_nav/tests/test_field_preparation.py
++++ b/cooperative_ws/src/multi_agent_nav/tests/test_field_preparation.py
+@@ -6,7 +6,7 @@
+ import pytest
+ from multi_agent_nav.config import load_config, live_gates,go2_local_gates,map_file_info
+ from multi_agent_nav.adapters.go2 import Go2Adapter
+-from multi_agent_nav.models import Pose2D
++from multi_agent_nav.models import Pose2D,PathResult
+ 
+ def stamp(seconds):
+     from builtin_interfaces.msg import Time
+@@ -39,6 +39,7 @@
+ 
+ def test_live_gates_reject_incomplete_scene_and_unverified_costmap():
+     c=load_config();c['scene']['enabled']=True
++    c['scene']['share_c_coordinates']=True
+     c['robot_go2']['costmap_source_verified']=False
+     c['scene']['resources']={'door':{'polygon':[[0,0],[1,0],[1,1]]}}
+     c['scene']['exit_points']={'go2':[2,2,0]}
+@@ -195,7 +196,7 @@
+     pending=Future();a.compute_path=lambda goal:pending
+     result=a.select_approach(Pose2D(),[])
+     a.on_costmap(costmap(254))
+-    pending.set_result(S(reachable=True))
++    pending.set_result(PathResult(True,[Pose2D(),Pose2D(1.,0.)]))
+     assert result.result().goal is None
+ 
+ def test_stationary_uses_linear_norm_and_separate_angular_limit():
+--- /dev/null
++++ b/cooperative_ws/src/multi_agent_nav/tests/test_local_adapter_contract.py
+@@ -0,0 +1,85 @@
++from types import SimpleNamespace as S
++import numpy as np
++import pytest
++from multi_agent_nav.adapters.nav2 import Nav2Adapter
++from multi_agent_nav.models import Pose2D
++
++
++def costmap_adapter():
++    a=Nav2Adapter.__new__(Nav2Adapter)
++    a.config=dict(footprint=[[.2,.2],[.2,-.2],[-.2,-.2],[-.2,.2]],footprint_padding=0.,costmap_blocked_cost=253)
++    def grid(size):
++        return S(metadata=S(resolution=.1,size_x=size,size_y=size,
++            origin=S(position=S(x=0.,y=0.),orientation=S(x=0.,y=0.,z=0.,w=1.))),
++            data=np.zeros(size*size,dtype=np.uint8))
++    a.costmap=grid(10);a.global_costmap=grid(100)
++    a.costmap_transform=lambda global_goal=False:Pose2D()
++    return a
++
++
++def test_distant_candidate_uses_global_coverage_and_checks_local_overlap():
++    a=costmap_adapter()
++    assert a.observation_candidate_free(Pose2D(4,4))
++    assert a.approach_candidate_free(Pose2D(4,4))
++    assert a.observation_candidate_free(Pose2D(1.05,.5))
++    a.costmap.data[5*10+9]=255
++    assert not a.observation_candidate_free(Pose2D(1.05,.5))
++    assert not a.approach_candidate_free(Pose2D(1.05,.5))
++    a.costmap_transform=lambda global_goal=False:Pose2D() if global_goal else None
++    assert not a.observation_candidate_free(Pose2D(4,4))
++
++
++def test_motion_guard_runs_before_any_native_goal_is_sent():
++    a=Nav2Adapter.__new__(Nav2Adapter)
++    a.motions={}
++    def guard():raise RuntimeError('paused')
++    a.motion_guard=guard
++    with pytest.raises(RuntimeError,match='paused'):
++        a._motion(S(send_goal_async=lambda _:pytest.fail('must not send')),None,'t','c','SCAN_SPIN')
++    assert not a.motions
++
++
++def test_real_nav2_parameter_reads_are_async_and_keep_controller_planner_values():
++    from concurrent.futures import Future
++    from rcl_interfaces.msg import ParameterValue,ParameterType
++    a=Nav2Adapter.__new__(Nav2Adapter)
++    pending=[]
++    def client(kind):
++        def call(request):
++            f=Future();pending.append((kind,request.names,f));return f
++        return S(service_is_ready=lambda:True,call_async=call)
++    a.node=S(create_client=lambda _,name:client(name))
++    future=a.read_approach_parameters()
++    assert not future.done()
++    while pending:
++        kind,names,reply=pending.pop(0)
++        values=[]
++        for name in names:
++            if name in ('goal_checker_plugins','planner_plugins'):
++                value=ParameterValue(type=ParameterType.PARAMETER_STRING_ARRAY,
++                    string_array_value=['custom_checker' if name=='goal_checker_plugins' else 'GridBased'])
++            else:
++                value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE,double_value=.05 if name.endswith('xy_goal_tolerance') else .76)
++            values.append(value)
++        reply.set_result(S(values=values))
++    assert future.result()==dict(xy_goal_tolerance=.05,planner_tolerance=.76)
++
++
++@pytest.mark.parametrize('robot_id',['go2','ranger'])
++def test_private_factory_applies_clockwise_scan_to_actual_adapter_without_changing_single_defaults(monkeypatch,robot_id):
++    from importlib import import_module
++    from multi_agent_nav.config import load_config
++    from multi_agent_nav.local_context import local_config
++    from multi_agent_nav.adapters.factory import create_runtime
++    config=load_config();config['scene']['share_c_coordinates']=False
++    module=import_module('multi_agent_nav.adapters.'+robot_id)
++    monkeypatch.setattr(module,'make_observer',lambda *args,**kwargs:S(create_subscription=lambda *a:None,destroy_node=lambda:None))
++    original=list(config['robot_'+robot_id]['scan_angles'])
++    _,adapter=create_runtime(robot_id,config,global_goal_checks=True)
++    try:
++        assert adapter.config['scan_angles']==pytest.approx([-.7853981633974483*i for i in range(1,9)])
++        assert config['robot_'+robot_id]['scan_angles']==original
++    finally:adapter.close(stop=False)
++    _,adapter=create_runtime(robot_id,local_config(config,robot_id),global_goal_checks=True)
++    try:assert adapter.config['scan_angles']==original
++    finally:adapter.close(stop=False)
+--- /dev/null
++++ b/cooperative_ws/src/multi_agent_nav/tests/test_private_c.py
+@@ -0,0 +1,330 @@
++"""Private local maps, strict arrival and shared resource ordering, without ROS."""
++from dataclasses import replace
++from concurrent.futures import Future
++import pytest
++from multi_agent_nav.models import *
++from multi_agent_nav.mock import mock_config, make_machine, MockMission
++from multi_agent_nav.adapters.fake import FakeAdapter, completed
++from multi_agent_nav.runner import AgentRunner
++
++
++def private_config():
++    config = mock_config()
++    config['scene']['share_c_coordinates'] = False
++    for robot in ROBOTS:
++        config['alignment']['robots'][robot]['transform'] = None
++        config['robot_'+robot].update(scan_angles=[0.], api_timeout=2., standoff_distance=.7,
++            approach_on_detection=True, footprint=[[.38,.18],[.38,-.18],[-.38,-.18],[-.38,.18]])
++    return config
++
++
++def local_agent():
++    config = private_config()
++    machine, frame = make_machine(config, 'ranger', True)
++    adapter = FakeAdapter('ranger', {'B':Pose2D(3,-3), 'C':Pose2D(9,1)})
++    adapter.pose = Pose2D(3,-3)
++    machine.tick(0., adapter.get_health())
++    sync = Command(task_id='t', recipient_id='ranger', action='SYNC', kind='SYNC_LOCAL_C',
++        common_frame_id='', alignment_id='')
++    assert machine.accept(sync,0.).accepted
++    machine.peer_received=0.
++    command = replace(sync,action='EXECUTE',kind='APPROACH_PICKUP',target_id='B',command_id='b',sequence=1)
++    return config,machine,adapter,command
++
++
++def test_private_identity_has_no_transform_and_state_does_not_publish_local_pose():
++    _,machine,adapter,_ = local_agent()
++    state=machine.state()
++    assert state.localization_valid and not state.pose_valid
++    assert state.common_pose == Pose2D()
++    assert state.common_frame_id == state.alignment_id == ''
++
++
++def test_private_command_accepts_intent_and_rejects_coordinate_or_old_sync():
++    _,machine,_,command=local_agent()
++    assert not machine.accept(replace(command,position_valid=True,object_position=Pose2D(2,3)),0).accepted
++    assert not machine.accept(replace(command,common_goal=Pose2D(2,3)),0).accepted
++    assert not machine.accept(replace(command,action='SYNC',kind='WAIT'),0).accepted
++    assert machine.accept(command,0).accepted
++    assert [effect.kind for effect in machine.take_effects()] == ['LOCAL_EXECUTE']
++
++
++def test_cache_is_local_network_is_zero_and_new_task_discards_cache():
++    _,machine,_,command=local_agent()
++    assert machine.accept(command,0).accepted
++    machine.take_effects()
++    observation=Observation(scan_id='b',observation_id='local-c',target_id='C',status='DETECTED',
++        position_valid=True,common_position=Pose2D(9,1))
++    machine.on_observation(observation,0)
++    sent=machine.take_effects()[0].payload
++    assert sent.status == 'CACHED' and sent.observation_id == 'local-c'
++    assert not sent.position_valid and sent.common_position == Pose2D()
++    assert machine.local_observations['local-c'].common_position == Pose2D(9,1)
++    machine.stop('test');machine.tick(.1,machine.health);machine.take_effects()
++    sync=replace(command,task_id='next',action='SYNC',kind='SYNC_LOCAL_C')
++    assert machine.accept(sync,.2).accepted
++    assert not machine.local_observations
++
++
++def test_new_task_resets_published_sequence_and_old_command_identity():
++    _,machine,_,command=local_agent()
++    assert machine.accept(replace(command,sequence=20),0).accepted
++    machine._state.requested_resource='door';machine._state.requested_command_id='b'
++    machine.stop('test');machine.tick(.1,machine.health);machine.take_effects()
++    assert machine.accept(replace(command,task_id='next',action='SYNC',kind='SYNC_LOCAL_C'),.2).accepted
++    state=machine.state()
++    assert state.sequence==0 and state.command_id==state.goal_id==''
++    assert state.requested_resource==state.requested_command_id==''
++
++
++def test_deposit_rejects_non_c_local_observation_reference():
++    _,machine,_,command=local_agent()
++    machine.local_observations['own-b']=Observation(target_id='B',position_valid=True,status='DETECTED',common_position=Pose2D(3,-3))
++    machine._state.ready=True;machine.phase='DEPOSIT'
++    assert not machine.accept(replace(command,phase='DEPOSIT',kind='APPROACH_DEPOSIT',target_id='C',observation_id='own-b'),0).accepted
++
++
++def test_release_requires_resource_identity_as_well_as_parent_and_token():
++    _,machine,_,command=local_agent()
++    machine._state.resource_id='basket';machine._state.token='token';machine._state.permit_command_id='deposit'
++    release=replace(command,action='GRANT_RESOURCE',kind='RELEASE',token='token',parent_command_id='deposit',resource_id='door')
++    assert not machine.accept(release,0).accepted
++    assert machine.state().token=='token'
++
++
++def test_held_basket_token_cannot_be_replaced_by_another_grant():
++    _,machine,_,command=local_agent()
++    assert machine.accept(command,0).accepted
++    state=machine._state
++    state.resource_id='basket';state.token='basket-token';state.permit_command_id='b'
++    state.requested_resource='door'
++    grant=replace(command,action='GRANT_RESOURCE',resource_id='door',token='door-token',parent_command_id='b')
++    assert not machine.accept(grant,0).accepted
++    assert machine.state().token=='basket-token'
++
++
++def test_full_private_mission_keeps_ready_barrier_and_order_without_coordinate_messages():
++    mission=MockMission(private_config())
++    assert mission.start().accepted
++    mission.run(800)
++    assert mission.coordinator.phase=='DONE', (mission.coordinator.reason,mission.coordinator.states)
++    deposits=[(r,c) for r,c in mission.executed if c.kind=='APPROACH_DEPOSIT']
++    assert [r for r,c in deposits]==['go2','ranger']
++    assert deposits[0][1].observation_id != deposits[1][1].observation_id
++    for robot,deposit in deposits:
++        assert deposit.observation_id.startswith(robot+'/')
++        exit_command=next(c for r,c in mission.executed if r==robot and c.kind=='EXIT')
++        assert exit_command.parent_command_id == deposit.command_id and exit_command.token
++    assert not mission.coordinator.resources.held
++    for robot,command in mission.executed:
++        assert not command.position_valid and command.common_goal==command.object_position==Pose2D()
++        assert command.common_frame_id==command.alignment_id==command.viewpoint_id==''
++    for state in mission.coordinator.states.values():
++        assert state.ready and state.deposited and state.exited
++        assert state.localization_valid and not state.pose_valid and state.common_pose==Pose2D()
++    assert all(not o.position_valid and o.common_position==Pose2D() for o in mission.coordinator.observations.values())
++
++
++@pytest.mark.parametrize('fault',['moving','far','aborted','cancel'])
++def test_private_ready_requires_current_success_and_actual_stopped_distance(fault):
++    config,machine,adapter,command=local_agent()
++    runner=AgentRunner(machine,adapter,config['scene']['targets'],lambda _:None,config=config,success_radius=1.)
++    assert machine.accept(command,0).accepted
++    original_advance=adapter.advance
++    if fault=='aborted':
++        def advance(now):
++            if any(row[2].goal_kind=='PICKUP_NAV' for row in adapter.active.values()):adapter.aborts=10
++            original_advance(now)
++        adapter.advance=advance
++    injected=False
++    for index in range(200):
++        now=index*.05;machine.peer_received=machine.sync_received=now
++        if not injected and any(kind=='PICKUP_NAV' for kind,_,_ in adapter.calls):
++            injected=True
++            if fault=='cancel':machine.stop('cancel')
++            original=adapter.get_health
++            if fault=='moving':adapter.get_health=lambda:replace(original(),stopped=False)
++            elif fault=='far':adapter.get_health=lambda:replace(original(),pose=Pose2D(-100,-100))
++        runner.tick(now)
++    assert injected,'pickup navigation was not started'
++    assert not machine.state().ready
++
++
++@pytest.mark.parametrize('endpoint', [.7,.94,1.2])
++def test_actual_path_endpoint_budget_controls_approach(endpoint):
++    config,machine,adapter,command=local_agent()
++    adapter.delay=.1
++    original=adapter.compute_path
++    def compute(goal):
++        result=original(goal).result()
++        if goal.x>0 and goal.y<-2 and goal!=Pose2D(3,-3):
++            result.path[-1]=Pose2D(3-endpoint,-3)
++        return completed(result)
++    adapter.compute_path=compute
++    # Keep fake candidate validation tied to the actual planner, as in Nav2Adapter.
++    def select(obj,excluded,**kwargs):
++        goal=Pose2D(3-endpoint,-3)
++        path=compute(goal).result()
++        return completed(ApproachResult(goal if kwargs['path_accept'](path) else None))
++    adapter.select_approach=select
++    runner=AgentRunner(machine,adapter,config['scene']['targets'],lambda _:None,config=config,success_radius=1.)
++    assert machine.accept(command,0).accepted
++    for index in range(100):
++        now=index*.05;machine.peer_received=machine.sync_received=now;runner.tick(now)
++    assert machine.state().ready is (endpoint==.7)
++    if endpoint!=.7:assert not any(kind=='PICKUP_NAV' for kind,_,_ in adapter.calls)
++
++
++def test_private_door_exit_releases_then_resumes_same_main_command():
++    config=private_config()
++    config['scene']['resources']['door']={'polygon':[[-.5,-5],[.5,-5],[.5,5],[-.5,5]],
++        'transit_exits':{r:[[2,-3,0],[-2,-3,3.14]] for r in ROBOTS}}
++    mission=MockMission(config);assert mission.start().accepted
++    mission.run(1000)
++    assert mission.coordinator.phase=='DONE',mission.coordinator.reason
++    calls=mission.adapters['go2'].calls
++    assert 'DOOR_TRANSIT' in [kind for kind,_,_ in calls]
++    transit=next(c for kind,_,c in calls if kind=='DOOR_TRANSIT')
++    assert transit in [c for kind,_,c in calls if kind=='DEPOSIT_NAV']
++    assert not mission.coordinator.resources.held
++
++
++def test_slow_local_vision_does_not_block_tick_or_pause():
++    config,machine,adapter,command=local_agent()
++    pending=Future()
++    adapter.start_scan=lambda *a,**k:pending
++    runner=AgentRunner(machine,adapter,config['scene']['targets'],lambda _:None,config=config,success_radius=1.)
++    assert machine.accept(command,0).accepted
++    for index in range(20):
++        now=index*.05;machine.peer_received=machine.sync_received=now;runner.tick(now)
++    assert not machine.state().ready and not pending.done()
++    machine.stop('pause');runner.tick(1.)
++    assert not machine.state().ready and not adapter.active
++
++
++def test_adapter_guard_error_stops_and_cannot_escape_heartbeat_tick():
++    config,machine,adapter,command=local_agent()
++    runner=AgentRunner(machine,adapter,config['scene']['targets'],lambda _:None,config=config)
++    assert machine.accept(command,0).accepted
++    adapter.tick=lambda:adapter.motion_guard()
++    runner.tick(4.)
++    assert machine.paused and machine.state().run_state=='PAUSED'
++    assert not adapter.active and not machine.state().ready
++
++
++def test_native_terminal_path_clear_allows_local_arrival_consumption():
++    config,machine,adapter,command=local_agent()
++    original=adapter.advance
++    def advance(now):
++        original(now)
++        if adapter.results:adapter.path=[]
++    adapter.advance=advance
++    runner=AgentRunner(machine,adapter,config['scene']['targets'],lambda _:None,config=config)
++    assert machine.accept(command,0).accepted
++    for index in range(100):
++        now=index*.05;machine.sync_received=machine.peer_received=now;runner.tick(now)
++    assert machine.state().ready,machine.state().reason
++
++
++def test_private_heartbeat_loss_pauses_with_held_resource_frozen():
++    mission=MockMission(private_config());assert mission.start().accepted
++    for _ in range(600):
++        mission.step()
++        if 'basket' in mission.coordinator.resources.held:break
++    assert 'basket' in mission.coordinator.resources.held
++    mission.online['go2']=False;mission.run(60)
++    assert mission.coordinator.phase=='PAUSED' and 'basket' in mission.coordinator.resources.held
++
++
++def test_peer_private_state_uses_local_receipt_and_pauses_on_map_change():
++    config,machine,adapter,command=local_agent()
++    peer=AgentState(task_id='t',robot_id='go2',local_map_id='synthetic_go2',map_version='1',
++        common_frame_id='',alignment_id='',localization_valid=True,nav_ready=True,stamp=9999999999.)
++    assert machine.receive_peer(peer,config['alignment']['robots']['go2'],1.)
++    assert machine.peer_received==1.
++    assert not machine.receive_peer(replace(peer,map_version='rebuilt'),config['alignment']['robots']['go2'],2.)
++    assert machine.paused
++
++
++def test_ranger_live_gates_require_local_inputs_and_do_not_require_alignment_or_go2_files(monkeypatch):
++    from multi_agent_nav.config import load_config,live_gates
++    import multi_agent_nav.config as module
++    config=load_config();config['scene'].update(share_c_coordinates=False,enabled=True)
++    config['scene']['resources']={'basket':{'polygon':[[7,0],[9,0],[9,2],[7,2]]}}
++    config['scene']['exit_points']={'ranger':[1.,1.,0.]}
++    config['scene']['viewpoints']['ranger']=[{'id':'r','pose':[1.,2.,0.]}]
++    robot=config['robot_ranger'];robot.update(stop_margin=.1,costmap_source_verified=True,
++        camera_calibrated=True,vision_validated=True,path_source_verified=True,peer_obstacle_verified=True,
++        exploration_strategy='generated_candidates_vlm',scan_angles=[-(i+1)*.7853981633974483 for i in range(8)])
++    monkeypatch.setattr(module,'map_file_gates',lambda config,robot,check_files=True:[])
++    # Asset inspection has its own regression; do not require site-specific semantic files here.
++    import multi_agent_nav.go2_exploration as core
++    monkeypatch.setattr(core,'exploration_gates',lambda config,robot_id:[])
++    assert live_gates(config,local_robot='ranger')==[]
++    robot['path_source_verified']=False
++    assert any('ranger' in reason and 'path_source_verified' in reason for reason in live_gates(config,local_robot='ranger'))
++
++
++@pytest.mark.parametrize('resources',[['invalid'],'invalid',{'door':'invalid'}])
++def test_private_live_config_reports_malformed_resource_geometry(resources):
++    from multi_agent_nav.config import load_config,live_gates
++    config=load_config();config['scene']['share_c_coordinates']=False
++    config['scene']['resources']=resources
++    assert live_gates(config,local_robot='ranger')
++
++
++def test_deposit_requires_basket_permit_even_if_cached_c_path_misses_polygon():
++    config=private_config()
++    config['scene']['resources']['basket']['polygon']=[[50,50],[52,50],[52,52],[50,52]]
++    mission=MockMission(config);assert mission.start().accepted
++    for _ in range(800):
++        mission.step()
++        if any(kind=='DEPOSIT_NAV' for kind,_,_ in mission.adapters['go2'].calls):break
++    else:pytest.fail('deposit did not start')
++    assert mission.machines['go2'].state().token
++    assert 'basket' in mission.coordinator.resources.held
++
++
++def test_motion_ownership_is_local_and_allows_only_one_agent_observer():
++    from multi_agent_nav.runner import other_motion_owners
++    assert other_motion_owners(['multi_agent_ranger_agent','multi_agent_ranger_rgbd'],'ranger')==[]
++    assert other_motion_owners(['multi_agent_go2_agent','multi_agent_go2_rgbd','multi_agent_coordinator'],'go2')==[]
++    for names in (['vlm_nav'],['multi_agent_coordinator'],['multi_agent_go2_rgbd'],
++            ['multi_agent_ranger_agent']*2,['multi_agent_task_agent','multi_agent_ranger_agent']):
++        assert other_motion_owners(names,'ranger')
++
++
++from test_generated_candidates import generated_config
++
++
++@pytest.mark.parametrize('robot_id',['go2','ranger'])
++def test_cooperative_runner_uses_same_local_generated_candidate_core(generated_config,tmp_path,robot_id):
++    from types import SimpleNamespace as S
++    import yaml
++    config=private_config()
++    config['robot_'+robot_id].update(generated_config['robot_go2'],standoff_distance=.7)
++    config['alignment']['robots'][robot_id].update(generated_config['alignment']['robots']['go2'])
++    semantic=tmp_path/'semantic.yaml';data=yaml.safe_load(semantic.read_text())
++    data['source_robot']=robot_id;semantic.write_text(yaml.safe_dump(data))
++    machine,frame=make_machine(config,robot_id,True)
++    target_id={'go2':'A','ranger':'B'}[robot_id]
++    adapter=FakeAdapter(robot_id,{target_id:Pose2D(3,-3),'C':Pose2D(3,3)},delay=.1)
++    snapshots=[]
++    def choose(snapshot):snapshots.append(snapshot);return dict(candidate_id='P1',reason='first eligible side')
++    adapter.client=S(choose_candidate=choose)
++    adapter.vision=S(submit=lambda fn:completed(fn()))
++    machine.tick(0,adapter.get_health())
++    sync=Command(task_id='t',recipient_id=robot_id,action='SYNC',kind='SYNC_LOCAL_C',common_frame_id='',alignment_id='')
++    assert machine.accept(sync,0).accepted
++    command=replace(sync,action='EXECUTE',command_id='pickup',sequence=1,kind='APPROACH_PICKUP',target_id=target_id)
++    assert machine.accept(command,0).accepted
++    emitted=[]
++    runner=AgentRunner(machine,adapter,config['scene']['targets'],emitted.append,config=config,success_radius=1.)
++    for index in range(100):
++        now=index*.05;machine.sync_received=machine.peer_received=now;runner.tick(now)
++    assert machine.state().ready,machine.state().reason
++    assert snapshots and snapshots[0]['candidates'][0]['display_id']=='P1'
++    assert [kind for kind,_,_ in adapter.calls]==['VIEWPOINT_NAV','PICKUP_NAV']
++    assert all(command_id=='pickup' for _,_,command_id in adapter.calls)
++    assert any(o.status=='CACHED' for o in emitted)
++    assert all(o.common_position==Pose2D() and not o.position_valid for o in emitted)
+--- /dev/null
++++ b/cooperative_ws/src/multi_agent_nav/tests/test_ranger_task_entry.py
+@@ -0,0 +1,64 @@
++"""Evaluate the Ranger task wiring without initializing ROS or sending goals."""
++import importlib.util
++from pathlib import Path
++from types import SimpleNamespace as S
++from launch import LaunchContext
++from launch.actions import DeclareLaunchArgument
++from launch_ros.actions import Node
++from multi_agent_nav.adapters.fake import FakeAdapter
++from multi_agent_nav.mock import mock_config
++
++
++def test_ranger_launch_contains_only_local_agent(monkeypatch):
++    path=Path(__file__).resolve().parents[1]/'launch/ranger_cooperative.launch.py'
++    spec=importlib.util.spec_from_file_location('ranger_task_launch',path)
++    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
++    ld=module.generate_launch_description();context=LaunchContext()
++    for action in ld.entities:
++        if isinstance(action,DeclareLaunchArgument):action.execute(context)
++    monkeypatch.setattr(module,'Node',lambda **kwargs:kwargs)
++    nodes=module.build(context)
++    assert len(nodes)==1 and nodes[0]['executable']=='multi_agent_agent_node'
++    assert nodes[0]['parameters'][0]['robot_id']=='ranger'
++
++
++def test_live_ranger_entry_uses_own_adapter_and_config(monkeypatch):
++    import multi_agent_nav.agent_node as module
++    import multi_agent_nav.adapters.factory as factory
++    config=mock_config();config['scene']['share_c_coordinates']=False
++    config['alignment']['robots']['ranger']['transform']=None
++    adapter=FakeAdapter('ranger')
++    adapter.create_vision_client=lambda config:S()
++    monkeypatch.setattr(module.Node,'__init__',lambda self,*a:None)
++    monkeypatch.setattr(module,'settings',lambda node:(config,False,'/multi_agent',[]))
++    monkeypatch.setattr(factory,'create_runtime',lambda robot,config,**kwargs:(S(),adapter))
++    monkeypatch.setattr(module.AgentNode,'declare_parameter',lambda *a:None)
++    monkeypatch.setattr(module.AgentNode,'get_parameter',lambda *a:S(value='ranger'))
++    monkeypatch.setattr(module.AgentNode,'create_publisher',lambda *a:S(publish=lambda _:None))
++    monkeypatch.setattr(module.AgentNode,'create_subscription',lambda *a:None)
++    monkeypatch.setattr(module.AgentNode,'create_timer',lambda *a:None)
++    monkeypatch.setattr(module.AgentNode,'create_client',lambda *a:S())
++    monkeypatch.setattr(module.AgentNode,'get_logger',lambda self:S(info=lambda _:None))
++    node=module.AgentNode()
++    assert node.machine.context.robot_id=='ranger'
++    assert node.runner.adapter is adapter and node.runner.config is config
++    assert node.runner.success_radius==1.
++
++
++def test_live_map_monitor_rejects_wrong_map_and_expired_evidence(monkeypatch):
++    import multi_agent_nav.agent_node as module
++    import multi_agent_nav.config as config_module
++    node=object.__new__(module.AgentNode)
++    node.simulation=False;node.adapter=S(task_map_ready=False)
++    node.robot='ranger';node.config={'robot_ranger':{'map_path':'/tmp/expected.yaml'}}
++    node.map_probe=S(path='/tmp/wrong.yaml',poll=lambda now:None)
++    node.map_ready=False;node.map_verified_at=0.;node.next_map_probe=0.
++    node.poll_map(1.)
++    assert not node.adapter.task_map_ready
++    monkeypatch.setattr(config_module,'map_file_gates',lambda *args:[])
++    node.map_probe=S(path='/tmp/expected.yaml',poll=lambda now:None)
++    node.poll_map(2.)
++    assert node.adapter.task_map_ready
++    node.next_map_probe=100.
++    node.poll_map(6.)
++    assert not node.adapter.task_map_ready

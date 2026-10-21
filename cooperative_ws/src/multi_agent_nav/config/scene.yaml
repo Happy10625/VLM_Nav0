@@ -1,0 +1,21 @@
+scenario_id: lab
+enabled: false
+simulation: false
+share_c_coordinates: false
+targets:
+  A: 灭火器
+  B: 水杯
+  C: 篮子
+viewpoints:
+  go2:
+    - id: go2_view_01
+      pose: [-0.37453392148017883, 1.9982248544692993, 1.911663117782095]
+    - id: go2_view_02
+      pose: [0.9363348484039307, 2.5810399055480957, 0.22931137952344943]
+  ranger: []
+wait_points: {}
+exit_points: {}
+resources: {}
+heartbeat_hz: 2.0
+lost_timeout: 3.0
+task_timeout: 600.0

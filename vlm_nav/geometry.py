@@ -1,10 +1,188 @@
 """Pure geometry, occupancy-grid, and exploration helpers."""
 
 import math
+import ctypes as C
 from collections import deque
 from typing import Iterable, Optional, Sequence, Tuple
 
 import numpy as np
+
+
+class RealSenseIntrinsics(C.Structure):
+    _fields_ = [("width", C.c_int), ("height", C.c_int)] + [
+        (name, C.c_float) for name in ("ppx", "ppy", "fx", "fy")
+    ] + [("model", C.c_int), ("coeffs", C.c_float * 5)]
+
+
+class RealSenseExtrinsics(C.Structure):
+    _fields_ = [("rotation", C.c_float * 9), ("translation", C.c_float * 3)]
+
+
+def realsense_intrinsics(info, model=None):
+    try:
+        k = np.asarray(info["k"], dtype=float).reshape(-1)
+        distortion = np.asarray(info["d"], dtype=float).reshape(-1)
+        width, height = int(info["width"]), int(info["height"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("Invalid CameraInfo") from error
+    if model is None:
+        if not np.any(distortion):
+            model = 0
+        else:
+            raise ValueError(
+                "Nonzero distortion: supply verified SDK distortion enum "
+                "(not inferred from plumb_bob)"
+            )
+    if model not in (0, 2, 4):
+        raise ValueError(
+            "This minimal projection supports verified "
+            "NONE/INVERSE_BROWN/BROWN models only"
+        )
+    if (
+        k.size != 9
+        or distortion.size > 5
+        or not np.isfinite(k).all()
+        or not np.isfinite(distortion).all()
+        or min(k[0], k[4]) <= 0
+        or min(width, height) <= 0
+    ):
+        raise ValueError("Invalid CameraInfo")
+    distortion = distortion.tolist()
+    return RealSenseIntrinsics(
+        width,
+        height,
+        k[2],
+        k[5],
+        k[0],
+        k[4],
+        model,
+        (C.c_float * 5)(*(distortion + [0.0] * (5 - len(distortion)))),
+    )
+
+
+def realsense_extrinsics(matrix):
+    matrix = np.asarray(matrix, dtype=float)
+    if matrix.shape != (4, 4) or not np.isfinite(matrix).all():
+        raise ValueError("Invalid extrinsic matrix")
+    return RealSenseExtrinsics(
+        (C.c_float * 9)(*matrix[:3, :3].flatten(order="F")),
+        (C.c_float * 3)(*matrix[:3, 3]),
+    )
+
+
+class RealSenseGeometry:
+    """Thin ABI wrapper; projection arithmetic stays in librealsense."""
+
+    def __init__(self, library):
+        self.lib = C.CDLL(library)
+        float_pointer = C.POINTER(C.c_float)
+        self.lib.rs2_project_color_pixel_to_depth_pixel.argtypes = [
+            float_pointer,
+            C.POINTER(C.c_uint16),
+            C.c_float,
+            C.c_float,
+            C.c_float,
+            C.POINTER(RealSenseIntrinsics),
+            C.POINTER(RealSenseIntrinsics),
+            C.POINTER(RealSenseExtrinsics),
+            C.POINTER(RealSenseExtrinsics),
+            float_pointer,
+        ]
+        self.lib.rs2_project_color_pixel_to_depth_pixel.restype = None
+        self.lib.rs2_deproject_pixel_to_point.argtypes = [
+            float_pointer,
+            C.POINTER(RealSenseIntrinsics),
+            float_pointer,
+            C.c_float,
+        ]
+        self.lib.rs2_deproject_pixel_to_point.restype = None
+
+    def project(
+        self,
+        snapshot,
+        pixel,
+        scale,
+        minimum,
+        maximum,
+        color_model=None,
+        depth_model=None,
+    ):
+        rgb, raw, metadata = snapshot
+        if not (
+            np.isfinite([*pixel, scale, minimum, maximum]).all()
+            and scale > 0
+            and 0 < minimum < maximum
+        ):
+            raise ValueError("Invalid pixel, scale, or depth limits")
+        u, v = pixel
+        if not (0 <= u < rgb.shape[1] and 0 <= v < rgb.shape[0]):
+            raise ValueError("Color pixel outside image")
+        if raw.dtype != np.uint16 or raw.ndim != 2:
+            raise ValueError("Expected native uint16 ROS raw depth")
+        if not np.any(
+            (raw.astype(float) * scale >= minimum)
+            & (raw.astype(float) * scale <= maximum)
+        ):
+            raise ValueError("No valid depth in frame")
+        if abs(metadata["rgb_stamp_ns"] - metadata["depth_stamp_ns"]) > 50_000_000:
+            raise ValueError("Snapshot RGB/depth delta exceeds 50 ms")
+        depth_intrinsics = realsense_intrinsics(metadata["depth_info"], depth_model)
+        color_intrinsics = realsense_intrinsics(metadata["color_info"], color_model)
+        if raw.shape != (depth_intrinsics.height, depth_intrinsics.width) or rgb.shape[:2] != (
+            color_intrinsics.height,
+            color_intrinsics.width,
+        ):
+            raise ValueError("Image/CameraInfo dimensions differ")
+        depth_to_color = realsense_extrinsics(metadata["depth_to_color"])
+        color_to_depth = realsense_extrinsics(metadata["color_to_depth"])
+        raw = np.ascontiguousarray(raw)
+        mapped = (C.c_float * 2)(float("nan"), float("nan"))
+        self.lib.rs2_project_color_pixel_to_depth_pixel(
+            mapped,
+            raw.ctypes.data_as(C.POINTER(C.c_uint16)),
+            scale,
+            minimum,
+            maximum,
+            C.byref(depth_intrinsics),
+            C.byref(color_intrinsics),
+            C.byref(color_to_depth),
+            C.byref(depth_to_color),
+            (C.c_float * 2)(u, v),
+        )
+        if not np.isfinite(list(mapped)).all():
+            raise ValueError("SDK did not find a depth pixel")
+        x, y = (int(np.floor(value + 0.5)) for value in mapped)
+        if not (0 <= x < raw.shape[1] and 0 <= y < raw.shape[0]):
+            raise ValueError("Mapped depth pixel outside image")
+        value = int(raw[y, x])
+        depth = value * scale
+        if value == 0 or not minimum <= depth <= maximum:
+            raise ValueError("Mapped depth is zero or outside limits")
+        point = (C.c_float * 3)()
+        self.lib.rs2_deproject_pixel_to_point(
+            point,
+            C.byref(depth_intrinsics),
+            (C.c_float * 2)(x, y),
+            depth,
+        )
+        result = {
+            "color_pixel": list(pixel),
+            "depth_pixel": [x, y],
+            "raw_value": value,
+            "depth_m": depth,
+            "depth_optical_point": list(point),
+            "map_point": None,
+            "rgb_stamp_ns": metadata["rgb_stamp_ns"],
+            "depth_stamp_ns": metadata["depth_stamp_ns"],
+        }
+        if metadata["T_map_depth_optical"] is not None:
+            matrix = np.asarray(metadata["T_map_depth_optical"], dtype=float)
+            if matrix.shape != (4, 4) or not np.isfinite(matrix).all():
+                raise ValueError("Invalid map transform")
+            result["map_point"] = (
+                matrix @ np.array([*point, 1.0])
+            )[:3].tolist()
+        return result
 
 
 class TargetTracker:

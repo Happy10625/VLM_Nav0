@@ -1,0 +1,23 @@
+# Schema v1: task coordinates are lab_ref; stamp is trace-only.
+uint64 schema_version
+string task_id
+string command_id
+string recipient_id
+uint64 sequence
+string action
+string phase
+string kind
+string target_id
+string viewpoint_id
+string observation_id
+string common_frame_id
+string alignment_id
+geometry_msgs/Pose2D common_goal
+geometry_msgs/Pose2D object_position
+bool position_valid
+string parent_command_id
+string cancel_command_id
+string resource_id
+string token
+uint64 ack_sequence
+bool simulation

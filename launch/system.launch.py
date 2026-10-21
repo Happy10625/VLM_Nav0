@@ -15,6 +15,8 @@ def generate_launch_description():
     return LaunchDescription(
         [
             DeclareLaunchArgument("enabled", default_value="false"),
+            DeclareLaunchArgument("start_legacy_navigator", default_value="true"),
+            DeclareLaunchArgument("nav2_overrides_file", default_value=""),
             DeclareLaunchArgument("target_description", default_value="chair"),
             DeclareLaunchArgument("enable_odom_adapter", default_value="true"),
             DeclareLaunchArgument("publish_camera_tf", default_value="true"),
@@ -37,6 +39,7 @@ def generate_launch_description():
                 ),
                 launch_arguments={
                     "localization_mode": LaunchConfiguration("localization_mode"),
+                    "overrides_file": LaunchConfiguration("nav2_overrides_file"),
                 }.items(),
             ),
             IncludeLaunchDescription(
@@ -46,6 +49,7 @@ def generate_launch_description():
                 launch_arguments={
                     "params_file": robot_params,
                     "enabled": LaunchConfiguration("enabled"),
+                    "start_legacy_navigator": LaunchConfiguration("start_legacy_navigator"),
                     "target_description": LaunchConfiguration("target_description"),
                     "enable_odom_adapter": LaunchConfiguration("enable_odom_adapter"),
                     "publish_camera_tf": LaunchConfiguration("publish_camera_tf"),

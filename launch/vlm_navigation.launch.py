@@ -16,6 +16,7 @@ def generate_launch_description():
         [
             DeclareLaunchArgument("params_file", default_value=params),
             DeclareLaunchArgument("enabled", default_value="false"),
+            DeclareLaunchArgument("start_legacy_navigator", default_value="true"),
             DeclareLaunchArgument("target_description", default_value="chair"),
             DeclareLaunchArgument("easy_case_mode", default_value="false"),
             DeclareLaunchArgument("scan_first", default_value="true"),
@@ -65,6 +66,7 @@ def generate_launch_description():
             Node(
                 package="vlm_nav",
                 executable="vlm_navigator",
+                condition=IfCondition(LaunchConfiguration("start_legacy_navigator")),
                 name="vlm_nav",
                 output="screen",
                 parameters=[

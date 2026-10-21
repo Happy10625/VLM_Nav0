@@ -177,7 +177,7 @@ def validate_frontier_decision(payload: Any, valid_ids: Iterable[int]) -> Fronti
     return FrontierDecision(selected, confidence, reason.strip()[:199])
 
 
-def build_prompt(
+def build_grounding_prompt(
     target: str, width: int, height: int, normalized_1000: bool = False
 ) -> str:
     coordinate_instruction = (
@@ -224,12 +224,19 @@ def build_prompt(
         "must be on solid visible material of the most discriminative required qualifier, or on the "
         "main object when no qualifier exists. Never place either pixel in holes, cutouts, gaps, or openings, "
         "or on background visible through the target. "
+    )
+
+
+def build_prompt(target: str, width: int, height: int, normalized_1000: bool = False) -> str:
+    return build_grounding_prompt(target,width,height,normalized_1000) + (
         "The JSON object must contain exactly these seven fields: target_visible (boolean), "
         "object_match (boolean), qualifier_match (boolean), relation_match (boolean), confidence "
         "(number from 0.0 to 1.0), target_pixel ({u: integer, v: integer} or null), evidence_pixel "
         "({u: integer, v: integer} or null). Each non-null pixel must be a JSON object "
-        "with exactly the keys u and v, never an array. When not visible return target_pixel=null and "
-        "evidence_pixel=null. Never output velocities, "
+        "with exactly the keys u and v, never an array. When the complete target is not visible, "
+        "return exactly {\"target_visible\":false,\"object_match\":false,"
+        "\"qualifier_match\":false,\"relation_match\":false,\"confidence\":0.0,"
+        "\"target_pixel\":null,\"evidence_pixel\":null}. Never output velocities, "
         "steering commands, prose, or fields outside the schema. Return exactly one valid JSON "
         "object matching the requested fields."
     )

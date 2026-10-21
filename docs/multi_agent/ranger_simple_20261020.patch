@@ -1,0 +1,923 @@
+--- a/cooperative_ws/src/multi_agent_nav/config/robot_go2.yaml
++++ b/cooperative_ws/src/multi_agent_nav/config/robot_go2.yaml
+@@ -49,10 +49,10 @@
+ camera_calibrated: true
+ peer_obstacle_verified: false
+ vision_validated: false
+-exploration_strategy: fixed_viewpoints
++exploration_strategy: generated_candidates_vlm
+ experiment_records_root: /home/isee-pst/unitree_ros2/VLM_Nav/build/go2-vlm-experiments
+ generated_candidates:
+-  semantic_yaml: /home/isee-pst/unitree_ros2/VLM_Nav/maps/lab_rear120_20261001_IwQjMX/semantic_map.yaml
++  semantic_yaml: ''
+   # Distance from each furniture edge midpoint to the robot center; not field certified.
+   observation_distance: 1.0
+ # Matches the existing Nav2 footprint_padding; generated scans use its full rotation disk.
+--- a/cooperative_ws/src/multi_agent_nav/config/robot_ranger.yaml
++++ b/cooperative_ws/src/multi_agent_nav/config/robot_ranger.yaml
+@@ -29,7 +29,7 @@
+ costmap_max_age: 1.0
+ goal_costmap_max_age: 3.0
+ costmap_blocked_cost: 253
+-stop_margin: null
++stop_margin: 0.20
+ stationary_linear_speed: 0.03
+ stationary_angular_speed: 0.05
+ stationary_duration: 0.5
+@@ -57,7 +57,7 @@
+ camera_calibrated: false
+ vision_validated: false
+ peer_obstacle_verified: false
+-exploration_strategy: fixed_viewpoints
++exploration_strategy: generated_candidates_vlm
+ experiment_records_root: /home/isee601/ws/VLM_Nav/build/ranger-local/experiments
+ generated_candidates:
+   semantic_yaml: ''
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/adapters/vision.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/adapters/vision.py
+@@ -124,15 +124,17 @@
+         allowed=[p['display_id'] for p in snapshot['candidates']]
+         # Only this whitelist leaves the process: geometry and internal IDs stay local.
+         context={k:snapshot.get(k) for k in ('task_id','decision_id','main_target','search_hint','history')}
+-        context.update(allowed_candidate_ids=allowed,
++        annotated=bool(snapshot.get('furniture_annotated',True))
++        context.update(allowed_candidate_ids=allowed,furniture_annotated=annotated,
+             legend='Blue circle/arrow: robot. Orange P IDs: selectable. Gray: observed, cannot select.',
+-            images=['occupancy map','furniture semantic map'])
++            images=['occupancy map','furniture semantic map' if annotated else 'unannotated candidate map'])
+         content=[dict(type='text',text=json.dumps(context,ensure_ascii=False))]
+         for path in snapshot['images']:
+             data=base64.b64encode(Path(path).read_bytes()).decode('ascii')
+             content.append(dict(type='image_url',image_url=dict(url='data:image/png;base64,'+data)))
+         messages=[dict(role='system',content=(
+-            '根据搜索目标、家具语义、蓝色机器人位置和已观察记录，选择图中下一橙色观察点。'
++            '根据搜索目标、地图、蓝色机器人位置和已观察记录，选择图中下一橙色观察点。'
++            '有家具标注时可参考；未标注时不得推断家具名称或位置。'
+             '仅允许本轮 allowed_candidate_ids；灰色已观察点不可选。'
+             '历史P编号仅对应历史决策，不代表本轮同名点。'
+             '只返回JSON，字段恰为candidate_id和reason。不要生成坐标，不判断运动安全，不宣布目标不存在。'
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/agent.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/agent.py
+@@ -34,7 +34,8 @@
+         self.transit_goal = None
+         self.private = context.common_frame_id == context.alignment_id == ''
+         self.local_observations = {}
+-        self.exit_point = None
++        self.deposit_observation = None
++        self.deposit_command_id = ''
+         self.task_started_at = 0.
+ 
+     def state(self):
+@@ -60,12 +61,8 @@
+         return True
+ 
+     def _plan(self):
+-        if self.private and self.command.kind != 'EXIT':
++        if self.private:
+             self.effects.append(Effect('LOCAL_EXECUTE'))
+-            return
+-        if self.private:
+-            self.selected_goal=Pose2D(*self.exit_point)
+-            self.effects.append(Effect('PLAN',self.selected_goal))
+             return
+         if self.command.kind.startswith('APPROACH'):
+             self.effects.append(Effect('APPROACH', (self.frame.to_local(self.command.object_position), list(self.excluded))))
+@@ -98,6 +95,7 @@
+             self._state.reply = ''
+             self.command = None
+             self.local_observations.clear()
++            self.deposit_observation=None;self.deposit_command_id=''
+             self.effects.clear()
+             self.selected_goal=self.transit_goal=None
+             self.last_sequence = 0
+@@ -148,8 +146,6 @@
+             observation=self.local_observations.get(command.observation_id)
+             if not observation or observation.target_id!='C' or not observation.navigable:
+                 return CommandReply(False,'local C observation missing/invalid')
+-        if self.private and command.kind=='EXIT' and not self.exit_point:
+-            return CommandReply(False,'local exit point missing')
+         if command.kind in ('APPROACH_DEPOSIT','EXIT') and (self.phase != 'DEPOSIT' or not self._state.ready):
+             return CommandReply(False, 'deposit requires READY and deposit phase')
+         if self.paused or self._state.run_state == 'STOPPING':
+@@ -158,9 +154,14 @@
+             return CommandReply(False, 'one active command')
+         if not self._state.stopped or not self.health.motion_terminal:
+             return CommandReply(False, 'previous motion not stopped')
+-        if command.kind == 'EXIT' and (not self._state.deposited or command.token != self._state.token or
+-                command.parent_command_id != self._state.permit_command_id or command.resource_id != self._state.resource_id):
+-            return CommandReply(False, 'EXIT must preserve deposit permit identity')
++        if command.kind == 'EXIT':
++            parent=self.deposit_command_id if self.private else self._state.permit_command_id
++            if (not self._state.deposited or command.token != self._state.token or
++                    command.parent_command_id != parent or command.resource_id != self._state.resource_id):
++                return CommandReply(False, 'EXIT must preserve deposit identity')
++        if self.private and command.kind=='APPROACH_DEPOSIT':
++            self.deposit_observation=self.local_observations[command.observation_id]
++            self.deposit_command_id=command.command_id
+         self.command, self.last_sequence = command, command.sequence
+         self.retry, self.excluded = 0, []
+         self._state.command_id, self._state.sequence = command.command_id, command.sequence
+@@ -206,7 +207,7 @@
+                 self._state.requested_command_id = self.command.command_id
+                 self._state.run_state = 'WAITING_RESOURCE'
+                 return
+-        if self.command.kind == 'APPROACH_DEPOSIT' and not self.transit_goal and self._state.resource_id != 'basket':
++        if not self.private and self.command.kind == 'APPROACH_DEPOSIT' and not self.transit_goal and self._state.resource_id != 'basket':
+             self._state.requested_resource = 'basket'
+             self._state.requested_command_id = self.command.command_id
+             self._state.run_state = 'WAITING_RESOURCE'
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/config.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/config.py
+@@ -62,12 +62,13 @@
+         errors.append(f'{robot_id}: map identity/version missing')
+     errors+=map_file_gates(config,robot_id,check_map_files)
+     if motion:
+-        errors+=region_errors(config['scene'].get('resources'))
++        if config['scene'].get('share_c_coordinates',True) or config.get('coordinate_mode')=='local_only':
++            errors+=region_errors(config['scene'].get('resources'))
+         margin=go2.get('stop_margin')
+         if not isinstance(margin,(int,float)) or not math.isfinite(margin) or margin<=0:
+             errors.append('measured positive stop margin missing')
+-        for flag in ('costmap_source_verified','camera_calibrated'):
+-            if go2.get(flag) is not True:errors.append(f'{robot_id} {flag} field verification required')
++        if go2.get('costmap_source_verified') is not True:
++            errors.append(f'{robot_id} costmap_source_verified field verification required')
+         if not go2.get('costmap_topic'):errors.append(f'{robot_id} realtime costmap topic missing')
+         footprint=go2.get('footprint')
+         if not isinstance(footprint,list) or len(footprint)<3 or not all(valid_numbers(p,2) for p in footprint):
+@@ -161,15 +162,6 @@
+     if not robot.get('goal_costmap_topic'):errors.append(robot_id+': global costmap topic missing')
+     if robot.get('exploration_strategy')!='generated_candidates_vlm':
+         errors.append(robot_id+': cooperative generated_candidates_vlm strategy required')
+-    if not isinstance(scene.get('resources'),dict) or 'basket' not in scene['resources']:
+-        errors.append('basket resource polygon missing')
+-    if not valid_numbers(scene.get('exit_points',{}).get(robot_id),3):errors.append(robot_id+': local exit_points missing/invalid')
+-    resources=scene.get('resources')
+-    for name,region in (resources.items() if isinstance(resources,dict) else []):
+-        if not isinstance(region,dict):continue
+-        if name!='basket':
+-            exits=region.get('transit_exits',{}).get(robot_id,[])
+-            if not exits or not all(valid_numbers(p,3) for p in exits):errors.append(name+': local transit exits missing/invalid')
+     if any(not isinstance(scene.get('targets',{}).get(t),str) or not scene['targets'][t].strip() or
+             '现场填写' in scene['targets'][t] for t in ('A','B','C')):errors.append('measured A/B/C target descriptions missing')
+     return list(dict.fromkeys(errors))
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/coordinator.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/coordinator.py
+@@ -136,7 +136,7 @@
+         if self.phase == 'SEARCH_AB' and all(self.states[r].ready for r in ROBOTS) and not self.commands:
+             self.phase = 'SEARCH_C'
+         if self.phase == 'SEARCH_C':
+-            if 'basket' not in self.scene['resources'] or not self.private and any(r not in self.scene['exit_points'] for r in ROBOTS):
++            if not self.private and ('basket' not in self.scene['resources'] or any(r not in self.scene['exit_points'] for r in ROBOTS)):
+                 return output+self.pause('C region or exit geometry missing')
+             clue = next((o for o in self.observations.values() if o.target_id=='C' and o.navigable), None)
+             cached=all(any(o.robot_id==r and o.target_id=='C' and o.status=='CACHED' for o in self.observations.values()) for r in ROBOTS)
+@@ -148,7 +148,7 @@
+         if self.phase == 'DEPOSIT' and all(self.states[r].deposited and self.states[r].exited and not self.states[r].token for r in ROBOTS) and not self.resources.held:
+             self.phase = 'DONE'
+             return output
+-        if self.resources:
++        if self.resources and not self.private:
+             output += self._resource_commands(now)
+         snapshot = Snapshot(self.phase, self.states, self.observations, self.reservations,
+             self.resources, self.commands, self.scene, now, self.received_at, self.rejected)
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/generated_candidates.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/generated_candidates.py
+@@ -46,21 +46,23 @@
+             raise ValueError('positive finite observation_distance required')
+         self.radius=rotation_radius(robot['footprint'],robot.get('footprint_padding',0.))
+         self.map_path=Path(robot['map_path']).resolve()
+-        self.semantic_path=Path(options['semantic_yaml']).resolve()
++        self.semantic_path=Path(options['semantic_yaml']).resolve() if options.get('semantic_yaml') else None
+         info=map_file_info(self.map_path)
+         identity=config['alignment']['robots'][robot_id]
+         if (info['map_digest']!=robot['map_digest'] or identity['map_version']!='sha256:'+info['map_digest']):
+             raise ValueError('generated map identity mismatch')
+         source=yaml.safe_load(self.map_path.read_text())
+-        semantic=yaml.safe_load(self.semantic_path.read_text())
+-        if (not isinstance(semantic,dict) or semantic.get('schema_version')!=1 or semantic.get('source_robot')!=robot_id
+-                or semantic.get('frame_id')!='map' or semantic.get('units')!='meters'):
+-            raise ValueError('invalid semantic map frame/schema')
+-        for key in ('yaml_sha256','image_sha256'):
+-            if semantic['source_map'][key]!=info[key]:raise ValueError('semantic source digest mismatch')
+-        for key,other in (('yaml','yaml_path'),('image','image_path')):
+-            if Path(semantic['source_map'][key]).resolve()!=Path(info[other]):
+-                raise ValueError('semantic source path mismatch')
++        semantic={'furniture':[]}
++        if self.semantic_path is not None:
++            semantic=yaml.safe_load(self.semantic_path.read_text())
++            if (not isinstance(semantic,dict) or semantic.get('schema_version')!=1 or semantic.get('source_robot')!=robot_id
++                    or semantic.get('frame_id')!='map' or semantic.get('units')!='meters'):
++                raise ValueError('invalid semantic map frame/schema')
++            for key in ('yaml_sha256','image_sha256'):
++                if semantic['source_map'][key]!=info[key]:raise ValueError('semantic source digest mismatch')
++            for key,other in (('yaml','yaml_path'),('image','image_path')):
++                if Path(semantic['source_map'][key]).resolve()!=Path(info[other]):
++                    raise ValueError('semantic source path mismatch')
+         if (source.get('mode','trinary')!='trinary' or source.get('negate') not in (0,1)
+                 or not valid_numbers(source.get('origin'),3)
+                 or not valid_numbers([source.get('resolution')],1) or source['resolution']<=0
+@@ -107,8 +109,20 @@
+                 if any(math.hypot(x-p['pose'][0],y-p['pose'][1])<source['resolution'] for p in self.points):continue
+                 self.points.append(dict(id=f'{fid}/edge_{index}',furniture_id=fid,
+                                         pose=[x,y,math.atan2(-ny,-nx)],side=index))
++        if not self.furniture:
++            resolution=source['resolution']
++            stride=max(1,math.ceil(max(distance,2*self.radius)/resolution))
++            edge=math.ceil(self.radius/resolution)
++            ox,oy,yaw=source['origin'];c,s=math.cos(yaw),math.sin(yaw)
++            # shortcut: fixed spacing may miss narrow pockets; sample more densely if field coverage requires it.
++            for gy in range(edge,self.raw.shape[0]-edge,stride):
++                for gx in range(edge,self.raw.shape[1]-edge,stride):
++                    mx,my=(gx+.5)*resolution,(gy+.5)*resolution
++                    if not circle_free(self.raw,mx,my,self.radius,resolution,lambda cells:cells>=253):continue
++                    self.points.append(dict(id=f'free/{gx}/{gy}',furniture_id='free_space',
++                        pose=[ox+c*mx-s*my,oy+s*mx+c*my,yaw],side=0))
+         self.digests={path:hashlib.sha256(path.read_bytes()).hexdigest()
+-                      for path in (self.map_path,Path(info['image_path']),self.semantic_path)}
++                      for path in (self.map_path,Path(info['image_path']),self.semantic_path) if path is not None}
+ 
+     def unchanged(self):
+         return all(hashlib.sha256(path.read_bytes()).hexdigest()==digest for path,digest in self.digests.items())
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/go2_exploration.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/go2_exploration.py
+@@ -75,14 +75,14 @@
+ def explore_steps(adapter, config, frame, deadline, target, record, owners,
+             stop, before_motion, clock=time.monotonic, *, robot_id='go2', target_id='A',
+             success_radius=None, require_navigation_success=False, task_id=None, command_id=None,
+-            on_observation=None, initial_observation=None, resource_permits=lambda: {}):
++            on_observation=None, initial_observation=None):
+     if robot_id not in ('go2','ranger') or target_id not in ('A','B','C'):
+         raise ValueError('unknown robot or target ID')
+     original_record=record
+     def record(event):
+         original_record(dict(event,robot_id=robot_id,target_id=target_id,
+             common_frame_id=frame.ids[2],local_map_id=frame.ids[0],map_version=frame.ids[1]))
+-    guard = RegionGuard(config['scene']['resources'], config['robot_'+robot_id]['stop_margin'])
++    guard = RegionGuard({} if require_navigation_success else config['scene']['resources'], config['robot_'+robot_id]['stop_margin'])
+     task_id = task_id or robot_id+'_explore/' + uuid.uuid4().hex
+     main_command_id = command_id
+     cooperative = require_navigation_success
+@@ -141,7 +141,7 @@
+         else:
+             checked = replace(health, path_valid=True)
+             checked_path = path if path is not None else [health.pose]
+-        decision = guard.check(health.pose, health.footprint, checked_path, resource_permits(), checked)
++        decision = guard.check(health.pose, health.footprint, checked_path, {}, checked)
+         if decision.action != 'ALLOW':
+             raise ExplorationStopped(decision.reason or 'protected resource requires coordinator permit')
+         return health, acquired
+@@ -164,32 +164,10 @@
+             yield None
+ 
+     def path_decision(path,health):
+-        return guard.check(health.pose,health.footprint,path,resource_permits(),replace(health,path_valid=True))
++        return guard.check(health.pose,health.footprint,path,{},replace(health,path_valid=True))
+ 
+     def path_possible(path,health):
+-        decision=path_decision(path,health)
+-        return decision.action=='ALLOW' or (cooperative and decision.action=='REQUEST' and
+-            (decision.resource_id!='basket' or initial_observation is not None))
+-
+-    def permit_path(path,goal):
+-        while cooperative:
+-            health,_=health_check()
+-            decision=path_decision(path,health)
+-            if initial_observation is not None and 'basket' not in resource_permits() and decision.action=='ALLOW':
+-                yield dict(resource_id='basket',path=path,goal=goal)
+-                continue
+-            if decision.action=='ALLOW':return
+-            if decision.action!='REQUEST' or decision.resource_id=='basket' and initial_observation is None:
+-                raise ExplorationStopped(decision.reason or 'unpermitted path')
+-            yield dict(resource_id=decision.resource_id,path=path,goal=goal)
+-            future=adapter.compute_path(goal)
+-            while not future.done():
+-                health_check()
+-                yield None
+-            result=future.result()
+-            if not result.reachable or not result.path:raise ExplorationStopped('path after permit unavailable')
+-            if path_accept is not None and not path_accept(result):raise ExplorationStopped('path endpoint budget changed after permit')
+-            path=result.path
++        return path_decision(path,health).action=='ALLOW'
+ 
+     def parking_free(goal, observation=True):
+         free=adapter.costmap_candidate_free(goal,global_goal=True)
+@@ -267,7 +245,6 @@
+                 or not path_possible(result.path,health) or cooperative and not path_accept(result)):
+             emit('APPROACH_UNREACHABLE', reason='target reference path rejected' if direct else 'standoff footprint/path rejected')
+             return 'APPROACH_UNREACHABLE'
+-        yield from permit_path(result.path,goal)
+         current['pose'] = [goal.x, goal.y, goal.yaw]
+         emit('APPROACH_SELECTED', approach_method=method,
+              **({'requested_goal':asdict(goal)} if direct else {'standoff_distance':distance}))
+@@ -351,7 +328,11 @@
+         epoch = getattr(adapter, 'selection_epoch', 0)
+         if not catalog_unchanged():raise ExplorationStopped('selection map assets changed')
+         candidates = []
+-        for candidate in points:
++        ordered=points
++        if generated and not geometry.furniture:
++            pose=adapter.get_health().pose
++            ordered=sorted(points,key=lambda p:math.hypot(p['pose'][0]-pose.x,p['pose'][1]-pose.y))
++        for candidate in ordered:
+             if candidate['id'] not in state.eligible(clock()):
+                 continue
+             health, _ = health_check()
+@@ -398,7 +379,7 @@
+         if generated:
+             for index,candidate in enumerate(candidates,1):candidate['display_id']=f'P{index}'
+             health, _ = health_check()
+-            snapshot.update(history=history[-12:], images=render_selection(geometry,candidates,state.records,
++            snapshot.update(furniture_annotated=bool(geometry.furniture),history=history[-12:], images=render_selection(geometry,candidates,state.records,
+                 health.pose,adapter.selection_evidence_dir / decision_id))
+         else:
+             snapshot.update(targets=config['scene'].get('targets', {}),current_room=catalog['current_room'],
+@@ -491,7 +472,6 @@
+                          or point['id'] not in state.eligible(clock())):
+             raise ExplorationStopped('selection invalidated before navigation')
+         if semantic:update('executing')
+-        yield from permit_path(result.path,goal)
+         terminal = yield from navigate(goal, command_id, 'VIEWPOINT_NAV')
+         emit('ARRIVED' if terminal == 'SUCCEEDED' else 'NAV_FAILED', navigation_status=terminal, stop_confirmed=True)
+         if terminal != 'SUCCEEDED':
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/mock.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/mock.py
+@@ -28,13 +28,12 @@
+     machine=AgentMachine(context,frame,config['scene'].get('lost_timeout',3.0),
+         config[f'robot_{robot}'].get('path_start_timeout',1.0))
+     regions={}
+-    for key,region in config['scene']['resources'].items():
++    for key,region in (config['scene'].get('resources',{}).items() if not machine.private else []):
+         value=dict(region,polygon=frame.polygon_to_local(region['polygon']))
+         value['transit_exits']={r:[[p.x,p.y,p.yaw] for p in (frame.to_local(Pose2D(*point)) for point in points)]
+                                  for r,points in region.get('transit_exits',{}).items()}
+         regions[key]=value
+     machine.guard=RegionGuard(regions,config[f'robot_{robot}'].get('stop_margin'))
+-    machine.exit_point=config['scene'].get('exit_points',{}).get(robot)
+     return machine,frame
+ 
+ def make_coordinator(config,simulation,gates=None):
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/models.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/models.py
+@@ -217,6 +217,8 @@
+         if getattr(command, name) != getattr(context, name):
+             return CommandReply(False, f'{name} mismatch')
+     private = context.common_frame_id == context.alignment_id == ''
++    if private and command.action=='GRANT_RESOURCE':
++        return CommandReply(False,'private local task does not use resource grants')
+     if command.action == 'SYNC' and (command.kind == 'SYNC_LOCAL_C') != private:
+         return CommandReply(False, 'coordinate mode mismatch')
+     if command.action not in ('EXECUTE', 'SYNC', 'PAUSE', 'CANCEL', 'GRANT_RESOURCE'):
+@@ -225,7 +227,7 @@
+         if command.kind not in KINDS or command.phase not in PHASES:
+             return CommandReply(False, 'unknown kind/phase')
+         if private and (command.position_valid or command.common_goal != Pose2D() or
+-                command.object_position != Pose2D() or command.viewpoint_id):
++                command.object_position != Pose2D() or command.viewpoint_id or command.resource_id or command.token):
+             return CommandReply(False, 'private command must contain intent only')
+         if not private and not command.position_valid:
+             return CommandReply(False, 'position invalid')
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/planner.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/planner.py
+@@ -63,10 +63,9 @@
+             elif snapshot.phase=='DEPOSIT' and not state.exited:
+                 if robot=='ranger' and (not snapshot.states['go2'].exited or snapshot.states['go2'].token):continue
+                 if state.deposited:
+-                    actions.append(PlannedAction(robot,'EXIT',resource_id=state.resource_id,
+-                        token=state.token,parent_command_id=state.permit_command_id))
++                    actions.append(PlannedAction(robot,'EXIT',target_id='C',parent_command_id=state.command_id))
+                 else:
+                     clue=next(o for o in snapshot.observations.values() if o.robot_id==robot and o.target_id=='C' and o.status=='CACHED')
+                     actions.append(PlannedAction(robot,'APPROACH_DEPOSIT',target_id='C',
+-                        observation_id=clue.observation_id,resource_id='basket'))
++                        observation_id=clue.observation_id))
+         return actions
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/runner.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/runner.py
+@@ -24,7 +24,7 @@
+         self.config,self.success_radius=config,success_radius
+         self.owners=owners
+         if not math.isfinite(success_radius) or success_radius<=0:raise ValueError('positive success radius required')
+-        self.local_steps=self.transit_steps=None
++        self.local_steps=None
+         self.local_identity=None
+         self.now=0.
+         self.adapter.motion_guard=self.motion_guard
+@@ -58,73 +58,92 @@
+     def _start_local(self):
+         from .go2_exploration import explore_steps
+         machine=self.machine;command=machine.command
++        self.local_identity=(command.task_id,command.command_id)
++        machine._state.run_state='LOCAL_EXECUTING'
++        if command.kind=='EXIT':
++            self.local_steps=self._exit_steps()
++            return
+         config=dict(self.config)
+         robot=dict(config['robot_'+machine.context.robot_id])
+         robot['approach_on_detection']=command.kind!='SEARCH_VIEWPOINT'
+         robot['scan_angles']=[-(i+1)*math.pi/4 for i in range(8)]
+         config['robot_'+machine.context.robot_id]=robot
+-        self.local_identity=(command.task_id,command.command_id)
+-        machine._state.run_state='LOCAL_EXECUTING'
+         self.local_steps=explore_steps(self.adapter,config,machine.frame,
+             self.now+config['scene'].get('task_timeout',600.),self.descriptions[command.target_id],
+             self._record_local,self.owners,None,self.motion_guard,clock=lambda:self.now,
+             robot_id=machine.context.robot_id,target_id=command.target_id,
+             success_radius=self.success_radius,require_navigation_success=True,
+             task_id=command.task_id,command_id=command.command_id,on_observation=self._local_observation,
+-            initial_observation=machine.local_observations.get(command.observation_id) if command.kind=='APPROACH_DEPOSIT' else None,
+-            resource_permits=lambda:{machine._state.resource_id:machine._state.token} if machine._state.token else {})
+-
+-    def _resource(self,request):
+-        from .go2_exploration import ExplorationStopped
+-        machine=self.machine;state=machine._state;command=machine.command
+-        resource=request['resource_id']
+-        state.requested_resource=resource;state.requested_command_id=command.command_id
+-        state.run_state='WAITING_RESOURCE'
+-        while state.resource_id!=resource or not state.token:yield None
+-        if resource=='basket':
+-            state.run_state='LOCAL_EXECUTING'
+-            return
+-        exit_goal=machine.guard.transit_exit(resource,machine.context.robot_id,request['path'])
+-        if exit_goal is None:raise ExplorationStopped('missing local door transit exit')
+-        future=self.adapter.compute_path(exit_goal)
+-        while not future.done():yield None
+-        result=future.result();health=self.adapter.get_health()
+-        if not result.reachable or not result.path or machine.guard.check(health.pose,health.footprint,result.path,
+-                {resource:state.token},replace(health,path_valid=True)).action!='ALLOW':
+-            raise ExplorationStopped('door transit path rejected')
+-        goal_id=self.adapter.start_navigation(exit_goal,command.task_id,command.command_id,'DOOR_TRANSIT')
+-        machine.navigation_started(goal_id,'DOOR_TRANSIT',self.now)
++            initial_observation=machine.local_observations.get(command.observation_id) if command.kind=='APPROACH_DEPOSIT' else None)
++
++    def _exit_steps(self):
++        from .generated_candidates import rotation_radius
++        from .config import valid_numbers
++        machine=self.machine;command=machine.command
++        robot=self.config['robot_'+machine.context.robot_id]
++        target=machine.deposit_observation.common_position
++        required=self.success_radius+rotation_radius(self.adapter.get_health().footprint,
++            robot.get('footprint_padding',0.))+robot['stop_margin']
++        def wait(future):
++            expires=self.now+15.
++            while not future.done():
++                if self.now>=expires:
++                    future.cancel();raise RuntimeError('exit planning timeout')
++                yield None
++            return future.result()
++        parameters=yield from wait(self.adapter.read_approach_parameters())
++        values=[parameters.get('xy_goal_tolerance'),parameters.get('planner_tolerance')]
++        safety=robot.get('approach_safety_margin',.02)
++        if not valid_numbers(values,2) or min(values)<0 or not valid_numbers([safety],1) or safety<0:
++            raise RuntimeError('invalid actual exit tolerances')
++        budget=required+values[0]+safety
++        def path_accept(result):
++            return (result.reachable and bool(result.path) and all(p.valid for p in result.path) and
++                math.hypot(result.path[-1].x-target.x,result.path[-1].y-target.y)>=budget and
++                self.adapter.approach_candidate_free(result.path[-1]))
++        # Sample just outside the budget so floating-point subtraction cannot move it inside.
++        approach=yield from wait(self.adapter.select_approach(target,[],standoff_distance=budget+1e-6,path_accept=path_accept))
++        if approach.goal is None:raise RuntimeError('no reachable local exit')
++        result=yield from wait(self.adapter.compute_path(approach.goal))
++        health=self.adapter.get_health()
++        if not path_accept(result) or not health.stopped or not health.motion_terminal:
++            raise RuntimeError('exit path/stop prerequisites invalid')
++        goal_id=self.adapter.start_navigation(approach.goal,command.task_id,command.command_id,'EXIT_NAV')
++        machine.navigation_started(goal_id,'EXIT_NAV',self.now)
++        expires=self.now+self.config['scene'].get('task_timeout',600.)
+         terminal=None
+         while terminal is None:
++            if self.now>=expires:raise RuntimeError('exit navigation timeout')
+             yield None
+             while self.adapter.results:
+-                reply=self.adapter.results.popleft()
+-                if (reply.task_id,reply.command_id,reply.goal_id,reply.goal_kind)==(
+-                        command.task_id,command.command_id,goal_id,'DOOR_TRANSIT'):terminal=reply.status
+-        if terminal!='SUCCEEDED':raise ExplorationStopped('door transit failed: '+terminal)
+-        state.goal_id='';state.run_state='TRANSIT_STOP'
+-        while state.token or not self.adapter.get_health().stopped or not self.adapter.get_health().motion_terminal:yield None
+-        state.run_state='LOCAL_EXECUTING'
++                result=self.adapter.results.popleft()
++                if (result.task_id,result.command_id,result.goal_id,result.goal_kind)==(
++                        command.task_id,command.command_id,goal_id,'EXIT_NAV'):terminal=result.status
++        if terminal!='SUCCEEDED':raise RuntimeError('exit navigation: '+terminal)
++        while True:
++            health=self.adapter.get_health()
++            if health.stopped and health.motion_terminal:break
++            if self.now>=expires:raise RuntimeError('exit stop unconfirmed')
++            yield None
++        if not health.pose.valid or math.hypot(health.pose.x-target.x,health.pose.y-target.y)<required:
++            raise RuntimeError('actual local exit clearance not reached')
++        return 'EXITED'
+ 
+     def _advance_local(self):
+         machine=self.machine;command=machine.command
+         if machine.paused or not command or self.local_identity!=(command.task_id,command.command_id):
+             self.local_steps.close();self.local_steps=None
+-            if self.transit_steps:self.transit_steps.close();self.transit_steps=None
+             return
+         if machine.peer_received is None:return
+         try:
+-            if self.transit_steps:
+-                try:next(self.transit_steps)
+-                except StopIteration:self.transit_steps=None
+-                return
+-            request=next(self.local_steps)
+-            if request:self.transit_steps=self._resource(request)
++            next(self.local_steps)
+         except StopIteration as completed:
+             self.local_steps=None
+             health=self.adapter.get_health()
+             if not health.stopped or not health.motion_terminal:machine.stop('local completion stop unconfirmed');return
+-            if completed.value=='TARGET_APPROACHED' and command.kind in ('APPROACH_PICKUP','APPROACH_DEPOSIT'):
++            if completed.value=='EXITED' and command.kind=='EXIT':
++                machine._state.exited=True
++            elif completed.value=='TARGET_APPROACHED' and command.kind in ('APPROACH_PICKUP','APPROACH_DEPOSIT'):
+                 if command.kind=='APPROACH_PICKUP':machine._state.ready=True
+                 else:machine._state.deposited=True
+             elif completed.value!='TARGET_FOUND' or command.kind!='SEARCH_VIEWPOINT':
+@@ -133,7 +152,6 @@
+             machine._state.goal_id=''
+         except Exception as error:
+             self.local_steps.close();self.local_steps=None
+-            if self.transit_steps:self.transit_steps.close();self.transit_steps=None
+             machine.stop('local execution: '+str(error))
+ 
+     def tick(self,now):
+@@ -181,7 +199,6 @@
+             command=self.machine.command
+             if effect.kind=='STOP':
+                 if self.local_steps:self.local_steps.close();self.local_steps=None
+-                if self.transit_steps:self.transit_steps.close();self.transit_steps=None
+                 for future,*_ in self.pending:future.cancel()
+                 self.pending.clear()
+                 goal_id,reason=effect.payload
+--- a/cooperative_ws/src/multi_agent_nav/tests/test_field_preparation.py
++++ b/cooperative_ws/src/multi_agent_nav/tests/test_field_preparation.py
+@@ -61,7 +61,7 @@
+ 
+ @pytest.mark.parametrize('resources',[None,[],{'door':{'polygon':[[0,0],[1,0]]}}])
+ def test_independent_motion_rejects_missing_or_malformed_resources(resources):
+-    c=load_config();c['scene']['resources']=resources
++    c=load_config();c['scene']['resources']=resources;c['coordinate_mode']='local_only'
+     assert any('resource' in e for e in go2_local_gates(c,motion=True))
+ 
+ def test_actual_costmap_vetoes_static_free_map_and_bad_updates():
+--- a/cooperative_ws/src/multi_agent_nav/tests/test_generated_candidates.py
++++ b/cooperative_ws/src/multi_agent_nav/tests/test_generated_candidates.py
+@@ -81,6 +81,33 @@
+         else:doc['source_map']['image_sha256']='wrong'
+         path.write_text(yaml.safe_dump(doc))
+     with pytest.raises(ValueError):GeneratedCandidates(generated_config)
++
++
++@pytest.mark.parametrize('origin_yaw,first_xy',[(0.,[-4.45,-4.45]),(.4,[-4.707596541,-4.279236365])])
++def test_unannotated_map_generates_free_rotation_candidates(generated_config,origin_yaw,first_xy):
++    from multi_agent_nav.generated_candidates import GeneratedCandidates,circle_free
++    from multi_agent_nav.config import map_file_info
++    robot=generated_config['robot_go2'];robot['generated_candidates']['semantic_yaml']=''
++    path=Path(robot['map_path']);source=yaml.safe_load(path.read_text());source['origin'][2]=origin_yaw
++    path.write_text(yaml.safe_dump(source));info=map_file_info(path)
++    robot['map_digest']=info['map_digest']
++    generated_config['alignment']['robots']['go2']['map_version']='sha256:'+info['map_digest']
++    catalog=GeneratedCandidates(generated_config)
++    assert catalog.points and catalog.furniture==[] and catalog.semantic_path is None
++    assert catalog.points[0]['pose'][:2]==pytest.approx(first_xy,abs=1e-8)
++    assert len({p['id'] for p in catalog.points})==len(catalog.points)
++    for point in catalog.points:
++        x,y=catalog.map_xy(*point['pose'][:2])
++        assert circle_free(catalog.raw,x,y,catalog.radius,.1,lambda cells:cells>=253)
++    assert catalog.unchanged()
++    Path(info['image_path']).write_bytes(b'changed')
++    assert not catalog.unchanged()
++
++
++def test_explicit_missing_annotation_is_not_silently_ignored(generated_config,tmp_path):
++    from multi_agent_nav.generated_candidates import GeneratedCandidates
++    generated_config['robot_go2']['generated_candidates']['semantic_yaml']=str(tmp_path/'missing.yaml')
++    with pytest.raises(OSError):GeneratedCandidates(generated_config)
+ 
+ 
+ def test_dual_images_have_identical_marks_and_do_not_write_map(generated_config,tmp_path):
+@@ -202,7 +229,8 @@
+     assert not any(e.get('observation_status')=='observed' for e in rows)
+ 
+ 
+-def test_candidate_api_sends_only_two_images_ids_and_history(monkeypatch,tmp_path):
++@pytest.mark.parametrize('annotated',[True,False])
++def test_candidate_api_sends_only_two_images_ids_and_history(monkeypatch,tmp_path,annotated):
+     from multi_agent_nav.adapters.go2 import ABCClient
+     from vlm_nav.vlm_client import OpenAICompatibleVLMClient
+     client=ABCClient.__new__(ABCClient);client.client=S(api_key='secret')
+@@ -213,7 +241,7 @@
+         captured.extend(messages)
+         return S(choices=[S(message=S(content='{"candidate_id":"P1","reason":"side"}'))])
+     monkeypatch.setattr(OpenAICompatibleVLMClient,'_completion',completion)
+-    reply=client.choose_candidate(dict(images=list(map(str,images)),task_id='task',decision_id='decision',
++    reply=client.choose_candidate(dict(images=list(map(str,images)),task_id='task',decision_id='decision',furniture_annotated=annotated,
+         main_target='target',candidates=[dict(display_id='P1',id='internal',pose=[1.,2.,3.])],
+         furniture=[dict(id='table',polygon=[[1.,2.],[3.,4.]])],history=[],records={'internal':{'pose':[1,2,3]}}))
+     assert reply['candidate_id']=='P1'
+@@ -221,6 +249,7 @@
+     text=captured[1]['content'][0]['text']
+     assert 'internal' not in text and 'pose' not in text and 'polygon' not in text
+     assert json.loads(text)['allowed_candidate_ids']==['P1']
++    assert json.loads(text)['furniture_annotated'] is annotated
+ 
+ 
+ @pytest.mark.parametrize('raw',[
+--- a/cooperative_ws/src/multi_agent_nav/tests/test_go2_exploration.py
++++ b/cooperative_ws/src/multi_agent_nav/tests/test_go2_exploration.py
+@@ -252,7 +252,7 @@
+     (tmp_path/'map.pgm').write_bytes(b'fixture')
+     config['robot_go2'].update(map_path=str(map_path),map_digest=map_file_info(map_path)['map_digest'],
+         costmap_source_verified=True,camera_calibrated=True,path_topic='/fixture/path',
+-        path_source_verified=False,stop_margin=.1,scan_angles=[0.])
++        path_source_verified=False,stop_margin=.1,scan_angles=[0.],exploration_strategy='fixed_viewpoints')
+     config['scene']['viewpoints']['go2']=[{'id':'point_one','pose':[1.,0.,0.]}]
+     config['scene']['resources']={'basket':{'polygon':[[100,100],[102,100],[102,102],[100,102]]}}
+     now=[0.];destroyed=[False];published=[];passive_polls=[]
+--- a/cooperative_ws/src/multi_agent_nav/tests/test_private_c.py
++++ b/cooperative_ws/src/multi_agent_nav/tests/test_private_c.py
+@@ -84,23 +84,11 @@
+     assert not machine.accept(replace(command,phase='DEPOSIT',kind='APPROACH_DEPOSIT',target_id='C',observation_id='own-b'),0).accepted
+ 
+ 
+-def test_release_requires_resource_identity_as_well_as_parent_and_token():
+-    _,machine,_,command=local_agent()
+-    machine._state.resource_id='basket';machine._state.token='token';machine._state.permit_command_id='deposit'
+-    release=replace(command,action='GRANT_RESOURCE',kind='RELEASE',token='token',parent_command_id='deposit',resource_id='door')
+-    assert not machine.accept(release,0).accepted
+-    assert machine.state().token=='token'
+-
+-
+-def test_held_basket_token_cannot_be_replaced_by_another_grant():
+-    _,machine,_,command=local_agent()
+-    assert machine.accept(command,0).accepted
+-    state=machine._state
+-    state.resource_id='basket';state.token='basket-token';state.permit_command_id='b'
+-    state.requested_resource='door'
+-    grant=replace(command,action='GRANT_RESOURCE',resource_id='door',token='door-token',parent_command_id='b')
++def test_private_rejects_legacy_resource_grants():
++    _,machine,_,command=local_agent()
++    grant=replace(command,action='GRANT_RESOURCE',resource_id='basket',token='legacy',parent_command_id='b')
+     assert not machine.accept(grant,0).accepted
+-    assert machine.state().token=='basket-token'
++    assert machine.state().token==machine.state().resource_id==''
+ 
+ 
+ def test_full_private_mission_keeps_ready_barrier_and_order_without_coordinate_messages():
+@@ -114,7 +102,7 @@
+     for robot,deposit in deposits:
+         assert deposit.observation_id.startswith(robot+'/')
+         exit_command=next(c for r,c in mission.executed if r==robot and c.kind=='EXIT')
+-        assert exit_command.parent_command_id == deposit.command_id and exit_command.token
++        assert exit_command.parent_command_id == deposit.command_id and exit_command.token==''
+     assert not mission.coordinator.resources.held
+     for robot,command in mission.executed:
+         assert not command.position_valid and command.common_goal==command.object_position==Pose2D()
+@@ -175,7 +163,7 @@
+     if endpoint!=.7:assert not any(kind=='PICKUP_NAV' for kind,_,_ in adapter.calls)
+ 
+ 
+-def test_private_door_exit_releases_then_resumes_same_main_command():
++def test_private_ignores_legacy_door_regions():
+     config=private_config()
+     config['scene']['resources']['door']={'polygon':[[-.5,-5],[.5,-5],[.5,5],[-.5,5]],
+         'transit_exits':{r:[[2,-3,0],[-2,-3,3.14]] for r in ROBOTS}}
+@@ -183,9 +171,8 @@
+     mission.run(1000)
+     assert mission.coordinator.phase=='DONE',mission.coordinator.reason
+     calls=mission.adapters['go2'].calls
+-    assert 'DOOR_TRANSIT' in [kind for kind,_,_ in calls]
+-    transit=next(c for kind,_,c in calls if kind=='DOOR_TRANSIT')
+-    assert transit in [c for kind,_,c in calls if kind=='DEPOSIT_NAV']
++    assert 'DOOR_TRANSIT' not in [kind for kind,_,_ in calls]
++    assert any(kind=='DEPOSIT_NAV' for kind,_,_ in calls)
+     assert not mission.coordinator.resources.held
+ 
+ 
+@@ -226,14 +213,14 @@
+     assert machine.state().ready,machine.state().reason
+ 
+ 
+-def test_private_heartbeat_loss_pauses_with_held_resource_frozen():
++def test_private_heartbeat_loss_pauses_without_granting_ranger():
+     mission=MockMission(private_config());assert mission.start().accepted
+     for _ in range(600):
+         mission.step()
+-        if 'basket' in mission.coordinator.resources.held:break
+-    assert 'basket' in mission.coordinator.resources.held
++        if any(kind=='DEPOSIT_NAV' for kind,_,_ in mission.adapters['go2'].calls):break
+     mission.online['go2']=False;mission.run(60)
+-    assert mission.coordinator.phase=='PAUSED' and 'basket' in mission.coordinator.resources.held
++    assert mission.coordinator.phase=='PAUSED'
++    assert not any(r=='ranger' and c.kind=='APPROACH_DEPOSIT' for r,c in mission.executed)
+ 
+ 
+ def test_peer_private_state_uses_local_receipt_and_pauses_on_map_change():
+@@ -266,14 +253,14 @@
+ 
+ 
+ @pytest.mark.parametrize('resources',[['invalid'],'invalid',{'door':'invalid'}])
+-def test_private_live_config_reports_malformed_resource_geometry(resources):
++def test_private_live_config_does_not_inspect_removed_resource_geometry(resources):
+     from multi_agent_nav.config import load_config,live_gates
+     config=load_config();config['scene']['share_c_coordinates']=False
+     config['scene']['resources']=resources
+-    assert live_gates(config,local_robot='ranger')
+-
+-
+-def test_deposit_requires_basket_permit_even_if_cached_c_path_misses_polygon():
++    assert not any('resource' in reason or 'polygon' in reason for reason in live_gates(config,local_robot='ranger'))
++
++
++def test_deposit_never_requires_legacy_basket_permit():
+     config=private_config()
+     config['scene']['resources']['basket']['polygon']=[[50,50],[52,50],[52,52],[50,52]]
+     mission=MockMission(config);assert mission.start().accepted
+@@ -281,8 +268,8 @@
+         mission.step()
+         if any(kind=='DEPOSIT_NAV' for kind,_,_ in mission.adapters['go2'].calls):break
+     else:pytest.fail('deposit did not start')
+-    assert mission.machines['go2'].state().token
+-    assert 'basket' in mission.coordinator.resources.held
++    assert not mission.machines['go2'].state().token
++    assert not mission.coordinator.resources.held
+ 
+ 
+ def test_motion_ownership_is_local_and_allows_only_one_agent_observer():
+@@ -298,7 +285,8 @@
+ 
+ 
+ @pytest.mark.parametrize('robot_id',['go2','ranger'])
+-def test_cooperative_runner_uses_same_local_generated_candidate_core(generated_config,tmp_path,robot_id):
++@pytest.mark.parametrize('annotated',[True,False])
++def test_cooperative_runner_uses_same_local_generated_candidate_core(generated_config,tmp_path,robot_id,annotated):
+     from types import SimpleNamespace as S
+     import yaml
+     config=private_config()
+@@ -306,6 +294,7 @@
+     config['alignment']['robots'][robot_id].update(generated_config['alignment']['robots']['go2'])
+     semantic=tmp_path/'semantic.yaml';data=yaml.safe_load(semantic.read_text())
+     data['source_robot']=robot_id;semantic.write_text(yaml.safe_dump(data))
++    if not annotated:config['robot_'+robot_id]['generated_candidates']['semantic_yaml']=''
+     machine,frame=make_machine(config,robot_id,True)
+     target_id={'go2':'A','ranger':'B'}[robot_id]
+     adapter=FakeAdapter(robot_id,{target_id:Pose2D(3,-3),'C':Pose2D(3,3)},delay=.1)
+@@ -324,6 +313,7 @@
+         now=index*.05;machine.sync_received=machine.peer_received=now;runner.tick(now)
+     assert machine.state().ready,machine.state().reason
+     assert snapshots and snapshots[0]['candidates'][0]['display_id']=='P1'
++    assert snapshots[0]['furniture_annotated'] is annotated
+     assert [kind for kind,_,_ in adapter.calls]==['VIEWPOINT_NAV','PICKUP_NAV']
+     assert all(command_id=='pickup' for _,_,command_id in adapter.calls)
+     assert any(o.status=='CACHED' for o in emitted)
+--- a/cooperative_ws/src/multi_agent_nav/tests/test_robot_local_exploration.py
++++ b/cooperative_ws/src/multi_agent_nav/tests/test_robot_local_exploration.py
+@@ -20,7 +20,9 @@
+     assert report['configured_nav2_tolerances']=={'planner_tolerance':.76,'goal_xy_tolerance':.05}
+     assert report['common_frame_id']=='ranger_local_map' and report['motion_sent'] is False
+     assert report['map_files']['yaml_path'].endswith('/shared_maps/lab_ranger_20261006/lab.yaml')
+-    assert any('viewpoint' in error.lower() for error in report['single_robot_experiment_gates'])
++    assert report['exploration_strategy']=='generated_candidates_vlm'
++    assert not any('viewpoint' in error.lower() for error in report['single_robot_experiment_gates'])
++    assert report['semantic_search']['points']
+ 
+ 
+ def test_local_context_does_not_change_cooperative_alignment():
+--- /dev/null
++++ b/cooperative_ws/src/multi_agent_nav/tests/test_simplified_mission.py
+@@ -0,0 +1,96 @@
++"""Unannotated exploration and ordered C mission without protected regions."""
++from dataclasses import replace
++import math
++import pytest
++from multi_agent_nav.mock import MockMission
++from multi_agent_nav.models import Pose2D
++from test_private_c import private_config
++
++
++def simple_config():
++    config=private_config()
++    config['scene']['resources']={};config['scene']['exit_points']={}
++    return config
++
++
++def test_no_region_no_exit_points_mission_preserves_ready_and_deposit_order():
++    mission=MockMission(simple_config())
++    assert mission.start().accepted
++    go2_exited=False
++    for _ in range(800):
++        mission.step()
++        go2_exited=go2_exited or mission.machines['go2'].state().exited
++        if any(robot=='ranger' and command.kind=='APPROACH_DEPOSIT' for robot,command in mission.executed):
++            assert go2_exited
++        assert all(not m.state().token and not m.state().requested_resource for m in mission.machines.values())
++    assert mission.coordinator.phase=='DONE',mission.coordinator.reason
++    deposits=[(r,c) for r,c in mission.executed if c.kind=='APPROACH_DEPOSIT']
++    assert [r for r,c in deposits]==['go2','ranger']
++    for robot,deposit in deposits:
++        exit_command=next(c for r,c in mission.executed if r==robot and c.kind=='EXIT')
++        assert exit_command.parent_command_id==deposit.command_id
++        assert exit_command.resource_id==exit_command.token==''
++        health=mission.adapters[robot].get_health()
++        radius=max(math.hypot(*p) for p in health.footprint)
++        assert math.hypot(health.pose.x-9.,health.pose.y-1.)>=1.+radius+.1
++
++
++@pytest.mark.parametrize('fault',['far_not_reached','moving','aborted'])
++def test_exit_requires_actual_clearance_success_and_stopped_before_ranger(fault):
++    mission=MockMission(simple_config());adapter=mission.adapters['go2']
++    original=adapter.advance;health=adapter.get_health
++    def advance(now):
++        exiting=any(row[2].goal_kind=='EXIT_NAV' for row in adapter.active.values())
++        if exiting and fault=='aborted':adapter.aborts=10
++        original(now)
++        if exiting and not adapter.active:
++            adapter.path=[]
++            if fault=='far_not_reached':adapter.pose=Pose2D(8.3,1.)
++            if fault=='moving':adapter.get_health=lambda:replace(health(),stopped=False)
++    adapter.advance=advance
++    assert mission.start().accepted
++    mission.run(500)
++    assert any(kind=='EXIT_NAV' for kind,_,_ in adapter.calls)
++    assert not mission.machines['go2'].state().exited
++    assert not any(r=='ranger' and c.kind=='APPROACH_DEPOSIT' for r,c in mission.executed)
++
++
++def test_camera_confirmation_is_evidence_not_startup_gate():
++    from multi_agent_nav.config import load_config,robot_local_gates
++    config=load_config();config['robot_ranger']['camera_calibrated']=False
++    errors=robot_local_gates(config,'ranger',motion=True,check_map_files=False)
++    assert not any('camera_calibrated' in error for error in errors)
++
++
++def test_private_gates_do_not_require_resource_or_exit_geometry(monkeypatch):
++    from multi_agent_nav.config import load_config,private_live_gates
++    import multi_agent_nav.go2_exploration as core
++    import multi_agent_nav.config as settings
++    config=load_config();config['scene'].update(enabled=True,resources={},exit_points={},share_c_coordinates=False)
++    config['robot_ranger'].update(exploration_strategy='generated_candidates_vlm',stop_margin=.2,
++        camera_calibrated=False,costmap_source_verified=True,path_source_verified=True,
++        peer_obstacle_verified=True,vision_validated=True)
++    monkeypatch.setattr(core,'exploration_gates',lambda *args:[])
++    monkeypatch.setattr(settings,'map_file_gates',lambda *args,**kwargs:[])
++    assert private_live_gates(config,'ranger')==[]
++
++
++def test_exit_sampling_does_not_lose_the_only_safe_direction_to_roundoff():
++    from test_private_c import local_agent
++    from multi_agent_nav.models import Observation
++    from multi_agent_nav.runner import AgentRunner
++    config,machine,adapter,command=local_agent()
++    config['robot_ranger'].update(stop_margin=.2,footprint_padding=.03)
++    health=adapter.get_health
++    adapter.get_health=lambda:replace(health(),footprint=[[.36,.25],[.36,-.25],[-.36,-.25],[-.36,.25]])
++    adapter.pose=Pose2D(8.19,1.)
++    adapter.approach_candidate_free=lambda point:point.y==1.
++    machine.phase='DEPOSIT';machine._state.ready=machine._state.deposited=True
++    machine.deposit_observation=Observation(target_id='C',status='DETECTED',position_valid=True,common_position=Pose2D(9,1))
++    machine.deposit_command_id='deposit'
++    command=replace(command,kind='EXIT',target_id='C',phase='DEPOSIT',command_id='exit',parent_command_id='deposit')
++    assert machine.accept(command,0).accepted
++    runner=AgentRunner(machine,adapter,config['scene']['targets'],lambda _:None,config=config)
++    for index in range(100):
++        now=index*.05;machine.sync_received=machine.peer_received=now;runner.tick(now)
++    assert machine.state().exited,machine.state().reason
+--- a/build/ranger-local/acceptance-20261015_161341/config/robot_go2.yaml
++++ b/build/ranger-local/acceptance-20261015_161341/config/robot_go2.yaml
+@@ -49,10 +49,10 @@
+ camera_calibrated: true
+ peer_obstacle_verified: false
+ vision_validated: false
+-exploration_strategy: fixed_viewpoints
++exploration_strategy: generated_candidates_vlm
+ experiment_records_root: /home/isee-pst/unitree_ros2/VLM_Nav/build/go2-vlm-experiments
+ generated_candidates:
+-  semantic_yaml: /home/isee-pst/unitree_ros2/VLM_Nav/maps/lab_rear120_20261001_IwQjMX/semantic_map.yaml
++  semantic_yaml: ''
+   # Distance from each furniture edge midpoint to the robot center; not field certified.
+   observation_distance: 1.0
+ # Matches the existing Nav2 footprint_padding; generated scans use its full rotation disk.
+--- a/build/ranger-local/acceptance-20261015_161341/config/robot_ranger.yaml
++++ b/build/ranger-local/acceptance-20261015_161341/config/robot_ranger.yaml
+@@ -57,7 +57,7 @@
+ camera_calibrated: true
+ vision_validated: false
+ peer_obstacle_verified: false
+-exploration_strategy: fixed_viewpoints
++exploration_strategy: generated_candidates_vlm
+ experiment_records_root: /home/isee601/ws/VLM_Nav/build/ranger-local/experiments
+ generated_candidates:
+   semantic_yaml: ''
+--- a/build/ranger-local/acceptance-20261015_161341/config/scene.yaml
++++ b/build/ranger-local/acceptance-20261015_161341/config/scene.yaml
+@@ -1,6 +1,7 @@
+ scenario_id: lab
+ enabled: false
+ simulation: false
++share_c_coordinates: false
+ targets:
+   A: 灭火器
+   B: 纸巾

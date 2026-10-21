@@ -1,0 +1,62 @@
+robot_id: go2
+map_path: /home/isee-pst/unitree_ros2/VLM_Nav/maps/lab_rear120_20261001_IwQjMX/lab.yaml
+map_digest: c9f354a26471032e7ff10b5898db627b65fce7526c28124891833b6a3a164c02
+domain_id: 0
+footprint:
+- - 0.38
+  - 0.18
+- - 0.38
+  - -0.18
+- - -0.38
+  - -0.18
+- - -0.38
+  - 0.18
+path_topic: /received_global_plan
+# controller_server confirmed; full field certification remains unmeasured.
+path_source_verified: false
+path_start_timeout: 1.0
+# Initial single-robot experiment value; no safety-derived timing claim.
+path_receive_timeout: 5.0
+pose_max_age: 1.0
+costmap_topic: /local_costmap/costmap_raw
+goal_costmap_topic: /global_costmap/costmap_raw
+# Initial goal-precheck budget for observed 1 Hz input and 2 s receipt gaps.
+goal_costmap_max_age: 3.0
+costmap_source_verified: true
+costmap_max_age: 1.0
+costmap_blocked_cost: 253
+stop_margin: 1.0
+stationary_linear_speed: 0.02
+stationary_angular_speed: 0.02
+stationary_duration: 0.5
+odom_max_age: 0.5
+odom_topic: /odometry
+cancel_timeout: 5.0
+scan_angles:
+- 0.0
+- 1.5707963267948966
+- 3.141592653589793
+- -1.5707963267948966
+standoff_distance: 0.9
+arrival_config_files:
+- /home/isee-pst/unitree_ros2/VLM_Nav/config/robot.yaml
+- /home/isee-pst/unitree_ros2/VLM_Nav/config/robot_go2.yaml
+model: null
+endpoint: null
+api_key_env: DASHSCOPE_API_KEY
+api_timeout: 20.0
+vision_mode: abc
+camera_calibrated: true
+peer_obstacle_verified: false
+vision_validated: false
+exploration_strategy: generated_candidates_vlm
+experiment_records_root: /home/isee-pst/unitree_ros2/VLM_Nav/build/go2-vlm-experiments
+generated_candidates:
+  semantic_yaml: ''
+  # Distance from each furniture edge midpoint to the robot center; not field certified.
+  observation_distance: 1.0
+# Matches the existing Nav2 footprint_padding; generated scans use its full rotation disk.
+footprint_padding: 0.0
+semantic_search:
+  observation_points: /home/isee-pst/unitree_ros2/VLM_Nav/maps/lab_rear120_20261001_IwQjMX/observation_points_go2.yaml
+  current_room: null

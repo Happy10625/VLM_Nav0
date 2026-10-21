@@ -1,0 +1,17 @@
+common_frame_id: lab_ref
+alignment_id: ''
+validated: false
+simulation: false
+report: null
+robots:
+  go2:
+    local_map_id: lab_rear120_20261001_IwQjMX
+    map_version: sha256:c9f354a26471032e7ff10b5898db627b65fce7526c28124891833b6a3a164c02
+    transform:
+    - 0.0
+    - 0.0
+    - 0.0
+  ranger:
+    local_map_id: lab_ranger_20261006
+    map_version: sha256:3bebc0aad79b9e3add860b33c59a1c7f98231341182103c8a20f1cdd9b43badb
+    transform: null

@@ -142,19 +142,7 @@ def test_package_declares_cpp_dependencies_and_pcl_filters_component():
 
 def test_every_python_test_is_registered_with_ament_cmake_pytest():
     cmake = (ROOT / "CMakeLists.txt").read_text()
-    expected = {
-        "test_arm_image_recorder.py",
-        "test_easy_case_config.py",
-        "test_exploration.py",
-        "test_fixed_map_config.py",
-        "test_geometry.py",
-        "test_latest_frame_worker.py",
-        "test_navigation_gate.py",
-        "test_pipeline.py",
-        "test_vlm_client.py",
-        "test_obstacle_chain_config.py",
-        "test_obstacle_cloud_filter_runtime.py",
-    }
+    expected = {path.name for path in (ROOT / 'test').glob('test_*.py')}
     registered = set(
         re.findall(r"ament_add_pytest_test\([^\s]+\s+test/([^\s\)]+)", cmake)
     )

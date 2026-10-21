@@ -4,10 +4,11 @@ from collections import deque
 from dataclasses import replace
 import json
 import math
+from pathlib import Path
 import queue
 import threading
 import time
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import cv2
 import numpy as np
@@ -26,6 +27,7 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import (
     DurabilityPolicy,
     HistoryPolicy,
@@ -35,20 +37,27 @@ from rclpy.qos import (
 )
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 from tf2_ros import Buffer, TransformException, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
 
+from .arrival import target_distance, stop_radius, arrival_decision
 from .geometry import (
     depth_at_pixel_with_reason,
     grid_to_world,
     normalize_angle,
     project_pixel,
+    RealSenseGeometry,
     scan_yaws,
     select_frontier,
     TargetTracker,
     transform_matrix,
     world_to_grid,
+)
+from .go2_preflight import (
+    CalibrationError,
+    rgbd_sync_health,
+    validate_depth_units_report,
 )
 from .exploration import (
     clip_polyline_to_length,
@@ -99,8 +108,10 @@ def quaternion_yaw(quaternion):
 
 
 class VLMNavigator(Node):
-    def __init__(self):
-        super().__init__("vlm_nav")
+    def __init__(self, *, observation_only=False, parameter_overrides=None, node_name=None):
+        super().__init__(node_name or ("multi_agent_go2_rgbd" if observation_only else "vlm_nav"),
+                         parameter_overrides=parameter_overrides)
+        self.observation_only = observation_only
         defaults = {
             "enabled": False,
             "target_description": "chair",
@@ -109,8 +120,29 @@ class VLMNavigator(Node):
             "camera_frame": "camera_color_optical_frame",
             "map_topic": "/map",
             "rgb_topic": "/camera/color/image_raw",
+            "camera_preview_topic": "/vlm_nav/camera_preview",
+            "camera_preview_rate": 1.0,
             "depth_topic": "/camera/aligned_depth_to_color/image_raw",
             "camera_info_topic": "/camera/color/camera_info",
+            "depth_camera_info_topic": "/camera/depth/camera_info",
+            "raw_depth_mode": False,
+            "realsense_library": "/usr/local/lib/librealsense2.so.2.53.1",
+            "depth_units_report": "~/.config/vlm_nav/raw_depth_units_verified.json",
+            "expected_device_depth_scale": 0.0010000000474974513,
+            "camera_profile_width": 640,
+            "camera_profile_height": 480,
+            "camera_profile_fps": 15,
+            "rgbd_sync_slop": 0.10,
+            "rgbd_sync_window": 30,
+            "rgbd_sync_minimum_samples": 10,
+            "rgbd_sync_minimum_rate": 0.90,
+            "require_camera_calibration": False,
+            "camera_extrinsic_calibrated": False,
+            "require_external_safety_gates": False,
+            "nav_ready_topic": "/vlm_nav/nav_ready",
+            "control_armed_topic": "/vlm_nav/control_armed",
+            "vlm_api_ready_topic": "/vlm_nav/vlm_api_ready",
+            "external_gate_timeout": 2.0,
             "navigate_action": "/navigate_to_pose",
             "compute_path_action": "/compute_path_to_pose",
             "spin_action": "/spin",
@@ -195,6 +227,52 @@ class VLMNavigator(Node):
         )
         self.add_on_set_parameters_callback(self.on_parameters_changed)
 
+        self.raw_depth_geometry = (
+            RealSenseGeometry(self.p.realsense_library)
+            if self.p.raw_depth_mode
+            else None
+        )
+        self.depth_scale = (
+            float(self.p.expected_device_depth_scale)
+            if self.p.raw_depth_mode
+            else None
+        )
+        self.depth_units_verified = not self.p.raw_depth_mode
+        self.depth_units_error = (
+            "unit report not loaded" if self.p.raw_depth_mode else "not_required"
+        )
+        report_path = Path(str(self.p.depth_units_report)).expanduser()
+        if self.p.raw_depth_mode and report_path.is_file():
+            try:
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+                self.depth_scale = validate_depth_units_report(
+                    report,
+                    expected_width=int(self.p.camera_profile_width),
+                    expected_height=int(self.p.camera_profile_height),
+                    expected_fps=int(self.p.camera_profile_fps),
+                    expected_depth_topic=str(self.p.depth_topic),
+                    expected_device_scale=float(self.p.expected_device_depth_scale),
+                )
+                self.depth_units_verified = True
+                self.depth_units_error = "none"
+            except (OSError, json.JSONDecodeError, CalibrationError) as error:
+                self.depth_units_error = str(error)
+
+        self.nav_ready = False
+        self.control_armed = False
+        self.vlm_api_ready = False
+        self.vlm_api_status_reason = "startup preflight pending"
+        self.vlm_api_last_update = 0.0
+        self.api_preflight_pending = True
+        self.external_gate_receipts = {
+            "nav_ready": 0.0,
+            "control_armed": 0.0,
+        }
+        if self.p.require_external_safety_gates and self.p.enabled:
+            raise RuntimeError(
+                "initial enabled=true is forbidden when external safety gates are required"
+            )
+
         self.state = DISARMED
         self.image_recorder = ArmImageRecorder(
             self.p.vlm_image_record_path,
@@ -208,6 +286,18 @@ class VLMNavigator(Node):
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
         self.state_pub = self.create_publisher(String, "~/state", 10)
+        self.vlm_enabled_pub = self.create_publisher(
+            Bool, "/vlm_nav/vlm_enabled", visualization_qos
+        )
+        self.vlm_input_ready_pub = self.create_publisher(
+            Bool, "/vlm_nav/input_ready", visualization_qos
+        )
+        self.vlm_autonomy_ready_pub = self.create_publisher(
+            Bool, "/vlm_nav/autonomy_ready", visualization_qos
+        )
+        self.vlm_api_ready_pub = self.create_publisher(
+            Bool, self.p.vlm_api_ready_topic, visualization_qos
+        )
         self.vlm_text_pub = self.create_publisher(
             String, "~/output_text", visualization_qos
         )
@@ -215,6 +305,10 @@ class VLMNavigator(Node):
             MarkerArray, "~/markers", visualization_qos
         )
         self.debug_pub = self.create_publisher(Image, "~/debug_image", 2)
+        self.camera_preview_pub = self.create_publisher(
+            Image, self.p.camera_preview_topic, qos_profile_sensor_data
+        )
+        self.last_camera_preview = 0.0
         self.frontier_map_pub = self.create_publisher(
             Image, "~/frontier_map_image", visualization_qos
         )
@@ -224,13 +318,23 @@ class VLMNavigator(Node):
         self.diagnostics_pub = self.create_publisher(
             DiagnosticArray, "~/diagnostics", 10
         )
-        self.stop_pub = self.create_publisher(Twist, self.p.stop_cmd_topic, 10)
+        self.stop_pub = self.create_publisher(Twist, self.p.stop_cmd_topic, 10) if self.p.publish_stop_command else None
 
         map_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.create_subscription(
+            Bool, self.p.nav_ready_topic,
+            lambda message: self.on_external_gate("nav_ready", message),
+            visualization_qos,
+        )
+        self.create_subscription(
+            Bool, self.p.control_armed_topic,
+            lambda message: self.on_external_gate("control_armed", message),
+            visualization_qos,
         )
         self.create_subscription(OccupancyGrid, self.p.map_topic, self.on_map, map_qos)
         self.create_subscription(
@@ -240,8 +344,18 @@ class VLMNavigator(Node):
             map_qos,
         )
         self.create_subscription(
-            CameraInfo, self.p.camera_info_topic, self.on_camera_info, 10
+            CameraInfo,
+            self.p.camera_info_topic,
+            lambda message: self.on_camera_info("color", message),
+            qos_profile_sensor_data,
         )
+        if self.p.raw_depth_mode:
+            self.create_subscription(
+                CameraInfo,
+                self.p.depth_camera_info_topic,
+                lambda message: self.on_camera_info("depth", message),
+                qos_profile_sensor_data,
+            )
         self.create_subscription(
             Odometry,
             self.p.arrival_odom_topic,
@@ -263,8 +377,16 @@ class VLMNavigator(Node):
             qos_profile=qos_profile_sensor_data,
             callback_group=self.perception_group,
         )
+        self.rgb_sub.registerCallback(
+            lambda message: self.record_rgbd_stamp("rgb", message)
+        )
+        self.depth_sub.registerCallback(
+            lambda message: self.record_rgbd_stamp("depth", message)
+        )
         self.sync = ApproximateTimeSynchronizer(
-            [self.rgb_sub, self.depth_sub], queue_size=10, slop=0.10
+            [self.rgb_sub, self.depth_sub],
+            queue_size=max(10, int(self.p.rgbd_sync_window)),
+            slop=float(self.p.rgbd_sync_slop),
         )
         self.sync.registerCallback(self.on_rgbd)
 
@@ -297,7 +419,18 @@ class VLMNavigator(Node):
         self.map_message = None
         self.grid = None
         self.map_revision = 0
-        self.camera_info = None
+        self.camera_infos = {"color": None, "depth": None}
+        self.rgbd_stamp_windows = {
+            "rgb": deque(maxlen=max(1, int(self.p.rgbd_sync_window))),
+            "depth": deque(maxlen=max(1, int(self.p.rgbd_sync_window))),
+        }
+        self.rgbd_sync_status = {
+            "healthy": False,
+            "matched": 0,
+            "total": 0,
+            "rate": 0.0,
+        }
+        self.camera_extrinsic_matrix = None
         self.latest_snapshot = None
         self.last_submitted_sequence = -1
         self.sequence = 0
@@ -423,6 +556,10 @@ class VLMNavigator(Node):
         self.frontier_path_length = 0.0
         self.frontier_scene_rgb = None
 
+        if observation_only:
+            # Cooperative adapter reuses RGB-D/TF grounding, owns every motion goal.
+            self.create_timer(0.05, self.resolve_pending_rgbd)
+            return
         sample_period = 1.0 / max(0.1, float(self.p.vlm_sample_rate))
         self.sample_timer = self.create_timer(sample_period, self.sample_latest_frame)
         self.result_timer = self.create_timer(0.05, self.drain_worker_results)
@@ -431,7 +568,10 @@ class VLMNavigator(Node):
         )
         self.safety_timer = self.create_timer(0.2, self.safety_tick)
         self.diagnostics_timer = self.create_timer(1.0, self.publish_diagnostics)
+        self.readiness_timer = self.create_timer(0.5, self.publish_readiness)
         self.publish_state()
+        self.publish_vlm_enabled()
+        self.set_vlm_api_ready(False, "startup preflight pending")
 
     # ---------- lifecycle and safety ----------
 
@@ -596,11 +736,127 @@ class VLMNavigator(Node):
             getattr(getattr(self, "p", None), "easy_case_mode", False)
         )
 
+    def on_external_gate(self, name, message):
+        setattr(self, name, bool(message.data))
+        self.external_gate_receipts[name] = time.monotonic()
+        if (
+            not message.data
+            and self.p.require_external_safety_gates
+            and self.get_parameter("enabled").value
+        ):
+            self.get_logger().error(f"{name} lost; disabling VLM task")
+            self.set_parameters([Parameter("enabled", value=False)])
+
+    def set_vlm_api_ready(self, ready, reason):
+        if (
+            not ready
+            and getattr(self.p, "require_external_safety_gates", False)
+            and self.get_parameter("enabled").value
+            and self.api_failures + 1 < max(1, int(self.p.api_failure_limit))
+        ):
+            self.vlm_api_status_reason = str(reason)
+            self.vlm_api_last_update = time.monotonic()
+            return
+        self.vlm_api_ready = bool(ready)
+        self.vlm_api_status_reason = str(reason)
+        self.vlm_api_last_update = time.monotonic()
+        publisher = getattr(self, "vlm_api_ready_pub", None)
+        if publisher is not None:
+            message = Bool()
+            message.data = self.vlm_api_ready
+            publisher.publish(message)
+        if (
+            not self.vlm_api_ready
+            and getattr(self.p, "require_external_safety_gates", False)
+            and self.get_parameter("enabled").value
+        ):
+            self.get_logger().error(
+                f"VLM API unavailable ({reason}); disabling VLM task"
+            )
+            self.set_parameters([Parameter("enabled", value=False)])
+
+    def update_vlm_api_ready(self, completed):
+        kind = getattr(completed.snapshot, "request_kind", "target")
+        expected = FrontierDecision if kind == "frontier" else VLMResult
+        ready = completed.error is None and isinstance(completed.result, expected)
+        reason = (
+            f"valid {kind} response"
+            if ready
+            else completed.error or f"invalid {kind} response"
+        )
+        self.set_vlm_api_ready(ready, reason)
+        return ready
+
+    def external_safety_gates_healthy(self):
+        now = time.monotonic()
+        maximum_age = float(self.p.external_gate_timeout)
+        return all(
+            (
+                self.nav_ready,
+                self.control_armed,
+                self.vlm_api_ready,
+                maximum_age > 0.0,
+                all(
+                    self.elapsed_since(receipt, now) <= maximum_age
+                    for receipt in self.external_gate_receipts.values()
+                ),
+            )
+        )
+
     def on_parameters_changed(self, parameters):
         values = {parameter.name: parameter.value for parameter in parameters}
+        if getattr(self, 'observation_only', False) and values.get('enabled', False):
+            return SetParametersResult(successful=False, reason='cooperative observer cannot enable autonomy')
         requested_enabled = bool(
             values.get("enabled", self.get_parameter("enabled").value)
         )
+        require_camera_calibration = bool(
+            values.get(
+                "require_camera_calibration",
+                self.get_parameter("require_camera_calibration").value,
+            )
+        )
+        camera_extrinsic_calibrated = bool(
+            values.get(
+                "camera_extrinsic_calibrated",
+                self.get_parameter("camera_extrinsic_calibrated").value,
+            )
+        )
+        require_external_safety_gates = bool(
+            values.get(
+                "require_external_safety_gates",
+                self.get_parameter("require_external_safety_gates").value,
+            )
+        )
+        if (
+            requested_enabled
+            and require_external_safety_gates
+            and not self.external_safety_gates_healthy()
+        ):
+            return SetParametersResult(
+                successful=False,
+                reason="NAV_READY / CONTROL_ARMED / VLM API gate is false",
+            )
+        if (
+            requested_enabled
+            and require_camera_calibration
+            and not camera_extrinsic_calibrated
+        ):
+            return SetParametersResult(
+                successful=False,
+                reason="camera extrinsic is not calibrated; VLM enable is blocked",
+            )
+        if requested_enabled and getattr(self.p, "raw_depth_mode", False):
+            if not self.vlm_input_ready():
+                return SetParametersResult(
+                    successful=False,
+                    reason="raw RGB-D input/geometry window is not ready",
+                )
+            if not self.depth_units_verified:
+                return SetParametersResult(
+                    successful=False,
+                    reason=f"raw-depth unit report rejected: {self.depth_units_error}",
+                )
         if "easy_case_mode" in values:
             if requested_enabled:
                 return SetParametersResult(
@@ -618,6 +874,13 @@ class VLMNavigator(Node):
                     successful=False,
                     reason="change target_description only while enabled=false",
                 )
+
+        if "require_camera_calibration" in values:
+            self.p.require_camera_calibration = require_camera_calibration
+        if "camera_extrinsic_calibrated" in values:
+            self.p.camera_extrinsic_calibrated = camera_extrinsic_calibrated
+        if "require_external_safety_gates" in values:
+            self.p.require_external_safety_gates = require_external_safety_gates
 
         if "easy_case_mode" in values:
             self.p.easy_case_mode = bool(values["easy_case_mode"])
@@ -663,7 +926,50 @@ class VLMNavigator(Node):
                 self.initial_costmap_refresh_deadline = 0.0
                 self.last_initial_costmap_clear_status = "not_required"
                 self.reset_task(DISARMED)
+            self.publish_vlm_enabled()
         return SetParametersResult(successful=True)
+
+    def publish_vlm_enabled(self):
+        message = Bool()
+        message.data = bool(self.p.enabled)
+        self.vlm_enabled_pub.publish(message)
+
+    def vlm_input_ready(self, now=None):
+        now = time.monotonic() if now is None else float(now)
+        snapshot = getattr(self, "latest_snapshot", None)
+        if snapshot is None:
+            return False
+        if self.elapsed_since(snapshot.captured_monotonic, now) > float(
+            self.p.rgbd_wait_timeout
+        ):
+            return False
+        if self.elapsed_since(self.last_camera_tf_success, now) > float(
+            self.p.tf_failure_timeout
+        ):
+            return False
+        if getattr(self.p, "raw_depth_mode", True):
+            return bool(
+                getattr(self, "rgbd_sync_status", {}).get("healthy")
+                and getattr(self, "camera_extrinsic_matrix", None) is not None
+                and getattr(snapshot, "raw_depth_snapshot", None) is not None
+            )
+        return True
+
+    def vlm_autonomy_ready(self, now=None):
+        now = time.monotonic() if now is None else float(now)
+        return bool(
+            self.vlm_input_ready(now)
+            and getattr(self, "depth_units_verified", False)
+            and getattr(self, "vlm_api_ready", False)
+        )
+
+    def publish_readiness(self):
+        input_message = Bool()
+        input_message.data = self.vlm_input_ready()
+        self.vlm_input_ready_pub.publish(input_message)
+        autonomy_message = Bool()
+        autonomy_message.data = self.vlm_autonomy_ready()
+        self.vlm_autonomy_ready_pub.publish(autonomy_message)
 
     def require_initial_costmap_clear(self):
         if not bool(getattr(self.p, "clear_costmap_on_arm", True)):
@@ -894,7 +1200,7 @@ class VLMNavigator(Node):
         self.state_pub.publish(message)
 
     def publish_stop(self):
-        if not bool(self.p.publish_stop_command) or not rclpy.ok():
+        if not bool(self.p.publish_stop_command) or self.stop_pub is None or not rclpy.ok():
             return
         message = Twist()
         for _ in range(3):
@@ -957,6 +1263,14 @@ class VLMNavigator(Node):
         return math.inf if timestamp <= 0.0 else max(0.0, now - timestamp)
 
     def safety_tick(self):
+        if (
+            self.get_parameter("enabled").value
+            and bool(getattr(self.p, "require_external_safety_gates", False))
+            and not self.external_safety_gates_healthy()
+        ):
+            self.get_logger().error("external VLM safety gate became stale or false")
+            self.set_parameters([Parameter("enabled", value=False)])
+            return
         if not self.get_parameter("enabled").value or self.state in (
             DISARMED,
             API_ERROR,
@@ -1069,8 +1383,48 @@ class VLMNavigator(Node):
 
     # ---------- sensor input and VLM worker ----------
 
-    def on_camera_info(self, message):
-        self.camera_info = message
+    @staticmethod
+    def stamp_ns(message):
+        return int(message.header.stamp.sec) * 1_000_000_000 + int(
+            message.header.stamp.nanosec
+        )
+
+    def record_rgbd_stamp(self, stream, message):
+        if stream == "rgb":
+            self.publish_camera_preview(message)
+        windows = getattr(self, "rgbd_stamp_windows", None)
+        if windows is None:
+            return
+        windows[stream].append(self.stamp_ns(message) * 1e-9)
+        self.rgbd_sync_status = rgbd_sync_health(
+            windows["rgb"],
+            windows["depth"],
+            slop_s=float(self.p.rgbd_sync_slop),
+            minimum_samples=int(self.p.rgbd_sync_minimum_samples),
+            minimum_rate=float(self.p.rgbd_sync_minimum_rate),
+        )
+
+    def publish_camera_preview(self, message, now=None):
+        rate = float(self.p.camera_preview_rate)
+        if rate <= 0.0:
+            return
+        now = time.monotonic() if now is None else float(now)
+        if now - self.last_camera_preview < 1.0 / rate:
+            return
+        self.camera_preview_pub.publish(message)
+        self.last_camera_preview = now
+
+    def on_camera_info(self, stream, message):
+        self.camera_infos[stream] = message
+
+    @staticmethod
+    def camera_info_values(message):
+        return {
+            "width": int(message.width),
+            "height": int(message.height),
+            "k": tuple(float(value) for value in message.k),
+            "d": tuple(float(value) for value in message.d),
+        }
 
     def on_behavior_costmap(self, _message):
         self.behavior_costmap_revision += 1
@@ -1144,38 +1498,123 @@ class VLMNavigator(Node):
             )
         raise ValueError(f"unsupported depth encoding: {message.encoding}")
 
+    @staticmethod
+    def image_to_raw_depth(message):
+        if message.encoding.upper() not in ("16UC1", "MONO16"):
+            raise ValueError(
+                f"raw depth requires 16UC1/MONO16, got {message.encoding}"
+            )
+        row = np.frombuffer(message.data, dtype=np.uint8).reshape(
+            message.height, message.step
+        )
+        dtype = ">u2" if bool(message.is_bigendian) else "<u2"
+        return (
+            row[:, : message.width * 2]
+            .copy()
+            .view(dtype)
+            .reshape(message.height, message.width)
+            .astype(np.uint16, copy=False)
+        )
+
     def on_rgbd(self, rgb_message, depth_message):
-        if (
-            not self.get_parameter("enabled").value
-            or self.state in (DISARMED, SUCCEEDED, FAILED)
-        ):
-            return
         now = time.monotonic()
         self.last_rgbd_pair_received = now
-        if self.camera_info is None:
+        infos = getattr(self, "camera_infos", {})
+        if not getattr(self.p, "raw_depth_mode", False):
+            if not getattr(self,'observation_only',False) and (
+                not self.get_parameter("enabled").value
+                or self.state in (DISARMED, SUCCEEDED, FAILED)
+            ):
+                return
+            camera_info = infos.get("color") or getattr(self, "camera_info", None)
+            if camera_info is None:
+                self.sensor_recovery_count = 0
+                return
+            rgb_size = (int(rgb_message.height), int(rgb_message.width))
+            depth_size = (int(depth_message.height), int(depth_message.width))
+            info_size = (int(camera_info.height), int(camera_info.width))
+            depth_frame = depth_message.header.frame_id
+            if (
+                rgb_size != depth_size
+                or rgb_size != info_size
+                or (depth_frame and depth_frame != self.p.camera_frame)
+            ):
+                self.invalid_rgbd_frames += 1
+                self.sensor_recovery_count = 0
+                self.get_logger().warn(
+                    "Rejecting aligned RGB-D metadata mismatch: "
+                    f"rgb={rgb_size}, depth={depth_size}, camera_info={info_size}, "
+                    f"depth_frame={depth_frame or 'empty'}",
+                    throttle_duration_sec=5.0,
+                )
+                return
+            try:
+                rgb = self.image_to_rgb(rgb_message)
+                depth = self.image_to_depth_m(depth_message)
+            except (ValueError, TypeError) as error:
+                self.invalid_rgbd_frames += 1
+                self.sensor_recovery_count = 0
+                self.get_logger().warn(
+                    f"Invalid aligned RGB-D frame: {error}",
+                    throttle_duration_sec=5.0,
+                )
+                return
+            self.last_valid_rgbd_received = now
+            queue_period = 1.0 / max(1.0, float(self.p.vlm_sample_rate))
+            if not self.pending_rgbd_frames or now - self.last_rgbd_queued >= queue_period:
+                queue_limit = max(1, int(self.p.image_tf_queue_size))
+                if len(self.pending_rgbd_frames) >= queue_limit:
+                    self.pending_rgbd_frames.popleft()
+                    self.image_tf_queue_drops += 1
+                self.pending_rgbd_frames.append(
+                    SimpleNamespace(
+                        received_monotonic=now,
+                        stamp=depth_message.header.stamp,
+                        frame_id=depth_message.header.frame_id or self.p.camera_frame,
+                        rgb=rgb.copy(),
+                        depth_m=depth.copy(),
+                        intrinsics=(
+                            float(camera_info.k[0]),
+                            float(camera_info.k[4]),
+                            float(camera_info.k[2]),
+                            float(camera_info.k[5]),
+                        ),
+                    )
+                )
+                self.last_rgbd_queued = now
+            self.resolve_pending_rgbd()
+            return
+        if not infos.get("color") or not infos.get("depth"):
             self.sensor_recovery_count = 0
             return
+        color_info = infos["color"]
+        depth_info = infos["depth"]
         rgb_size = (int(rgb_message.height), int(rgb_message.width))
         depth_size = (int(depth_message.height), int(depth_message.width))
-        info_size = (int(self.camera_info.height), int(self.camera_info.width))
+        color_info_size = (int(color_info.height), int(color_info.width))
+        depth_info_size = (int(depth_info.height), int(depth_info.width))
+        color_frame = rgb_message.header.frame_id
         depth_frame = depth_message.header.frame_id
         if (
-            rgb_size != depth_size
-            or rgb_size != info_size
-            or (depth_frame and depth_frame != self.p.camera_frame)
+            rgb_size != color_info_size
+            or depth_size != depth_info_size
+            or color_frame != color_info.header.frame_id
+            or depth_frame != depth_info.header.frame_id
         ):
             self.invalid_rgbd_frames += 1
             self.sensor_recovery_count = 0
             self.get_logger().warn(
                 "Rejecting RGB-D metadata mismatch: "
-                f"rgb={rgb_size}, depth={depth_size}, camera_info={info_size}, "
+                f"rgb={rgb_size}, color_info={color_info_size}, "
+                f"depth={depth_size}, depth_info={depth_info_size}, "
+                f"color_frame={color_frame or 'empty'}, "
                 f"depth_frame={depth_frame or 'empty'}",
                 throttle_duration_sec=5.0,
             )
             return
         try:
             rgb = self.image_to_rgb(rgb_message)
-            depth = self.image_to_depth_m(depth_message)
+            raw_depth = self.image_to_raw_depth(depth_message)
         except (ValueError, TypeError) as error:
             self.invalid_rgbd_frames += 1
             self.sensor_recovery_count = 0
@@ -1201,14 +1640,18 @@ class VLMNavigator(Node):
                 SimpleNamespace(
                     received_monotonic=now,
                     stamp=depth_message.header.stamp,
-                    frame_id=depth_message.header.frame_id or self.p.camera_frame,
+                    rgb_stamp=rgb_message.header.stamp,
+                    color_frame=color_frame,
+                    depth_frame=depth_frame,
                     rgb=rgb.copy(),
-                    depth_m=depth.copy(),
+                    raw_depth=raw_depth.copy(),
+                    color_info=self.camera_info_values(color_info),
+                    depth_info=self.camera_info_values(depth_info),
                     intrinsics=(
-                        float(self.camera_info.k[0]),
-                        float(self.camera_info.k[4]),
-                        float(self.camera_info.k[2]),
-                        float(self.camera_info.k[5]),
+                        float(color_info.k[0]),
+                        float(color_info.k[4]),
+                        float(color_info.k[2]),
+                        float(color_info.k[5]),
                     ),
                 )
             )
@@ -1225,15 +1668,42 @@ class VLMNavigator(Node):
                 self.image_tf_queue_drops += 1
                 continue
             try:
+                if hasattr(frame, "raw_depth") and self.camera_extrinsic_matrix is None:
+                    extrinsic = self.tf_buffer.lookup_transform(
+                        frame.color_frame,
+                        frame.depth_frame,
+                        Time(),
+                        timeout=Duration(seconds=0.0),
+                    )
+                    self.camera_extrinsic_matrix = transform_matrix(
+                        (
+                            extrinsic.transform.translation.x,
+                            extrinsic.transform.translation.y,
+                            extrinsic.transform.translation.z,
+                        ),
+                        (
+                            extrinsic.transform.rotation.x,
+                            extrinsic.transform.rotation.y,
+                            extrinsic.transform.rotation.z,
+                            extrinsic.transform.rotation.w,
+                        ),
+                    )
                 transform = self.tf_buffer.lookup_transform(
                     self.p.global_frame,
-                    self.p.camera_frame,
+                    (
+                        frame.depth_frame
+                        if hasattr(frame, "raw_depth")
+                        else self.p.camera_frame
+                    ),
                     Time.from_msg(frame.stamp),
                     timeout=Duration(seconds=0.0),
                 )
             except TransformException as error:
+                error_text = str(error)
+                if "extrapolation into the future" in error_text.lower():
+                    return
                 self.image_tf_failures += 1
-                self.last_image_tf_error = str(error)
+                self.last_image_tf_error = error_text
                 self.sensor_recovery_count = 0
                 self.get_logger().warn(
                     f"Image-time camera TF pending: {error}",
@@ -1247,6 +1717,52 @@ class VLMNavigator(Node):
                 (translation.x, translation.y, translation.z),
                 (rotation.x, rotation.y, rotation.z, rotation.w),
             )
+            if hasattr(frame, "raw_depth"):
+                depth_to_color = np.asarray(
+                    self.camera_extrinsic_matrix, dtype=float
+                )
+                color_to_depth = np.linalg.inv(depth_to_color)
+                color_to_map = matrix @ color_to_depth
+                rgb = frame.rgb.copy()
+                raw_depth = frame.raw_depth.copy()
+                depth_m = raw_depth.astype(np.float32) * float(self.depth_scale)
+                for array in (rgb, raw_depth, depth_m, matrix, color_to_map):
+                    array.flags.writeable = False
+                raw_snapshot = (
+                    rgb,
+                    raw_depth,
+                    MappingProxyType({
+                        "rgb_stamp_ns": self.stamp_ns(
+                            SimpleNamespace(header=SimpleNamespace(stamp=frame.rgb_stamp))
+                        ),
+                        "depth_stamp_ns": self.stamp_ns(
+                            SimpleNamespace(header=SimpleNamespace(stamp=frame.stamp))
+                        ),
+                        "color_info": MappingProxyType(frame.color_info),
+                        "depth_info": MappingProxyType(frame.depth_info),
+                        "depth_to_color": tuple(
+                            tuple(float(value) for value in row)
+                            for row in depth_to_color
+                        ),
+                        "color_to_depth": tuple(
+                            tuple(float(value) for value in row)
+                            for row in color_to_depth
+                        ),
+                        "T_map_depth_optical": tuple(
+                            tuple(float(value) for value in row) for row in matrix
+                        ),
+                    }),
+                )
+                snapshot_frame_id = frame.color_frame
+                snapshot_rgb = rgb
+                snapshot_depth = depth_m
+                snapshot_transform = color_to_map
+            else:
+                raw_snapshot = None
+                snapshot_frame_id = frame.frame_id
+                snapshot_rgb = frame.rgb
+                snapshot_depth = frame.depth_m
+                snapshot_transform = matrix
             self.sequence += 1
             self.latest_snapshot = FrameSnapshot(
                 sequence=self.sequence,
@@ -1256,11 +1772,13 @@ class VLMNavigator(Node):
                 ),
                 captured_monotonic=frame.received_monotonic,
                 stamp=frame.stamp,
-                frame_id=frame.frame_id,
-                rgb=frame.rgb,
-                depth_m=frame.depth_m,
+                frame_id=snapshot_frame_id,
+                rgb=snapshot_rgb,
+                depth_m=snapshot_depth,
                 intrinsics=frame.intrinsics,
-                transform_matrix=matrix,
+                transform_matrix=snapshot_transform,
+                raw_depth_snapshot=raw_snapshot,
+                depth_scale=(float(self.depth_scale) if raw_snapshot else None),
             )
             self.last_camera_tf_success = time.monotonic()
             self.last_image_tf_error = "none"
@@ -1284,6 +1802,7 @@ class VLMNavigator(Node):
                 jpeg_quality=int(self.p.jpeg_quality),
             )
         except Exception as error:
+            self.set_vlm_api_ready(False, f"Cannot initialize VLM client: {error}")
             self.record_api_failure(f"Cannot initialize VLM client: {error}")
             return False
         self.worker = LatestFrameWorker(
@@ -1305,6 +1824,24 @@ class VLMNavigator(Node):
         return True
 
     def sample_latest_frame(self):
+        if getattr(self, "api_preflight_pending", False):
+            snapshot = self.latest_snapshot
+            if snapshot is None:
+                return
+            self.api_preflight_pending = False
+            if not self.ensure_worker():
+                return
+            self.worker.submit(
+                replace(
+                    snapshot,
+                    request_kind="api_preflight",
+                    target_description=str(
+                        self.get_parameter("target_description").value
+                    ),
+                )
+            )
+            self.get_logger().info("Submitted real Qwen startup preflight")
+            return
         if (
             not self.get_parameter("enabled").value
             or self.state in (DISARMED, SENSOR_WAITING, SUCCEEDED, FAILED)
@@ -1405,6 +1942,19 @@ class VLMNavigator(Node):
         age = time.monotonic() - snapshot.captured_monotonic
         self.last_result_age = age
         state_before = self.state
+        api_ready = self.update_vlm_api_ready(completed)
+        if getattr(snapshot, "request_kind", "target") == "api_preflight":
+            if api_ready:
+                self.api_failures = 0
+                self.last_api_error = "none"
+                self.get_logger().info(
+                    f"Qwen startup preflight passed in {completed.latency_s:.3f}s"
+                )
+            else:
+                self.record_api_failure(
+                    completed.error or "invalid startup preflight response"
+                )
+            return
         scan_result = self.is_current_scan_result(snapshot)
         depth_reobserve_result = self.is_current_depth_reobserve_result(
             snapshot
@@ -1657,6 +2207,37 @@ class VLMNavigator(Node):
     def ground_pixel_with_reason(
         self, snapshot: FrameSnapshot, pixel: Pixel, require_ground: bool
     ):
+        raw_snapshot = getattr(snapshot, "raw_depth_snapshot", None)
+        if raw_snapshot is not None:
+            try:
+                projected = self.raw_depth_geometry.project(
+                    raw_snapshot,
+                    (pixel.u, pixel.v),
+                    float(snapshot.depth_scale),
+                    float(self.p.min_depth),
+                    float(self.p.max_depth),
+                )
+            except ValueError as error:
+                if any(
+                    text in str(error)
+                    for text in (
+                        "No valid depth",
+                        "did not find a depth pixel",
+                        "Mapped depth is zero",
+                    )
+                ):
+                    return None, "insufficient_valid_depth_samples:0/1"
+                return None, f"raw_depth_projection_error:{error}"
+            point = projected.get("map_point")
+            if point is None:
+                return None, "raw_depth_projection_error:map transform unavailable"
+            if require_ground and abs(float(point[2])) > float(self.p.max_ground_height):
+                return (
+                    None,
+                    f"ground_height_rejected:z={float(point[2]):.3f},"
+                    f"limit={float(self.p.max_ground_height):.3f}",
+                )
+            return tuple(float(value) for value in point), "ok"
         depth, depth_reason = depth_at_pixel_with_reason(
             snapshot.depth_m,
             pixel.u,
@@ -1779,6 +2360,7 @@ class VLMNavigator(Node):
         self.frontier_request = None
         self.frontier_request_pending = False
         self.set_state(SCANNING)
+        self.prepare_stationary_observation()
 
     def is_current_scan_result(self, snapshot):
         return (
@@ -2241,17 +2823,11 @@ class VLMNavigator(Node):
             self.prepare_frontier_cycle(pose, use_scan_context=False)
 
     def target_reference_distance(self, pose):
-        if self.target_reference_position is None or pose is None:
-            return math.inf
-        return math.hypot(
-            float(pose[0]) - float(self.target_reference_position[0]),
-            float(pose[1]) - float(self.target_reference_position[1]),
-        )
+        return target_distance(pose, self.target_reference_position)
 
     def approach_stop_radius(self):
-        if int(getattr(self, "arrival_retry_count", 0)) > 0:
-            return float(self.p.target_success_radius)
-        return float(self.p.approach_cancel_radius)
+        return stop_radius(float(self.p.target_success_radius), float(self.p.approach_cancel_radius),
+                           int(getattr(self, "arrival_retry_count", 0)))
 
     def reset_approach_stop(self, reset_retry=False):
         self.arrival_stop_started = 0.0
@@ -2340,10 +2916,12 @@ class VLMNavigator(Node):
             pose = self.robot_pose() if pose is None else pose
             distance = self.target_reference_distance(pose)
             self.easy_target_distance = distance
-            if distance <= float(self.p.target_success_radius):
+            decision = arrival_decision(distance, float(self.p.target_success_radius),
+                                        self.arrival_retry_count, int(self.p.arrival_retry_limit))
+            if decision == 'SUCCESS':
                 self.finish_approach_success()
                 return
-            if self.arrival_retry_count < int(self.p.arrival_retry_limit):
+            if decision == 'RETRY':
                 self.arrival_retry_count += 1
                 self.get_logger().warn(
                     "Approach action stopped outside distance contract; "

@@ -1,0 +1,26 @@
+# Explicit FINAL overlay for cooperative acceptance only. Legacy AMCL stays unchanged.
+# Inherit measured footprint, frames, voxel geometry and cloud ranges from nav2_go2.yaml.
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      plugins: [static_layer, obstacle_layer, inflation_layer]
+      always_send_full_costmap: true
+      map_topic: /map
+      obstacle_layer:
+        enabled: true
+        observation_sources: go2_cloud
+        go2_cloud:
+          marking: true
+          clearing: true
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      plugins: [static_layer, voxel_layer, inflation_layer]
+      always_send_full_costmap: true
+      map_topic: /map
+      voxel_layer:
+        enabled: true
+        observation_sources: go2_cloud
+        go2_cloud:
+          marking: true
+          clearing: true

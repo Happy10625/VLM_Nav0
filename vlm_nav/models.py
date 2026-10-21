@@ -62,6 +62,8 @@ class FrameSnapshot:
     frontier_context: str = ""
     frontier_robot_pixel: Optional[Tuple[int, int]] = None
     frontier_candidate_pixels: Tuple[Tuple[int, Tuple[int, int]], ...] = ()
+    raw_depth_snapshot: Optional[Any] = None
+    depth_scale: Optional[float] = None
 
 
 @dataclass(frozen=True)

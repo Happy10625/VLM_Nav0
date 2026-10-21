@@ -1,0 +1,366 @@
+--- /dev/null
++++ b/Cooperative_env.bash
+@@ -0,0 +1,54 @@
++#!/usr/bin/env bash
++# Source in each terminal; reuse each PC's existing hardware/API environment.
++if [[ -z "${BASH_VERSION:-}" || "${BASH_SOURCE[0]}" == "$0" ]]; then
++  echo '用法：source Cooperative_env.bash ranger|go2 [实际配置目录]' >&2
++  return 1 2>/dev/null || exit 1
++fi
++_cooperative_environment() {
++  local side="${1:-}" directory="${2:-}" repo base overlay status=0 had_nounset=false
++  [[ "$-" == *u* ]] && had_nounset=true
++  case "$side" in ranger|go2) ;; *) echo '须指定 ranger 或 go2。' >&2; return 2;; esac
++  (( $# <= 2 )) || return 2
++  repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)" || return 1
++  base="$repo/RangerVLM_env.bash"
++  [[ "$side" == go2 ]] && base="$repo/CoVLM_env.bash"
++  [[ -r "$base" ]] || { echo "缺少本机基础环境：$base" >&2; return 1; }
++  overlay="${COOP_SETUP_FILE:-}"
++  if [[ "$side" == go2 && -z "$overlay" ]]; then
++    overlay="$repo/build/go2-independent-c-20261020/install/local_setup.bash"
++  fi
++  [[ -z "$overlay" || -r "$overlay" ]] || { echo "缺少协同 overlay：$overlay；请将 COOP_SETUP_FILE 指向本机已构建的新任务 overlay。" >&2; return 1; }
++  set +u
++  if [[ "$side" == ranger ]]; then source "$base" local || status=$?;
++  else source "$base" || status=$?; fi
++  set +u
++  if (( status == 0 )) && [[ -n "$overlay" ]]; then source "$overlay" || status=$?; fi
++  if "$had_nounset"; then set -u; else set +u; fi
++  (( status == 0 )) || return "$status"
++  if [[ -z "$directory" ]]; then
++    if [[ "$side" == ranger ]]; then directory="${RANGER_CONFIG:-}";
++    else directory="${GO2_CONFIG:-${GO2_EXPLORE_CONFIG:-}}"; fi
++  fi
++  [[ "$directory" == /* && -d "$directory" ]] || { echo '须指定本机实际配置目录的绝对路径。' >&2; return 1; }
++  directory="$(cd -- "$directory" && pwd)" || return 1
++  export COOP_SIDE="$side" COOP_REPO="$repo" COOP_CONFIG="$directory"
++  export COOP_BRIDGE_YAML="$directory/bridge_${side}_pending.yaml"
++  if [[ "$side" == ranger ]]; then
++    export COOP_LOCAL_DDS_XML="$directory/cyclonedds_ranger_local.xml"
++    export COOP_BRIDGE_DDS_XML="$directory/cyclonedds_ranger_multi_agent_bridge.xml"
++    export RANGER_CONFIG="$directory" RANGER_BRIDGE_DDS_XML="$COOP_BRIDGE_DDS_XML"
++  else
++    export COOP_LOCAL_DDS_XML="$repo/config/cyclonedds_go2.xml"
++    export COOP_BRIDGE_DDS_XML="$repo/config/cyclonedds_go2_multi_agent_bridge.xml"
++    export GO2_CONFIG="$directory" GO2_NET_IFACE=enp4s0
++  fi
++  local asset
++  for asset in "$COOP_LOCAL_DDS_XML" "$COOP_BRIDGE_DDS_XML" "$COOP_BRIDGE_YAML"; do
++    [[ -r "$asset" ]] || { echo "缺少本机协同配置：$asset" >&2; return 1; }
++  done
++  export ROS_DOMAIN_ID=0 ROS_LOCALHOST_ONLY=0 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
++  export CYCLONEDDS_URI="file://$COOP_LOCAL_DDS_XML" COMM_ENV_FILE="$base"
++  export PYTHONDONTWRITEBYTECODE=1
++}
++if _cooperative_environment "$@"; then unset -f _cooperative_environment;
++else unset -f _cooperative_environment; return 1; fi
+--- /dev/null
++++ b/scripts/cooperative.sh
+@@ -0,0 +1,119 @@
++#!/usr/bin/env bash
++# One command per terminal; no automatic task start or background process management.
++set -eo pipefail
++if [[ "${1:-}" == --help || "${1:-}" == -h || $# == 0 ]]; then
++  cat <<'HELP'
++用法：bash scripts/cooperative.sh ranger|go2 ACTION
++  preflight   离线核对安装/协议/地图/候选/DDS/API环境与live gates；未就绪退出1
++  bridge      启动本机5条任务话题的定向桥，保持本终端运行
++  agent       启动本机新任务agent；有真实gates时只发布阻塞状态
++  coordinator 仅Go2：启动唯一coordinator，不自动开始任务
++  check       静止PAUSED传输检查12秒（两机agent与bridge须已运行）
++  state/peer  显示本机/对端任务状态，Ctrl+C只结束显示
++  watch       仅Go2：显示coordinator状态，Ctrl+C只结束显示
++  start       仅Go2：live预检通过后显式开始一次真实任务
++  pause       仅Go2：请求软件暂停；不受live gates阻塞
++每步独立执行；硬件/定位沿用原入口。配置用COOP_CONFIG覆盖，API继续用环境变量。
++HELP
++  exit 0
++fi
++side="$1" action="${2:-preflight}"
++case "$side" in ranger|go2) ;; *) echo '机器人须为 ranger 或 go2。' >&2; exit 2;; esac
++case "$action" in preflight|bridge|agent|coordinator|check|state|peer|watch|start|pause) ;; *) echo '未知 ACTION；使用 --help。' >&2; exit 2;; esac
++(( $# <= 2 )) || { echo '不接受额外参数；配置通过环境文件指定。' >&2; exit 2; }
++case "$action" in coordinator|start|pause|watch)
++  [[ "$side" == go2 ]] || { echo '该命令仅在Go2控制电脑执行。' >&2; exit 2; };;
++esac
++repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
++source "$repo/Cooperative_env.bash" "$side" "${COOP_CONFIG:-}"
++
++preflight() {
++  python3 - "${1:-transport}" <<'PY'
++from dataclasses import fields
++from pathlib import Path
++import hashlib, importlib, json, os, sys
++sys.path.insert(0,str(Path(os.environ["COOP_REPO"])/"scripts"))
++from check_multi_agent_comm import validate_bridge, validate_dds
++import yaml
++from multi_agent_nav.config import load_config, live_gates
++from multi_agent_nav.models import AgentContext, AgentState, Command, Observation, Pose2D, Snapshot, validate_command
++from multi_agent_nav.planner import RulePlanner
++from multi_agent_nav.generated_candidates import GeneratedCandidates
++from multi_agent_task_msgs import msg
++side=os.environ['COOP_SIDE'];repo=Path(os.environ['COOP_REPO']);directory=Path(os.environ['COOP_CONFIG'])
++interfaces=validate_dds(os.environ['COOP_LOCAL_DDS_XML'],os.environ['COOP_BRIDGE_DDS_XML'],side)
++bridge=validate_bridge(yaml.safe_load(Path(os.environ['COOP_BRIDGE_YAML']).read_text()),side)
++cfg=load_config(directory)
++if cfg['scene'].get('share_c_coordinates') is not False:raise ValueError('本流程要求share_c_coordinates=false')
++installed={}
++for name in ('agent','coordinator','models','planner','runner','generated_candidates'):
++    module=importlib.import_module('multi_agent_nav.'+name);path=Path(module.__file__)
++    source=repo/'cooperative_ws/src/multi_agent_nav/multi_agent_nav'/f'{name}.py'
++    installed[name]={'file':str(path),'matches_source':path.read_bytes()==source.read_bytes()}
++if not all(row['matches_source'] for row in installed.values()):raise ValueError('安装与源码不一致；先更新本机overlay，不能混用旧任务实现')
++states={r:AgentState(robot_id=r,ready=True) for r in ('go2','ranger')}
++observations={r:Observation(robot_id=r,target_id='C',status='CACHED',observation_id=r) for r in states}
++snapshot=Snapshot('DEPOSIT',states,observations,{},None,{},dict(share_c_coordinates=False),0.,local_c={r:r for r in states})
++actions=RulePlanner().decide(snapshot)
++if {a.robot_id for a in actions if a.kind=='APPROACH_DEPOSIT'}!=set(states):raise ValueError('安装未采用独立C并行接近规则')
++for state in states.values():state.deposited=True
++if RulePlanner().decide(snapshot):raise ValueError('安装仍在C完成后安排EXIT')
++kwargs=dict(robot_id=side,task_id='offline',local_map_id='offline',map_version='1',common_frame_id='',alignment_id='',simulation=False)
++if 'share_c_coordinates' in {f.name for f in fields(AgentContext)}:kwargs['share_c_coordinates']=False
++context=AgentContext(**kwargs);sync={}
++for label,action,kind in [('action','SYNC_LOCAL_C','WAIT'),('kind','SYNC','SYNC_LOCAL_C')]:
++    sync[label]=validate_command(Command(task_id='offline',recipient_id=side,action=action,kind=kind,common_frame_id='',alignment_id='',simulation=False),context).accepted
++if side=='ranger' and not sync['action']:raise ValueError('Ranger尚未支持远端action=SYNC_LOCAL_C；先同步接收兼容补丁')
++schemas={name:hashlib.sha256(json.dumps(getattr(msg,name).get_fields_and_field_types(),sort_keys=True).encode()).hexdigest() for name in ('AgentState','Observation','Command')}
++robot=cfg['robot_'+side];geometry=GeneratedCandidates(cfg,side)
++key=os.getenv(robot.get('api_key_env','DASHSCOPE_API_KEY')) or os.getenv('OPENAI_API_KEY')
++endpoint=robot.get('endpoint') or os.getenv('DASHSCOPE_BASE_URL') or os.getenv('DASHSCOPE_WORKSPACE_ID') or os.getenv('OPENAI_BASE_URL')
++model=robot.get('model') or os.getenv('DASHSCOPE_MODEL') or os.getenv('OPENAI_MODEL')
++api_ready=bool(key and endpoint and model)
++gates=live_gates(cfg,local_robot=side)
++print(json.dumps(dict(side=side,config_dir=str(directory),bridge=bridge,interfaces=interfaces,installed=installed,
++    schema_sha256=schemas,sync_encodings=sync,targets=cfg['scene']['targets'],scenario_id=cfg['scene']['scenario_id'],
++    map_identity=cfg['alignment']['robots'],candidate_count=len(geometry.points),api_environment_complete=api_ready,
++    live_gates=gates,motion_sent=False),ensure_ascii=False,indent=2))
++if sys.argv[1]=='live' and (gates or not api_ready):sys.exit(1)
++PY
++}
++
++unique_node() {
++  local name="$1" nodes
++  nodes="$(timeout 8 ros2 node list --no-daemon --spin-time 2)" || return 1
++  if awk -v name="/$name" '$0==name || index($0,name "_")==1 {found=1} END {exit !found}' <<< "$nodes"; then
++    echo "已有节点 $name，拒绝重复启动；核对原终端。" >&2; return 1
++  fi
++  if [[ "$action" == agent ]] && grep -Eq '^/(vlm_nav|multi_agent_.*check_motion|multi_agent_.*rgbd)$' <<< "$nodes"; then
++    echo '已有独立探索/感知任务拥有者，请先从原入口结束并确认停稳。' >&2; return 1
++  fi
++}
++
++case "$action" in
++  preflight) preflight live;;
++  bridge)
++    preflight transport
++    bridge_name="$(python3 -c 'import sys,yaml;print(yaml.safe_load(open(sys.argv[1]))["name"])' "$COOP_BRIDGE_YAML")"
++    unique_node "$bridge_name"
++    exec env -u ROS_DOMAIN_ID CYCLONEDDS_URI="file://$COOP_BRIDGE_DDS_XML" ros2 run domain_bridge domain_bridge "$COOP_BRIDGE_YAML";;
++  agent|coordinator)
++    preflight transport
++    node_name="multi_agent_${side}_agent";executable=multi_agent_agent_node
++    params=(-p "robot_id:=$side")
++    if [[ "$action" == coordinator ]]; then node_name=multi_agent_coordinator;executable=multi_agent_coordinator_node;params=();fi
++    unique_node "$node_name"
++    exec ros2 run multi_agent_nav "$executable" --ros-args -r "__node:=$node_name" \
++      -p simulation:=false -p topic_prefix:=/multi_agent -p "config_dir:=$COOP_CONFIG" "${params[@]}";;
++  check) exec python3 "$repo/scripts/check_multi_agent_comm.py" --side "$side" check --config-dir "$COOP_CONFIG";;
++  state) exec ros2 topic echo "/multi_agent/$side/state" multi_agent_task_msgs/msg/AgentState;;
++  peer)
++    peer=go2;[[ "$side" == go2 ]] && peer=ranger
++    exec ros2 topic echo "/multi_agent/$peer/state" multi_agent_task_msgs/msg/AgentState;;
++  watch) exec ros2 topic echo /multi_agent/coordinator/status std_msgs/msg/String;;
++  start)
++    preflight live
++    scenario="$(python3 -c 'import sys,yaml;print(yaml.safe_load(open(sys.argv[1]))["scenario_id"])' "$COOP_CONFIG/scene.yaml")"
++    exec ros2 run multi_agent_nav multi_agent_start_task start --scenario "$scenario";;
++  pause) exec ros2 run multi_agent_nav multi_agent_start_task pause;;
++esac
+--- /dev/null
++++ b/test/test_cooperative_startup.py
+@@ -0,0 +1,142 @@
++"""Manual cooperative commands and incoming Go2 sync compatibility, without ROS nodes."""
++from dataclasses import replace
++import os
++from pathlib import Path
++import shutil
++import subprocess
++
++import pytest
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def test_environment_uses_local_mode_preserves_keys_and_nounset(tmp_path):
++    repo=tmp_path/'env repo';repo.mkdir()
++    shutil.copy2(ROOT/'Cooperative_env.bash',repo/'Cooperative_env.bash')
++    cfg=repo/'config';cfg.mkdir()
++    for name in ('cyclonedds_ranger_local.xml','cyclonedds_ranger_multi_agent_bridge.xml','bridge_ranger_pending.yaml'):
++        (cfg/name).touch()
++    (repo/'RangerVLM_env.bash').write_text('[[ "${1:-}" == local ]] || return 9\nexport RANGER_CONFIG="$FIXTURE_CONFIG"\n')
++    result=subprocess.run(['bash','-c','set -u; source "$1/Cooperative_env.bash" ranger || exit; [[ "$-" == *u* && "$DASHSCOPE_API_KEY" == test_only && "$ROS_DOMAIN_ID" == 0 && "$RMW_IMPLEMENTATION" == rmw_cyclonedds_cpp ]]',
++        'test',str(repo)],env={**os.environ,'FIXTURE_CONFIG':str(cfg),'DASHSCOPE_API_KEY':'test_only'},capture_output=True,text=True)
++    assert result.returncode==0,result.stderr
++    assert 'test_only' not in result.stdout+result.stderr
++
++
++def test_go2_environment_loads_independent_overlay_last(tmp_path):
++    repo=tmp_path/'go2';repo.mkdir();(repo/'config').mkdir()
++    shutil.copy2(ROOT/'Cooperative_env.bash',repo/'Cooperative_env.bash')
++    cfg=repo/'task config';cfg.mkdir()
++    (cfg/'bridge_go2_pending.yaml').touch()
++    for name in ('cyclonedds_go2.xml','cyclonedds_go2_multi_agent_bridge.xml'):(repo/'config'/name).touch()
++    overlay=repo/'build/go2-independent-c-20261020/install';overlay.mkdir(parents=True)
++    (repo/'CoVLM_env.bash').write_text('export GO2_EXPLORE_CONFIG="$FIXTURE_CONFIG"\nexport OVERLAY_ORDER=old\n')
++    (overlay/'local_setup.bash').write_text('export OVERLAY_ORDER=new\n')
++    result=subprocess.run(['bash','-c','source "$1/Cooperative_env.bash" go2 || exit; [[ "$OVERLAY_ORDER" == new && "$GO2_NET_IFACE" == enp4s0 ]]',
++        'test',str(repo)],env={**os.environ,'FIXTURE_CONFIG':str(cfg),'COOP_SETUP_FILE':''},capture_output=True,text=True)
++    assert result.returncode==0,result.stderr
++
++
++def test_help_needs_no_environment():
++    result = subprocess.run(['bash', str(ROOT/'scripts/cooperative.sh'), '--help'], capture_output=True, text=True)
++    assert result.returncode == 0, result.stderr
++    assert 'preflight' in result.stdout and 'pause' in result.stdout
++
++
++@pytest.fixture
++def command_fixture(tmp_path):
++    repo = tmp_path/'manual setup'
++    (repo/'scripts').mkdir(parents=True)
++    shutil.copy2(ROOT/'scripts/cooperative.sh', repo/'scripts/cooperative.sh')
++    (repo/'Cooperative_env.bash').write_text('export COOP_SIDE="$1"\nexport ROS_DOMAIN_ID=0\nexport COOP_CONFIG="$FIXTURE_CONFIG"\nexport COOP_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\nexport COOP_BRIDGE_DDS_XML="$FIXTURE_CONFIG/bridge.xml"\nexport COOP_BRIDGE_YAML="$FIXTURE_CONFIG/bridge.yaml"\n')
++    cfg=tmp_path/'config';cfg.mkdir()
++    (cfg/'scene.yaml').write_text('scenario_id: lab\n')
++    tools=tmp_path/'bin';tools.mkdir()
++    (tools/'ros2').write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$TRACE"\nif [[ "$1 $2" == "node list" ]]; then printf "%s\\n" "${NODES:-}"; else printf "ENV %s %s\\n" "${ROS_DOMAIN_ID-UNSET}" "${CYCLONEDDS_URI-}" >> "$TRACE"; fi\n')
++    (tools/'ros2').chmod(0o755)
++    # External Python/ROS validation is isolated here; real preflight is tested separately.
++    (tools/'python3').write_text('#!/bin/bash\ncat >/dev/null\nif [[ "${PYTHON_MODE:-}" == scenario ]]; then echo lab; else exit "${PREFLIGHT_EXIT:-0}"; fi\n')
++    (tools/'python3').chmod(0o755)
++    trace=tmp_path/'trace'
++    env={**os.environ,'PATH':str(tools)+':'+os.environ['PATH'],'TRACE':str(trace),'FIXTURE_CONFIG':str(cfg)}
++    def run(side,action,**extra):
++        result=subprocess.run(['bash',str(repo/'scripts/cooperative.sh'),side,action],env={**env,**extra},capture_output=True,text=True,timeout=5)
++        calls=trace.read_text().splitlines() if trace.exists() else []
++        return result,calls
++    return run
++
++
++def test_agent_uses_new_task_node_and_never_starts_task(command_fixture):
++    result,calls=command_fixture('ranger','agent')
++    assert result.returncode==0,result.stderr
++    assert any('run multi_agent_nav multi_agent_agent_node' in c for c in calls)
++    assert not any('multi_agent_comm' in c or 'multi_agent_start_task' in c for c in calls)
++
++
++def test_duplicate_agent_is_rejected(command_fixture):
++    result,calls=command_fixture('ranger','agent',NODES='/multi_agent_ranger_agent')
++    assert result.returncode!=0
++    assert not any('run multi_agent_nav' in c for c in calls)
++
++
++def test_coordinator_can_attach_to_existing_go2_agent_and_its_observer(command_fixture):
++    result,calls=command_fixture('go2','coordinator',NODES='/multi_agent_go2_agent\n/multi_agent_go2_rgbd')
++    assert result.returncode==0,result.stderr
++    assert any('run multi_agent_nav multi_agent_coordinator_node' in c for c in calls)
++
++
++@pytest.mark.parametrize('action',['coordinator','start','pause','watch'])
++def test_go2_only_actions_are_rejected_on_ranger(command_fixture,action):
++    result,calls=command_fixture('ranger',action)
++    assert result.returncode!=0 and not calls
++
++
++def test_failed_live_preflight_cannot_start_task(command_fixture):
++    result,calls=command_fixture('go2','start',PREFLIGHT_EXIT='1')
++    assert result.returncode!=0 and not calls
++
++
++def test_pause_does_not_depend_on_preflight(command_fixture):
++    result,calls=command_fixture('go2','pause',PREFLIGHT_EXIT='1')
++    assert result.returncode==0,result.stderr
++    assert any('multi_agent_start_task pause' in c for c in calls)
++
++
++def test_explicit_start_uses_configured_scenario(command_fixture):
++    result,calls=command_fixture('go2','start',PYTHON_MODE='scenario')
++    assert result.returncode==0,result.stderr
++    assert any('multi_agent_start_task start --scenario lab' in c for c in calls)
++    assert not any('multi_agent_agent_node' in c for c in calls)
++
++
++def test_bridge_unsets_default_domain_and_uses_dual_domain_xml(command_fixture):
++    result,calls=command_fixture('ranger','bridge',PYTHON_MODE='scenario')
++    assert result.returncode==0,result.stderr
++    assert any('run domain_bridge domain_bridge' in c for c in calls)
++    assert any(c.startswith('ENV UNSET file://') and c.endswith('/bridge.xml') for c in calls)
++
++
++@pytest.mark.parametrize('mode',['legacy','upstream','upstream_default'])
++def test_private_agent_accepts_both_sync_encodings(mode):
++    from multi_agent_nav.mock import mock_config,make_machine
++    from multi_agent_nav.models import Command,validate_command
++    cfg=mock_config();cfg['scene']['share_c_coordinates']=False
++    machine,_=make_machine(cfg,'ranger',True)
++    from multi_agent_nav.models import Health,Pose2D
++    machine.tick(0,Health(Pose2D(),True,True,True,[],False,[[.3,.2],[.3,-.2],[-.3,-.2],[-.3,.2]],True))
++    sync=Command(task_id='new-task',recipient_id='ranger',action='SYNC' if mode=='legacy' else 'SYNC_LOCAL_C',
++        common_frame_id='',alignment_id='')
++    if mode!='upstream_default':sync=replace(sync,kind='SYNC_LOCAL_C' if mode=='legacy' else '')
++    context=replace(machine.context,task_id='new-task')
++    assert validate_command(sync,context).accepted
++    assert machine.accept(sync,0).accepted
++    assert machine.context.task_id=='new-task' and machine.sync_received==0
++
++
++def test_upstream_private_sync_is_rejected_in_shared_mode():
++    from multi_agent_nav.mock import mock_config,make_machine
++    from multi_agent_nav.models import Command,validate_command
++    machine,_=make_machine(mock_config(),'ranger',True)
++    context=replace(machine.context,task_id='t')
++    command=Command(task_id='t',recipient_id='ranger',action='SYNC_LOCAL_C',common_frame_id='lab_ref',alignment_id='SYNTHETIC_v1')
++    assert not validate_command(command,context).accepted
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/models.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/models.py
+@@ -1,4 +1,4 @@
+-from dataclasses import dataclass, field
++from dataclasses import dataclass, field, replace
+ import math
+ 
+ SCHEMA_VERSION = 1
+@@ -207,7 +207,13 @@
+     parent_command_id: str = ''
+     token: str = ''
+ 
++def normalize_command(command):
++    if command.action=='SYNC_LOCAL_C' and command.kind in ('','WAIT','SYNC_LOCAL_C'):
++        return replace(command,action='SYNC',kind='SYNC_LOCAL_C')
++    return command
++
+ def validate_command(command, context):
++    command=normalize_command(command)
+     if command.schema_version != SCHEMA_VERSION:
+         return CommandReply(False, 'schema mismatch')
+     if command.recipient_id != context.robot_id and not (
+--- a/cooperative_ws/src/multi_agent_nav/multi_agent_nav/agent.py
++++ b/cooperative_ws/src/multi_agent_nav/multi_agent_nav/agent.py
+@@ -69,6 +69,7 @@
+             self.effects.append(Effect('PLAN', self.selected_goal))
+ 
+     def accept(self, command, now):
++        command=normalize_command(command)
+         # SYNC alone establishes a task; EXECUTE can never silently replace it.
+         if command.action == 'SYNC' and command.task_id != self.context.task_id:
+             if command.task_id in self.retired_tasks:
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -104,6 +104,7 @@
+   ament_add_pytest_test(test_ranger_local_launch test/test_ranger_local_launch.py)
+   ament_add_pytest_test(test_ranger_check test/test_ranger_check.py)
+   ament_add_pytest_test(test_ranger_startup test/test_ranger_startup.py)
++  ament_add_pytest_test(test_cooperative_startup test/test_cooperative_startup.py)
+   ament_add_pytest_test(test_ranger_monitor test/test_ranger_monitor.py)
+   ament_add_pytest_test(test_latest_frame_worker test/test_latest_frame_worker.py)
+   ament_add_pytest_test(test_navigation_gate test/test_navigation_gate.py)

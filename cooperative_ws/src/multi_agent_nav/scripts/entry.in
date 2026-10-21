@@ -1,0 +1,3 @@
+#!@COOPERATIVE_RUNTIME_PYTHON@
+from multi_agent_nav.@ENTRY_MODULE@ import main
+raise SystemExit(main())

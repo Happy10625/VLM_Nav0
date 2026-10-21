@@ -1,0 +1,44 @@
+name: go2_cooperative_task_bridge
+from_domain: 0
+to_domain: 40
+topics:
+  /multi_agent/go2/state:
+    type: multi_agent_task_msgs/msg/AgentState
+    reversed: false
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10
+  /multi_agent/go2/observation:
+    type: multi_agent_task_msgs/msg/Observation
+    reversed: false
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 50
+  /multi_agent/ranger/state:
+    type: multi_agent_task_msgs/msg/AgentState
+    reversed: true
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10
+  /multi_agent/ranger/observation:
+    type: multi_agent_task_msgs/msg/Observation
+    reversed: true
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 50
+  /multi_agent/go2/command:
+    type: multi_agent_task_msgs/msg/Command
+    reversed: false
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10

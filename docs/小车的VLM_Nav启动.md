@@ -1,10 +1,10 @@
 使用方式：
 
 ```bash
-cd /home/isee-cdh/ws/VLM_Nav
+cd /home/isee601/ws/VLM_Nav
 
 ./scripts/start_fixed_map_navigation.sh \
---map /home/isee-cdh/ws/VLM_Nav/shared_maps/lab_ranger_20261006/lab.yaml \
+--map /home/isee601/ws/VLM_Nav/shared_maps/lab_ranger_20261006/lab.yaml \
 "红色灭火器"
 ```
 
@@ -27,7 +27,7 @@ cd /home/isee-cdh/ws/VLM_Nav
 启动后，在 RViz 设置 2D Pose Estimate，待 AMCL 收敛且检查通过后手动使能：
 
 ```bash
-cd /home/isee-cdh/ws/VLM_Nav
+cd /home/isee601/ws/VLM_Nav
 #  VLM_NAV_LOCALIZATION_MODE=amcl ./scripts/check_system.sh
 ./scripts/arm.sh  
 ```
@@ -35,7 +35,7 @@ cd /home/isee-cdh/ws/VLM_Nav
 停止：
 
 ```bash
-cd /home/isee-cdh/ws/VLM_Nav
+cd /home/isee601/ws/VLM_Nav
 ./scripts/stop.sh
 ```
 

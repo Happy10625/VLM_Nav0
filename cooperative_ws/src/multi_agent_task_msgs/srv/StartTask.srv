@@ -1,0 +1,5 @@
+string scenario_id
+---
+bool accepted
+string task_id
+string reason

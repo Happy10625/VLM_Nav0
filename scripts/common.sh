@@ -7,11 +7,11 @@ set +u
 source /opt/ros/humble/setup.bash
 
 for setup_file in \
-  /home/isee-cdh/ros2_ws/install/setup.bash \
-  /home/isee-cdh/rs515/ros2_ws/install/setup.bash \
-  /home/isee-cdh/agilex_ws/install/setup.bash \
-  /home/isee-cdh/ws/install_fastlio/setup.bash \
-  /home/isee-cdh/ws/VLM_Nav/install/setup.bash; do
+  /home/isee601/ros2_ws/install/setup.bash \
+  /home/isee601/rs515/ros2_ws/install/setup.bash \
+  /home/isee601/agilex_ws/install/setup.bash \
+  /home/isee601/ws/install_fastlio/setup.bash \
+  /home/isee601/ws/VLM_Nav/install/setup.bash; do
   if [[ -f "$setup_file" ]]; then
     source "$setup_file"
   else
