@@ -3,9 +3,9 @@ enabled: false
 simulation: false
 share_c_coordinates: false
 targets:
-  A: 灭火器
-  B: 水杯
-  C: 篮子
+  A: 纸巾
+  B: 浅棕色盒子
+  C: 椅子
 viewpoints:
   go2:
     - id: go2_view_01

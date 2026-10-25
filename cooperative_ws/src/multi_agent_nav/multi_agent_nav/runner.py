@@ -66,10 +66,11 @@ class AgentRunner:
         robot['scan_angles']=[-(i+1)*math.pi/4 for i in range(8)]
         config['robot_'+machine.context.robot_id]=robot
         self.local_steps=explore_steps(self.adapter,config,machine.frame,
-            self.now+config['scene'].get('task_timeout',600.),self.descriptions[command.target_id],
+            machine.task_started_at+machine.task_timeout,self.descriptions[command.target_id],
             self._record_local,self.owners,None,self.motion_guard,clock=lambda:self.now,
             robot_id=machine.context.robot_id,target_id=command.target_id,
             success_radius=self.success_radius,require_navigation_success=True,
+            scan_at_start=machine.context.robot_id=='ranger' and command.sequence==1,
             task_id=command.task_id,command_id=command.command_id,on_observation=self._local_observation,
             initial_observation=machine.local_observations.get(command.observation_id) if command.kind=='APPROACH_DEPOSIT' else None)
 

@@ -9,6 +9,8 @@ class Coordinator:
         self.gates = list(gates or [])
         self.phase, self.task_id, self.reason = 'IDLE', '', ''
         self.states, self.received_at, self.observations = {}, {}, {}
+        self.transport_received_at, self.task_received_at = {}, {}
+        self.state_errors = {}
         self.commands, self.reservations, self.rejected = {}, {}, set()
         self.sequence = {r:0 for r in ROBOTS}
         self.acked = {r:0 for r in ROBOTS}
@@ -28,19 +30,28 @@ class Coordinator:
             data.common_frame_id, data.alignment_id) == (('','') if self.private else ('lab_ref', self.alignment_id))
 
     def ingest_state(self, state, received_at):
-        if not self._identity(state):
-            if self.task_id and state.robot_id in ROBOTS:self.pause('peer map/mode identity changed')
+        if state.robot_id not in ROBOTS:return
+        error=''
+        if not self._identity(state):error='peer map/mode identity changed'
+        elif self.private and (state.pose_valid or state.common_pose!=Pose2D()):error='private peer published coordinates'
+        elif state.simulation!=self.simulation:error='simulation/live state mismatch'
+        if error:
+            self.state_errors[state.robot_id]=error
+            if self.private and (not self.task_id or self.phase=='SYNCING'):
+                self.states.pop(state.robot_id,None)
+            elif self.task_id:self.pause(error)
             return
-        if self.private and (state.pose_valid or state.common_pose!=Pose2D()):return
-        if state.simulation != self.simulation:
-            if self.task_id:
-                self.pause('simulation/live state mismatch')
-            return
+        self.state_errors.pop(state.robot_id,None)
+        self.transport_received_at[state.robot_id]=received_at
         if self.task_id and state.task_id not in ('', self.task_id):
+            return
+        if self.private and self.task_id and self.phase not in ('SYNCING','PAUSED','DONE','FAILED') and not state.task_id:
+            self.pause(state.robot_id+': peer restarted during task')
             return
         previous = self.states.get(state.robot_id)
         if previous and previous.task_id == state.task_id and state.sequence < previous.sequence:
             return
+        if self.task_id and state.task_id==self.task_id:self.task_received_at[state.robot_id]=received_at
         self.states[state.robot_id], self.received_at[state.robot_id] = state, received_at
         if self.resources:
             self._resource_feedback(state, received_at)
@@ -72,9 +83,12 @@ class Coordinator:
             state = self.states.get(robot)
             if not state or now-self.received_at[robot] > self.lost_timeout or not (
                 (self.private or state.pose_valid) and state.localization_valid and state.nav_ready and state.stopped) or state.token:
-                return StartReply(False, reason=f'{robot}: fresh healthy stopped state required')
+                return StartReply(False, reason=f'{robot}: '+self.state_errors.get(robot,'fresh healthy stopped state required'))
+            if self.private and not (startup_state(state) or state.run_state=='PAUSED'):
+                return StartReply(False,reason=f'{robot}: waiting for local/peer readiness')
+        self.task_received_at.clear()
         self.task_id = uuid.uuid4().hex
-        self.phase, self.started, self.reason = 'SEARCH_AB', now, ''
+        self.phase, self.started, self.reason = 'SYNCING' if self.private else 'SEARCH_AB', now, ''
         self.observations, self.commands, self.reservations, self.rejected = {}, {}, {}, set()
         self.planner = RulePlanner()
         self.sequence = {r:0 for r in ROBOTS}
@@ -90,6 +104,7 @@ class Coordinator:
                        alignment_id='' if self.private else self.alignment_id, simulation=self.simulation, **kwargs)
 
     def pause(self, reason):
+        if self.phase=='PAUSED':return [self.control(r,'PAUSE') for r in ROBOTS] if self.task_id else []
         self.phase, self.reason = 'PAUSED', reason
         if self.resources:
             for robot in ROBOTS:
@@ -120,12 +135,27 @@ class Coordinator:
     def tick(self, now):
         if not self.task_id:
             return []
+        if self.phase not in ('PAUSED','DONE','FAILED') and now-self.started>self.task_timeout:
+            return self.pause('task timeout')
+        if self.phase=='SYNCING':
+            pending=[robot for robot in ROBOTS if not (
+                robot in self.states and now-self.received_at[robot]<=self.lost_timeout and
+                self.states[robot].task_id==self.task_id and self.states[robot].reply=='SYNCED' and
+                self.states[robot].run_state=='SYNCED' and startup_state(self.states[robot],syncing=True))]
+            if pending:
+                self.reason='waiting SYNCED: '+', '.join(robot+(': '+self.state_errors[robot] if robot in self.state_errors else '') for robot in pending)
+                return [self.control(r,'SYNC') for r in ROBOTS]
+            self.phase,self.reason='SEARCH_AB',''
         if self.phase not in ('PAUSED','DONE','FAILED'):
             for robot in ROBOTS:
                 state = self.states.get(robot)
-                if not state or now-self.received_at[robot] > self.lost_timeout or not (
-                    (self.private or state.pose_valid) and state.localization_valid and state.nav_ready) or state.run_state in ('STOPPING','PAUSED'):
-                    self.pause(f'{robot}: health/heartbeat lost')
+                if not state or now-self.received_at[robot]>self.lost_timeout:
+                    self.pause(f'{robot}: heartbeat timeout')
+                elif not ((self.private or state.pose_valid) and state.localization_valid and state.nav_ready):
+                    self.pause(f'{robot}: health invalid: '+', '.join(name for name in ('localization_valid','nav_ready') if not getattr(state,name)))
+                elif state.run_state in ('STOPPING','PAUSED'):
+                    self.pause(f'{robot}: agent paused: '+state.reason)
+                if self.phase=='PAUSED':break
             if now-self.started > self.task_timeout:
                 self.pause('task timeout')
         output = [self.control(r, 'SYNC', ack_sequence=self.acked[r]) for r in ROBOTS]

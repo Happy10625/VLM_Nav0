@@ -206,6 +206,28 @@ def test_detection_stops_search_even_without_projected_position():
     assert len(adapter.calls) == 1
 
 
+@pytest.mark.parametrize('later_located',[False,True])
+def test_unreliable_depth_after_full_scan_continues_exploration(later_located):
+    from types import SimpleNamespace as S
+    from multi_agent_nav.adapters.vision import observations_from_results
+    from vlm_nav.models import VLMResult, Pixel
+    adapter=LocalFixture();events=[]
+    frame=FrameAdapter('fixture','1','lab_ref','',[0,0,0])
+    result=VLMResult(True,.95,Pixel(2,2),None,True,True,True)
+    def scan(descriptions,scan_id):
+        adapter.scans+=1
+        project=lambda *args:((2.,3.,1.),'ok') if later_located and adapter.scans==2 else (
+            None,'insufficient_valid_depth_samples:0/8')
+        return completed(observations_from_results({'A':('DETECTED',result)},
+            S(stamp=S(sec=adapter.scans,nanosec=0)),project,frame,scan_id,0,targets=descriptions))
+    adapter.start_scan=scan
+    assert run_case(adapter,events)==('TARGET_FOUND' if later_located else 'EXHAUSTED')
+    assert adapter.scans==(2 if later_located else 3)
+    assert not any(e['state']=='TARGET_DETECTED_UNLOCATED' for e in events)
+    first_scan=next(e for e in events if e['state']=='SCAN_RESULT')
+    assert first_scan['observations'][0]['status']=='UNCERTAIN'
+
+
 @pytest.mark.parametrize('mode', ['lost', 'api', 'stop'])
 def test_health_api_error_or_unconfirmed_stop_cannot_advance(mode):
     from multi_agent_nav.go2_exploration import ExplorationStopped

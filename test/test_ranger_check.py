@@ -177,3 +177,20 @@ def test_shell_entry_does_not_pass_check_options_to_environment_loader():
     assert result.returncode == 0, result.stdout + result.stderr
     assert '--hardware-only' in result.stdout
     assert '用法：source' not in result.stdout
+
+
+def test_hardware_check_receives_large_camera_images_reliably(check, monkeypatch):
+    import rclpy
+    from rclpy.qos import ReliabilityPolicy
+    from types import SimpleNamespace
+    subscriptions = {}
+    node = SimpleNamespace(
+        create_subscription=lambda kind, topic, callback, qos: subscriptions.setdefault(topic, qos),
+        get_publishers_info_by_topic=lambda topic: [], destroy_node=lambda: None)
+    monkeypatch.setattr(rclpy, 'init', lambda: None)
+    monkeypatch.setattr(rclpy, 'shutdown', lambda: None)
+    monkeypatch.setattr(rclpy, 'create_node', lambda name: node)
+    check.hardware_probe(0)
+    assert subscriptions['/camera/color/image_raw'].reliability == ReliabilityPolicy.RELIABLE
+    assert subscriptions['/camera/aligned_depth_to_color/image_raw'].reliability == ReliabilityPolicy.RELIABLE
+    assert subscriptions['/livox/lidar'].reliability == ReliabilityPolicy.BEST_EFFORT

@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
+#include <array>
+#include <cmath>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -52,6 +54,117 @@ sensor_msgs::msg::PointCloud2 make_cloud()
   return cloud;
 }
 }  // namespace
+
+namespace
+{
+sensor_msgs::msg::PointCloud2 scan(
+  double seconds, const std::vector<std::array<float, 3>> & points)
+{
+  sensor_msgs::msg::PointCloud2 cloud;
+  cloud.header.frame_id = "odom";
+  const auto ns = static_cast<int64_t>(std::llround(seconds * 1e9));
+  cloud.header.stamp.sec = ns / 1000000000;
+  cloud.header.stamp.nanosec = ns % 1000000000;
+  sensor_msgs::PointCloud2Modifier modifier(cloud);
+  modifier.setPointCloud2FieldsByString(1, "xyz");
+  modifier.resize(points.size());
+  sensor_msgs::PointCloud2Iterator<float> x(cloud, "x"), y(cloud, "y"), z(cloud, "z");
+  for (const auto & p : points) {
+    *x = p[0]; *y = p[1]; *z = p[2];
+    ++x; ++y; ++z;
+  }
+  return cloud;
+}
+const std::vector<std::array<float, 3>> hit{{1.01F, .01F, .5F}};
+}
+
+TEST(PlanarConfirmation, RequiresThreeCompletedCyclesNotThreeFramesOrPoints)
+{
+  vlm_nav::PlanarObstacleConfirmation confirmation(.05, .8, 3);
+  for (double t : {1., 1.1, 1.2, 1.79, 1.8, 2., 2.59, 2.6, 3.39}) {
+    EXPECT_EQ(confirmation.filter(scan(t, {hit[0], hit[0], hit[0]})).width, 0u);
+  }
+  auto output = confirmation.filter(scan(3.4, hit));
+  EXPECT_EQ(output.width, 1u);
+  EXPECT_EQ(output.header.frame_id, "odom");
+  EXPECT_EQ(output.header.stamp.nanosec, 400000000u);
+}
+
+TEST(PlanarConfirmation, CountsXYRegardlessOfHeightAndKeepsOnlyCurrentConfirmedPoints)
+{
+  vlm_nav::PlanarObstacleConfirmation confirmation(.05, .8, 3);
+  EXPECT_EQ(confirmation.filter(scan(1., {{1.01F, .01F, .2F}})).width, 0u);
+  EXPECT_EQ(confirmation.filter(scan(1.8, {{1.02F, .02F, 1.2F}})).width, 0u);
+  EXPECT_EQ(confirmation.filter(scan(2.6, hit)).width, 0u);
+  const auto current = scan(3.4, {{1.03F, .03F, .8F}, {2.01F, .01F, .5F}});
+  auto output = confirmation.filter(current);
+  EXPECT_EQ(output.width, 1u);
+  sensor_msgs::PointCloud2ConstIterator<float> z(output, "z");
+  EXPECT_FLOAT_EQ(*z, .8F);
+  EXPECT_EQ(output.fields, current.fields);
+  EXPECT_EQ(confirmation.filter(scan(3.5, {})).width, 0u);
+}
+
+TEST(PlanarConfirmation, MissingCycleAndStreamGapRequireFreshConfirmation)
+{
+  vlm_nav::PlanarObstacleConfirmation confirmation(.05, .8, 3);
+  confirmation.filter(scan(1., hit));
+  confirmation.filter(scan(1.8, {}));
+  for (double t : {2.6, 3.4, 4.2}) {
+    EXPECT_EQ(confirmation.filter(scan(t, hit)).width, 0u);
+  }
+  EXPECT_EQ(confirmation.filter(scan(5., hit)).width, 1u);
+  EXPECT_EQ(confirmation.filter(scan(7.4, hit)).width, 0u);
+  EXPECT_EQ(confirmation.filter(scan(8.2, hit)).width, 0u);
+  EXPECT_EQ(confirmation.filter(scan(9., hit)).width, 0u);
+  EXPECT_EQ(confirmation.filter(scan(9.8, hit)).width, 1u);
+}
+
+TEST(PlanarConfirmation, DuplicateOutOfOrderFrameChangesAndResetCannotReuseHistory)
+{
+  vlm_nav::PlanarObstacleConfirmation confirmation(.05, .8, 3);
+  confirmation.filter(scan(1., hit));
+  for (int i = 0; i < 20; ++i) {
+    EXPECT_EQ(confirmation.filter(scan(1., hit)).width, 0u);
+  }
+  confirmation.filter(scan(1.8, hit));
+  confirmation.filter(scan(2.6, hit));
+  EXPECT_EQ(confirmation.filter(scan(3.4, hit)).width, 1u);
+  EXPECT_EQ(confirmation.filter(scan(2., hit)).width, 0u);
+  EXPECT_EQ(confirmation.filter(scan(3.5, hit)).width, 0u);
+  confirmation.reset();
+  EXPECT_EQ(confirmation.filter(scan(3.6, hit)).width, 0u);
+  auto other_frame = scan(4.4, hit);
+  other_frame.header.frame_id = "map";
+  EXPECT_EQ(confirmation.filter(other_frame).width, 0u);
+  EXPECT_EQ(confirmation.filter(scan(5.2, hit)).width, 0u);
+}
+
+TEST(PlanarConfirmation, RejectsInvalidSettings)
+{
+  EXPECT_THROW(vlm_nav::PlanarObstacleConfirmation(0., .8, 3), std::invalid_argument);
+  EXPECT_THROW(vlm_nav::PlanarObstacleConfirmation(.05, 0., 3), std::invalid_argument);
+  EXPECT_THROW(vlm_nav::PlanarObstacleConfirmation(.05, .8, 0), std::invalid_argument);
+}
+
+TEST(PlanarConfirmation, LateFirstHitStillRequiresFullConfirmationDuration)
+{
+  vlm_nav::PlanarObstacleConfirmation confirmation(.05, .8, 3);
+  confirmation.filter(scan(1., {}));
+  for (double t : {1.79, 1.8, 2.6, 3.4}) {
+    EXPECT_EQ(confirmation.filter(scan(t, hit)).width, 0u);
+  }
+  EXPECT_EQ(confirmation.filter(scan(4.19, hit)).width, 1u);
+}
+
+TEST(PlanarConfirmation, AdjacentPlanarCellsDoNotShareEvidence)
+{
+  vlm_nav::PlanarObstacleConfirmation confirmation(.05, .8, 3);
+  confirmation.filter(scan(1., {{-.01F, .01F, .5F}}));
+  confirmation.filter(scan(1.8, {{.01F, .01F, .5F}}));
+  confirmation.filter(scan(2.6, {{-.01F, .01F, .5F}}));
+  EXPECT_EQ(confirmation.filter(scan(3.4, {{.01F, .01F, .5F}})).width, 0u);
+}
 
 TEST(ObstacleCloudFilter, RejectsInvalidParameters)
 {

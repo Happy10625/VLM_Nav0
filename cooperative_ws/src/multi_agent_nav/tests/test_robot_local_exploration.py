@@ -39,7 +39,7 @@ class RangerFixture(FakeAdapter):
     def __init__(self,detected):
         super().__init__('ranger',delay=.1);self.detected=detected;self.requested=[]
     def costmap_transform(self,global_goal=False):return object()
-    def costmap_candidate_free(self,goal,global_goal=False):return True
+    def costmap_candidate_free(self,goal,global_goal=False,*,allow_outside=False):return True
     def start_scan(self,descriptions,scan_id,*,stop_on_target=None):
         self.requested.append(descriptions)
         return completed([Observation(target_id=t,view_index=i,status='DETECTED' if t==self.detected else 'NOT_DETECTED',
@@ -98,7 +98,7 @@ def direct_reference_case(mode):
     """Nav2 may return a free path ending before the occupied object reference."""
     from multi_agent_nav.go2_exploration import explore
     frame=FrameAdapter('r','v','ranger_local_map','local_only',[10.,-2.,.4])
-    target=Pose2D(1.5,0.) if mode=='already_close' else Pose2D(1.85,0.) if mode=='cancel_band' else Pose2D(5.,2.)
+    target=Pose2D(1.5,0.) if mode in ('already_close','already_close_aborted') else Pose2D(1.85,0.) if mode=='cancel_band' else Pose2D(5.,2.)
     adapter=RangerFixture('B');adapter.delay=.5
     planned=[];events=[];now=[0.]
     def scan(descriptions,scan_id,*,stop_on_target=None):
@@ -116,11 +116,14 @@ def direct_reference_case(mode):
         if mode=='empty_path':return completed(PathResult(True,[]))
         return completed(PathResult(True,[adapter.pose,Pose2D(target.x-.7,target.y)]))
     adapter.compute_path=plan
+    if mode=='tolerance_exceeded':
+        adapter.read_approach_parameters=lambda:completed(dict(xy_goal_tolerance=.05,planner_tolerance=.9))
     adapter.costmap_transform=lambda global_goal=False:None if (
         mode=='stale_global' and global_goal and len(planned)>1) else object()
     def spin():
         now[0]+=.05
         approaching=any(row[2].goal_kind=='PICKUP_NAV' for row in adapter.active.values())
+        if approaching and mode in ('native_aborted','already_close_aborted'):adapter.aborts=1
         adapter.advance(now[0])
         if approaching and mode in ('retry','retry_exhausted'):
             attempts=sum(call[0]=='PICKUP_NAV' for call in adapter.calls)
@@ -139,12 +142,13 @@ def direct_reference_case(mode):
     return outcome,adapter,planned,events
 
 
-def test_ranger_plans_to_reference_with_planner_tolerance_and_cancels_on_distance():
+def test_ranger_plans_to_reference_and_waits_for_native_nav2_success():
     outcome,a,planned,events=direct_reference_case('success')
     assert outcome=='TARGET_APPROACHED'
     assert [planned[-1].x,planned[-1].y,planned[-1].yaw]==pytest.approx([5.,2.,.37])
     assert a.calls[-1][1]==planned[-1]
-    assert any(e['state']=='APPROACH_DISTANCE_STOP' for e in events)
+    assert not any(e['state']=='APPROACH_DISTANCE_STOP' for e in events)
+    assert any(e['state']=='ARRIVAL_VERIFIED' for e in events)
     assert not a.active and events[-1]['stop_confirmed'] is True
     assert events[-1]['measured_distance']<=.81
 
@@ -165,19 +169,31 @@ def test_ranger_direct_approach_keeps_freshness_cancellation_and_stop_checks(mod
     with pytest.raises(ExplorationStopped,match=reason):direct_reference_case(mode)
 
 
-def test_ranger_already_close_succeeds_without_target_planning_or_approach():
+def test_ranger_already_close_still_requires_current_native_navigation_success():
     outcome,a,planned,events=direct_reference_case('already_close')
-    assert outcome=='TARGET_APPROACHED' and len(planned)==1
-    assert [call[0] for call in a.calls]==['VIEWPOINT_NAV']
+    assert outcome=='TARGET_APPROACHED' and len(planned)==2
+    assert [call[0] for call in a.calls]==['VIEWPOINT_NAV','PICKUP_NAV']
 
 
-def test_ranger_inside_cancel_radius_verifies_stop_before_any_target_plan():
+def test_ranger_inside_old_cancel_radius_uses_native_navigation():
     outcome,a,planned,events=direct_reference_case('cancel_band')
     assert outcome=='TARGET_APPROACHED' and len(planned)==2
-    stopped_index=next(i for i,e in enumerate(events) if e['state']=='APPROACH_DISTANCE_STOP')
-    planning_index=next(i for i,e in enumerate(events) if e['state']=='APPROACH_PLANNING')
-    assert stopped_index<planning_index
-    assert [e['decision'] for e in events if e['state']=='ARRIVAL_VERIFIED']==['RETRY','SUCCESS']
+    assert not any(e['state']=='APPROACH_DISTANCE_STOP' for e in events)
+    assert [e['decision'] for e in events if e['state']=='ARRIVAL_VERIFIED']==['SUCCESS']
+
+
+@pytest.mark.parametrize('mode',['native_aborted','already_close_aborted'])
+def test_ranger_native_abort_cannot_succeed_even_inside_distance(mode):
+    outcome,adapter,_,events=direct_reference_case(mode)
+    assert outcome=='APPROACH_FAILED'
+    assert adapter.calls[-1][0]=='PICKUP_NAV'
+    assert not any(e['state']=='TARGET_APPROACHED' for e in events)
+
+
+def test_ranger_rejects_native_tolerances_exceeding_arrival_contract():
+    from multi_agent_nav.go2_exploration import ExplorationStopped
+    with pytest.raises(ExplorationStopped,match='tolerances exceed target success radius'):
+        direct_reference_case('tolerance_exceeded')
 
 
 @pytest.mark.parametrize('mode,expected', [('retry','TARGET_APPROACHED'),('retry_exhausted','APPROACH_DISTANCE_FAILED')])
@@ -189,7 +205,7 @@ def test_ranger_retry_keeps_reference_goal_and_verifies_final_stopped_distance(m
     verified=[e for e in events if e['state']=='ARRIVAL_VERIFIED']
     assert [e['decision'] for e in verified]==['RETRY','SUCCESS' if mode=='retry' else 'FAILED']
     radii=[e['cancel_radius'] for e in events if e['state']=='APPROACH_DISTANCE_STOP']
-    assert radii==([.89,.81] if mode=='retry' else [.89])
+    assert radii==[]
     assert events[-1]['stop_confirmed'] is True
 
 

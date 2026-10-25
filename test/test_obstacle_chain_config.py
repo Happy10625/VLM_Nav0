@@ -3,6 +3,7 @@ import re
 import xml.etree.ElementTree as ET
 
 import yaml
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -56,10 +57,11 @@ def test_diagnostics_are_periodic_and_cloud_callback_only_updates_statistics():
     assert "tf_failures_total" not in source
 
 
-def test_all_obstacle_consumers_share_the_filtered_cloud_and_height_range():
+@pytest.mark.parametrize('profile', ['nav2_overrides.yaml', 'nav2_ranger_local.yaml'])
+def test_all_obstacle_consumers_share_the_filtered_cloud_and_height_range(profile):
     mapping = (ROOT / "launch" / "mapping.launch.py").read_text()
     nav2 = yaml.safe_load(
-        (ROOT / "config" / "nav2_overrides.yaml").read_text()
+        (ROOT / "config" / profile).read_text()
     )
     robot = yaml.safe_load((ROOT / "config" / "robot.yaml").read_text())
 
@@ -72,15 +74,41 @@ def test_all_obstacle_consumers_share_the_filtered_cloud_and_height_range():
     ]["voxel_layer"]["fastlio_cloud"]
     assert global_cloud["topic"] == OBSTACLE_TOPIC
     assert local_cloud["topic"] == OBSTACLE_TOPIC
-    for source in (global_cloud, local_cloud):
+    confirmed_sources = []
+    for name, layer in [('global_costmap', 'obstacle_layer'), ('local_costmap', 'voxel_layer')]:
+        params = nav2[name][name]['ros__parameters'][layer]
+        assert set(params['observation_sources'].split()) == {'fastlio_cloud', 'confirmed_obstacles'}
+        assert params['fastlio_cloud']['marking'] is False
+        assert params['fastlio_cloud']['clearing'] is True
+        confirmed = params['confirmed_obstacles']
+        assert confirmed['topic'] == '/vlm_nav/confirmed_obstacle_cloud'
+        assert confirmed['marking'] is True
+        assert confirmed['clearing'] is False
+        confirmed_sources.append(confirmed)
+    for source in (global_cloud, local_cloud, *confirmed_sources):
         assert source["sensor_frame"] == "body"
-        assert source["min_obstacle_height"] == 0.05
-        assert source["max_obstacle_height"] == 1.50
+        assert source["min_obstacle_height"] == 0.10
+        assert source["max_obstacle_height"] == 1.60
 
     filter_params = robot["obstacle_cloud_filter"]["ros__parameters"]
     assert filter_params["input_topic"] == "/cloud_registered_body"
     assert filter_params["output_topic"] == OBSTACLE_TOPIC
     assert filter_params["target_frame"] == "base_link"
+    assert filter_params['confirmation_cycles'] == 3
+    assert filter_params['confirmation_period'] == .8
+    assert filter_params['confirmation_frame'] == 'odom'
+    assert filter_params['confirmed_topic'] == confirmed_sources[0]['topic']
+    assert filter_params['voxel_leaf_size'] == .05
+    assert filter_params['min_height'] == global_cloud['min_obstacle_height']
+    assert filter_params['max_height'] == global_cloud['max_obstacle_height']
+    assert filter_params['self_crop_min_z'] <= filter_params['min_height']
+    assert filter_params['self_crop_max_z'] >= filter_params['max_height']
+    assert '"min_height": 0.10' in mapping
+    assert '"max_height": 1.60' in mapping
+    voxel = nav2['local_costmap']['local_costmap']['ros__parameters']['voxel_layer']
+    assert 0 < voxel['z_voxels'] <= 16
+    assert voxel['origin_z'] <= -0.10  # Keep the existing clearing-ray origin coverage.
+    assert voxel['origin_z'] + voxel['z_resolution'] * voxel['z_voxels'] > local_cloud['max_obstacle_height']
 
 
 def test_behavior_server_and_arm_refresh_use_standard_local_costmap():

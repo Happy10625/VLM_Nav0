@@ -80,6 +80,7 @@ def load_catalog(config,robot_id='go2'):
     if not points:
         raise ValueError('no enabled observation viewpoints')
     return dict(points=points, furniture=furniture, image=str(image_path),
+                asset_paths=[str(path),str(semantic_path),str(image_path),info['yaml_path'],info['image_path']],
                 map_id=catalog['map_id'], map_version=catalog['map_version'],
                 semantic_yaml_sha256=catalog['semantic_yaml_sha256'],
                 annotated_image_sha256=catalog['annotated_image_sha256'],

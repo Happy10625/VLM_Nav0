@@ -259,7 +259,7 @@ class Nav2Adapter:
         now=time.monotonic()
         pose=Pose2D()
         valid=False
-        pose_age=None;pose_error=None
+        pose_age=None;pose_error=None;pose_error_detail=None
         try:
             tf=self.node.tf_buffer.lookup_transform('map','base_link',Time())
             stamp=tf.header.stamp.sec+tf.header.stamp.nanosec*1e-9
@@ -269,6 +269,12 @@ class Nav2Adapter:
         except Exception as error:
             valid=False
             pose_error=type(error).__name__
+            pose_error_detail=str(error)
+        if not valid and getattr(self,'last_health_details',{}).get('checks',{}).get('localization_valid') is True:
+            self.node.get_logger().warning(
+                f'Localization TF invalid: map->base_link; pose_age_s={pose_age}; '
+                f'pose_max_age_s={self.config.get("pose_max_age",1.0)}; '
+                f'pose_tf_error={pose_error}: {pose_error_detail}')
         stopped=now-self.odom_at<=self.config['odom_max_age'] and self.stationary_since is not None and now-self.stationary_since>=self.config['stationary_duration']
         gate_ages={name:now-v for name,v in getattr(self.node,'external_gate_receipts',{}).items()}
         checks=dict(self.readiness_checks(now),
@@ -278,11 +284,13 @@ class Nav2Adapter:
             odom_fresh=bool(self.odom_at and now-self.odom_at<=self.config['odom_max_age']),
             local_costmap=self.costmap_transform() is not None)
         if hasattr(self,'task_map_ready'):checks['active_task_map']=self.task_map_ready
+        if hasattr(self,'task_keepout_ready'):checks['active_task_keepout']=self.task_keepout_ready
         ready=all(checks.values())
         snapshot=getattr(self.node,'latest_snapshot',None)
         camera_tf_at=getattr(self.node,'last_camera_tf_success',None)
         self.last_health_details=dict(checks=dict(checks,localization_valid=valid),
             pose_age_s=pose_age,pose_max_age_s=self.config.get('pose_max_age',1.0),pose_tf_error=pose_error,
+            pose_tf_error_detail=pose_error_detail,
             external_gate_ages_s=gate_ages,external_gate_timeout_s=getattr(self.node.p,'external_gate_timeout',None),
             local_costmap=dict(getattr(self,'last_costmap_checks',{}).get('local',{})),
             rgbd_frame_age_s=now-snapshot.captured_monotonic if snapshot else None,
@@ -292,6 +300,9 @@ class Nav2Adapter:
         path_valid=bool(self.path) and now-self.path_at<=self.config.get('path_receive_timeout',5.0)
         if self.path and not path_valid and not getattr(self,'path_timeout_logged',False):
             self.path_timeout_logged=True
+            self.node.get_logger().warning(
+                f'Execution path receive timeout: topic={self.config.get("path_topic")}; '
+                f'receive_age_s={now-self.path_at:.3f}; timeout_s={self.config.get("path_receive_timeout",5.0)}')
             self._motion_event('PATH_RECEIVE_TIMEOUT',receive_age_s=now-self.path_at)
         return Health(pose,valid,ready,stopped,list(self.path),path_valid,self.config['footprint'],not self.motions,
                       'execution path missing or receive timeout' if not path_valid else '')
@@ -490,15 +501,17 @@ class Nav2Adapter:
         future=Future();future.set_result(True)
         return future
 
-    def start_scan(self,target_descriptions,scan_id,*,stop_on_target=None):
+    def start_scan(self,target_descriptions,scan_id,*,stop_on_target=None,task_id=None,command_id=None,current_view_only=False):
         if getattr(self,'read_only',False):raise RuntimeError('read-only adapter cannot start Spin/scan')
         if self.scan or self.motions:raise RuntimeError('motion not serial')
         if stop_on_target is not None and stop_on_target not in target_descriptions:
             raise ValueError('stop target must belong to requested scan')
         reply=Future()
-        self.scan={'reply':reply,'id':scan_id,'targets':target_descriptions,'stop_on_target':stop_on_target,'index':0,'phase':'SPIN',
-                   'navigation':getattr(self,'last_motion',('',{})),
-                   'initial':self.get_health().pose.yaw,'pending':None,'observations':[],'after':0,'deadline':time.monotonic()+self.config.get('scan_timeout',120.0)}
+        self.scan={'reply':reply,'id':scan_id,'targets':target_descriptions,'stop_on_target':stop_on_target,'index':0,
+                   'phase':'FRAME' if current_view_only else 'SPIN','current_view_only':current_view_only,
+                   'navigation':('',dict(task=task_id,command=command_id)) if task_id is not None else getattr(self,'last_motion',('',{})),
+                   'initial':self.get_health().pose.yaw,'pending':None,'observations':[],
+                   'after':time.monotonic() if current_view_only else 0,'deadline':time.monotonic()+self.config.get('scan_timeout',120.0)}
         return reply
 
     def _record_scan_view(self,scan,observations,consumer_status,error_type=None):
@@ -509,7 +522,7 @@ class Nav2Adapter:
         self._motion_event('VLM_VIEW_RESULT',nav_id,nav,scan_id=scan['id'],view_index=scan['index'],
             image_stamp_ns=scan['snapshot'].stamp.sec*10**9+scan['snapshot'].stamp.nanosec,
             consumer_status=consumer_status,error_type=error_type,
-            evidence_dir=str(evidence.directory) if evidence else None,
+            evidence_dir=str(evidence.directory) if evidence and evidence.directory is not None else None,
             observations=[asdict(o) for o in observations])
 
     def tick(self):
@@ -556,6 +569,7 @@ class Nav2Adapter:
                 scan['reply'].set_exception(RuntimeError(reason));self.scan=None;return
             scan['phase']='FRAME';scan['after']=now
         elif phase=='FRAME':
+            if not self.get_health().stopped:return
             snapshot=self.node.latest_snapshot
             if not self.node.vlm_input_ready(now) or snapshot.captured_monotonic<=scan['after'] or not self.vision.available:return
             evidence=None
@@ -563,11 +577,12 @@ class Nav2Adapter:
                 from ..scan_evidence import ScanEvidence
                 nav_id,nav=scan['navigation']
                 evidence=ScanEvidence(self.scan_evidence_dir,dict(scan_id=scan['id'],view_index=scan['index'],
-                    viewpoint_id=getattr(self,'scan_viewpoint_id',''),
+                    viewpoint_id=getattr(self,'scan_viewpoint_id',''),depth_attempt=scan.get('depth_attempt',1),
                     targets=scan['targets'],image_stamp_ns=snapshot.stamp.sec*10**9+snapshot.stamp.nanosec,
                     frame_id=snapshot.frame_id,image_sequence=snapshot.sequence,
                     image_shape=list(snapshot.rgb.shape),capture_pose=asdict(self.get_health().pose),
-                    scan_initial_yaw=scan['initial'],scan_requested_yaw=normalize_angle(scan['initial']+self.config['scan_angles'][scan['index']]),
+                    scan_initial_yaw=scan['initial'],scan_requested_yaw=normalize_angle(scan['initial']+
+                        (0. if scan.get('current_view_only') else self.config['scan_angles'][scan['index']])),
                     task_id=nav.get('task',''),command_id=nav.get('command',''),
                     navigation_goal_id=nav_id,native_action_uuid=nav.get('native_uuid',''),
                     navigation_goal_pose=nav.get('target'),api_timeout_s=self.config['api_timeout'],
@@ -605,11 +620,21 @@ class Nav2Adapter:
             observations=observations_from_results(results,scan['snapshot'],self.node.ground_pixel_with_reason,
                 self.frame,scan['id'],scan['index'],targets=scan['targets'],robot_id=self.config.get('robot_id','go2'))
             self._record_scan_view(scan,observations,'TIMEOUT' if error_type=='TimeoutError' else 'ERROR' if error_type else 'APPLIED',error_type)
+            if (self.config.get('robot_id')=='ranger' and scan.get('depth_attempt',1)<3 and
+                    any(o.target_id==scan.get('stop_on_target') and o.status=='UNCERTAIN' and
+                        results.get(o.target_id,(None,))[0]=='DETECTED' for o in observations)):
+                # Re-infer a fresh RGB-D pair so target pixels stay aligned with depth.
+                scan['depth_attempt']=scan.get('depth_attempt',1)+1
+                scan['phase']='FRAME';scan['after']=now
+                return
+            scan['depth_attempt']=1
             scan['observations']+=observations
             detected=next((o for o in observations if o.target_id==scan.get('stop_on_target') and o.status=='DETECTED'),None)
             if detected is not None:
                 self._motion_event('SCAN_TARGET_DETECTED',target_id=detected.target_id,view_index=scan['index'],
                     position_valid=detected.position_valid,reason='requested target detected; remaining scan headings skipped')
+                scan['reply'].set_result(scan['observations']);self.scan=None;return
+            if scan.get('current_view_only'):
                 scan['reply'].set_result(scan['observations']);self.scan=None;return
             scan['index']+=1;scan['phase']='SPIN'
 

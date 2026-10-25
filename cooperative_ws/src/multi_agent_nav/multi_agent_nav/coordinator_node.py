@@ -45,11 +45,13 @@ class CoordinatorNode(Node):
         return response
 
     def tick(self):
-        for command in self.coordinator.tick(time.monotonic()):self.command_pub.publish(to_ros(command))
+        now=time.monotonic()
+        for command in self.coordinator.tick(now):self.command_pub.publish(to_ros(command))
         message=String()
         message.data=json.dumps({'task_id':self.coordinator.task_id,'phase':self.coordinator.phase,
             'reason':self.coordinator.reason,'held_resources':list(self.coordinator.resources.held),
-            'online_robots':list(self.coordinator.states),
+            'online_robots':[r for r,at in self.coordinator.transport_received_at.items() if now-at<=self.coordinator.lost_timeout],
+            'current_task_online_robots':[r for r,at in self.coordinator.task_received_at.items() if now-at<=self.coordinator.lost_timeout],
             'bound_c':self.coordinator.c_observation})
         self.status_pub.publish(message)
 

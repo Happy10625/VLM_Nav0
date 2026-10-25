@@ -4,6 +4,8 @@
     # after initial_reset even when USB re-enumeration has completed.
     # Recover missing depth with a one-off reset, then reopen without reset.
     initial_reset: false
+    # Keep RGB at the requested rate instead of lowering FPS for long exposure.
+    rgb_camera.auto_exposure_priority: false
     # Use the host/global clock so the L515 32-bit hardware timestamp rollover
     # does not make image stamps jump backwards by about 4294.967 seconds.
     rgb_camera.global_time_enabled: true

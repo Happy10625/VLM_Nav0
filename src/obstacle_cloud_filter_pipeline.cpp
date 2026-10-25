@@ -1,6 +1,7 @@
 #include "vlm_nav/obstacle_cloud_filter.hpp"
 
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -11,6 +12,7 @@
 #include <pcl/filters/passthrough.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl_conversions/pcl_conversions.h>
+#include <sensor_msgs/point_cloud2_iterator.hpp>
 
 namespace vlm_nav
 {
@@ -100,6 +102,91 @@ sensor_msgs::msg::PointCloud2 filter_base_link_cloud(
   sensor_msgs::msg::PointCloud2 output;
   pcl_conversions::fromPCL(voxel_output, output);
   output.header = cloud.header;
+  return output;
+}
+
+PlanarObstacleConfirmation::PlanarObstacleConfirmation(
+  double cell_size, double cycle_seconds, unsigned int cycles)
+: cell_size_(cell_size), required_cycles_(cycles)
+{
+  if (!std::isfinite(cell_size) || cell_size <= 0. || !std::isfinite(cycle_seconds) ||
+    cycle_seconds < 1e-9 || cycle_seconds > 3600. || cycles == 0)
+  {
+    throw std::invalid_argument("positive cell size, cycle in [1ns, 1h], and cycle count required");
+  }
+  cycle_ns_ = static_cast<int64_t>(std::llround(cycle_seconds * 1e9));
+}
+
+void PlanarObstacleConfirmation::reset()
+{
+  start_ns_.reset();
+  last_ns_.reset();
+  cycle_ = 0;
+  frame_.clear();
+  completed_.clear();
+  hits_.clear();
+}
+
+sensor_msgs::msg::PointCloud2 PlanarObstacleConfirmation::filter(
+  const sensor_msgs::msg::PointCloud2 & cloud)
+{
+  auto output = cloud;
+  output.height = 1;
+  output.width = output.row_step = 0;
+  output.data.clear();
+  const int64_t stamp = static_cast<int64_t>(cloud.header.stamp.sec) * 1000000000 +
+    cloud.header.stamp.nanosec;
+  if (last_ns_ && stamp <= *last_ns_) {
+    if (stamp < *last_ns_) {reset();}
+    return output;
+  }
+  if (frame_ != cloud.header.frame_id) {reset();}
+  if (!start_ns_) {start_ns_ = stamp; frame_ = cloud.header.frame_id;}
+  last_ns_ = stamp;
+  const int64_t cycle = (stamp - *start_ns_) / cycle_ns_;
+  if (cycle > cycle_) {
+    std::map<Cell, Evidence> next;
+    // A wholly unobserved cycle breaks every streak; only completed cycles count.
+    if (cycle == cycle_ + 1) {
+      for (const auto & [cell, first_ns] : hits_) {
+        const auto previous = completed_.find(cell);
+        const auto evidence = previous == completed_.end() ? Evidence{0, first_ns} : previous->second;
+        next[cell] = {evidence.cycles < required_cycles_ ? evidence.cycles + 1 : evidence.cycles,
+          evidence.first_ns};
+      }
+    }
+    completed_.swap(next);
+    hits_.clear();
+    cycle_ = cycle;
+  }
+  if (cloud.width == 0 || cloud.height == 0) {return output;}
+  // The upstream PCL output is packed; preserve all fields of accepted current points.
+  if (cloud.row_step != cloud.width * cloud.point_step ||
+    cloud.data.size() != static_cast<size_t>(cloud.row_step) * cloud.height)
+  {
+    reset();
+    throw std::invalid_argument("confirmation requires a packed point cloud");
+  }
+  sensor_msgs::PointCloud2ConstIterator<float> x(cloud, "x"), y(cloud, "y"), z(cloud, "z");
+  size_t index = 0;
+  for (; x != x.end(); ++x, ++y, ++z, ++index) {
+    const double cx = std::floor(*x / cell_size_), cy = std::floor(*y / cell_size_);
+    if (!std::isfinite(cx) || !std::isfinite(cy) || !std::isfinite(*z) ||
+      std::abs(cx) >= static_cast<double>(std::numeric_limits<int64_t>::max()) ||
+      std::abs(cy) >= static_cast<double>(std::numeric_limits<int64_t>::max()))
+    {continue;}
+    const Cell cell{static_cast<int64_t>(cx), static_cast<int64_t>(cy)};
+    hits_.emplace(cell, stamp);
+    const auto count = completed_.find(cell);
+    // A first hit near a cycle boundary must not shorten the minimum confirmation time.
+    if (count == completed_.end() || count->second.cycles < required_cycles_ ||
+      (stamp - count->second.first_ns) / cycle_ns_ < required_cycles_)
+    {continue;}
+    const auto begin = cloud.data.begin() + index * cloud.point_step;
+    output.data.insert(output.data.end(), begin, begin + cloud.point_step);
+    ++output.width;
+  }
+  output.row_step = output.width * output.point_step;
   return output;
 }
 

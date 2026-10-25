@@ -39,12 +39,16 @@ bash scripts/start_ranger_local.sh --offline --require-ready
 配置目录为 `cooperative_ws/src/multi_agent_nav/config`。可复制该目录为自己的实验配置并用 `--config-dir /绝对目录`；配置必须完整包含四份 YAML，不要编辑 install 目录中的生成文件。
 
 - `robot_ranger.yaml`：本机地图 `shared_maps/lab_ranger_20261006/lab.yaml`，图像 `lab.pgm`；配置记录 YAML/图像组合摘要，防止错图。
-- 默认 `exploration_strategy=generated_candidates_vlm`，无需填写 viewpoints.ranger；家具标注暂为空时从本机地图空闲区生成候选。若显式选择 fixed_viewpoints，则仍需测量本机观察点。`targets.B` 源码默认“水杯”，当前 acceptance 配置保留“纸巾”；`--target` 只覆盖所选目标的描述。
+- 默认 `exploration_strategy=generated_candidates_vlm`，无需填写 viewpoints.ranger；家具标注暂为空时从本机地图空闲区生成候选。若显式选择 fixed_viewpoints，则仍需测量本机观察点。源码与当前 acceptance 配置均为 A=纸巾、B=灭火器、C=椅子；`--target` 只覆盖所选目标的描述。
 - `observer_config_file`：读取根 `config/robot.yaml` 的 RGB/对齐深度/TF 参数；Ranger 强制 `raw_depth_mode=false`，不需要 Go2 深度单位报告或 SDK 路径。
 - `odom_topic=/odom`：底盘反馈速度用于停稳（源码有反馈赋值，仍需现场动态对照）；map 位姿只取 map→base_link TF，不用 odom pose 冒充 map。
 - Ranger默认具备运动许可；不再配置 `motion_permission_topic`、`motion_permission_timeout`、`motion_permission_verified`，不订阅额外许可话题。公共Nav2输入、动作服务、互斥和停稳检查照常执行。
 - `stop_margin`：沿用原协同 acceptance 配置的 0.20 m。camera_calibrated 保留现场校验记录，不作为启动门槛；实际 TF/图像可用性仍必须满足。
-- 本机 footprint 为原 0.72×0.50 m 矩形及 padding 0.03；新 Nav2 profile 保留 Ranger 速度、膨胀及容差，仅增加原 `/vlm_nav/obstacle_cloud` 障碍输入。底层 cmd 超时/固件 watchdog 尚待现场确认，没有移植 Go2 Sport 机制。
+- 本机 footprint 为原 0.72×0.50 m 矩形及 padding 0.03。`/vlm_nav/obstacle_cloud` 逐帧用于清除；全局和局部 costmap 仅从 `/vlm_nav/confirmed_obstacle_cloud` 标记动态障碍。底层 cmd 超时/固件 watchdog 尚待现场确认，没有移植 Go2 Sport 机制。
+
+Ranger 的 `config/robot.yaml` 使用 `confirmation_period: 0.8`、`confirmation_cycles: 3`。过滤节点在固定 `odom` 坐标中按 5 cm XY 栅格累计，不区分 Z 层：同一周期中任意数量的命中都只算一个周期，连续三个完整周期均有命中、且距离首次命中至少 2.4 秒，才输出该格当前帧中的点。缺失一个周期、长时间断流、时钟回退或确认坐标变换失败均会打断历史累计；未设置的其他配置默认 `confirmation_cycles: 0`，保持逐帧输出。标记前的高度范围仍为 0.10～1.60 m。
+
+该机制抑制短暂回波和短时经过造成的新增占用，会延迟新障碍进入 Nav2；停留足够久的行人仍可被确认。它不让已有体素自动过期，也不主动清除静态地图或禁行掩膜。清除仍沿用每帧点云的有效射线。诊断新增 `confirmed_points`，可与 `output_points` 对照。更新过滤器二进制及两个点云源配置后需重启 R2 导航栈，不要仅设置参数值来声称运行逻辑已经更新。
 
 单机 `local_only` 在内存中使用 `ranger_local_map`、`alignment_id=local_only` 及本地图恒等变换。事件、观察和结果使用相同本机身份；ROS Nav2/marker 仍使用实际 TF 帧 `map`。磁盘 `alignment.yaml` 保持 `validated=false` 和 Ranger `transform=null`。单机 resources 显式为空。
 
@@ -86,9 +90,9 @@ bash scripts/start_ranger_local.sh --action explore --allow-motion \
 
 Ranger模板HTTP超时为15秒，后台识别另留5秒用于图像和证据处理。`metadata.json`中的 `api_timeout_s`/`adapter_timeout_s` 分别记录两种预算；模型标注与任务采纳状态需结合 `events.jsonl` 的 `VLM_VIEW_RESULT.consumer_status` 判断。超过预算或取消后的旧回复仍不用于导航。
 
-原 arrival 参数仍从根 `config/robot.yaml` 读取：成功半径 0.81 m、取消半径 0.89 m、重试上限 1；Nav2 planner tolerance 0.76 m、controller goal tolerance 0.05 m 分开保留。`TARGET_APPROACHED` 表示本地距离与停止契约成立，不产生公共 READY。原任务机仍用自身原生 action 身份和 READY/deposited 条件。
+Ranger 单机成功半径仍从根 `config/robot.yaml` 读取，为 0.81 m，最多重试一次。Nav2 沿用旧版原生容差分工：`GridBased.tolerance=0.76 m`、controller goal tolerance `0.05 m`；两项合计对应名义 0.81 m 停靠范围，不能都设置成停靠距离。运行前读取实际 Nav2 参数，并核对实际路径终点到目标的距离预算。`TARGET_APPROACHED` 表示本次原生导航成功、本地距离和停止契约成立，不产生公共 READY。
 
-Ranger单机接近采用原VLM_Nav目标参考点流程：将深度定位得到的目标坐标转入本机map，携带当前yaw请求Nav2规划和导航；按0.89 m取消并确认停稳，最终距离≤0.81 m才成功，重试时使用0.81 m取消半径。已在取消半径内时先停稳验证，最多重试一次。目标点可位于物体占据区，由Nav2按规划容差及实际路径检查处理；单机不再筛8个圆周停靠候选，也不读取 `standoff_distance`。任务取消、地图/TF时效、保护区与执行路径检查保留，无路径或停稳距离不合格仍失败。可在 `APPROACH_PLANNING`/`APPROACH_SELECTED` 中核对 `approach_method=target_reference`。
+Ranger 协同和新单机接近统一直接把目标本机 map 坐标交给 Nav2，yaw 使用当前机器人朝向，不再筛选目标周围的圆周停靠候选，也不读取 `standoff_distance`。目标参考点可以位于物体占据区；检查 Nav2 实际路径终点的车身空间，不额外要求完整旋转空间。等待本次导航 `SUCCEEDED`、动作终止和真实停稳后，单机距离须 ≤0.81 m，协同须 ≤1.00 m；超界最多重试一次，仍请求同一目标坐标。已在成功距离内也需完成本次导航，不再按 0.89 m 主动取消。取消参数保留供原版独立 VLMNavigator 使用。任务取消、地图/TF时效、保护区与执行路径检查保留。事件 `approach_method=target_reference` 和 `requested_goal` 可核对实际请求。
 
 完整结果在新输出目录的 `result.json`、`events.jsonl`、`vlm/`（每个视角的输入/原始响应/结果）、`selection/`（语义策略时）。取消后旧响应不成为新 goal 或新识别结果；停止未确认时保留运动锁。不要删除或截断 `/tmp/ranger-coop-acceptance-motion.lock` 来继续，须先核对原生 action 和物理停止。
 

@@ -47,6 +47,29 @@ def test_factory_rejects_unknown_robot_before_ros_import():
         create_runtime('unknown',{})
 
 
+@pytest.mark.parametrize('fault',['none','unreachable','empty','blocked','stale'])
+def test_ranger_approach_entry_uses_object_reference_and_validates_actual_path(fault):
+    from multi_agent_nav.adapters.ranger import RangerAdapter
+    from multi_agent_nav.models import Health, PathResult
+    adapter=RangerAdapter.__new__(RangerAdapter)
+    adapter.global_goal_checks=True
+    adapter.get_health=lambda:Health(pose=Pose2D(0.,0.,.4))
+    adapter.costmap_transform=lambda global_goal=False:None if fault=='stale' else Pose2D()
+    target=Pose2D(5.,2.)
+    endpoint=Pose2D(4.3,2.)
+    adapter.costmap_candidate_free=lambda goal,**kwargs:fault!='blocked' and goal==endpoint
+    adapter.approach_candidate_free=lambda *a:pytest.fail('no circular parking or rotation-space search')
+    pending=Future();requested=[]
+    adapter.compute_path=lambda goal:(requested.append(goal) or pending)
+    result=adapter.select_approach(target,[])
+    if fault=='stale':
+        assert result.result().goal is None and not requested
+        return
+    assert requested==[Pose2D(5.,2.,.4)] and not result.done()
+    pending.set_result(PathResult(fault!='unreachable',[] if fault=='empty' else [Pose2D(),endpoint]))
+    assert result.result().goal==(Pose2D(5.,2.,.4) if fault=='none' else None)
+
+
 def test_ranger_accepts_recorded_three_second_reply_and_allows_evidence_finalization(monkeypatch):
     from multi_agent_nav.adapters.ranger import RangerAdapter
     from multi_agent_nav.config import load_config
@@ -112,9 +135,33 @@ def test_ranger_eight_headings_are_relative_to_initial_and_require_fresh_frames(
     assert all(o.robot_id=='ranger' for o in reply.result())
 
 
-def test_aligned_depth_observer_processes_disabled_input_without_autonomy(tmp_path,monkeypatch):
+def test_ranger_observer_keeps_own_name_under_agent_global_remap(tmp_path,monkeypatch):
+    import rclpy
+    from rclpy.node import Node
+    from rclpy.parameter import Parameter
+    from vlm_nav.vlm_navigator import VLMNavigator
+    monkeypatch.setenv('ROS_DOMAIN_ID','31');monkeypatch.setenv('ROS_LOCALHOST_ONLY','1')
+    monkeypatch.setenv('CYCLONEDDS_URI','');monkeypatch.setenv('ROS_LOG_DIR',str(tmp_path))
+    rclpy.init(args=['--ros-args','-r','__node:=multi_agent_ranger_agent'])
+    agent=observer=None
+    try:
+        agent=Node('multi_agent_task_agent')
+        observer=VLMNavigator(observation_only=True,node_name='multi_agent_ranger_rgbd',
+            parameter_overrides=[Parameter('publish_stop_command',value=False)])
+        assert agent.get_name()=='multi_agent_ranger_agent'
+        assert observer.get_name()=='multi_agent_ranger_rgbd'
+        assert observer.stop_pub is None and observer.worker is None
+    finally:
+        if observer is not None:observer.destroy_node()
+        if agent is not None:agent.destroy_node()
+        rclpy.shutdown()
+
+
+@pytest.mark.parametrize('reliable',[False,True])
+def test_aligned_depth_observer_processes_disabled_input_without_autonomy(tmp_path,monkeypatch,reliable):
     import rclpy
     from rclpy.parameter import Parameter
+    from rclpy.qos import ReliabilityPolicy
     from sensor_msgs.msg import Image,CameraInfo
     from geometry_msgs.msg import TransformStamped
     from vlm_nav.vlm_navigator import VLMNavigator
@@ -122,8 +169,11 @@ def test_aligned_depth_observer_processes_disabled_input_without_autonomy(tmp_pa
     monkeypatch.setenv('ROS_LOG_DIR',str(tmp_path))
     rclpy.init(args=[])
     node=VLMNavigator(observation_only=True,node_name='ranger_test_observer',
-        parameter_overrides=[Parameter('publish_stop_command',value=False)])
+        parameter_overrides=[Parameter('publish_stop_command',value=False),Parameter('rgbd_reliable_qos',value=reliable)])
     try:
+        expected=ReliabilityPolicy.RELIABLE if reliable else ReliabilityPolicy.BEST_EFFORT
+        assert node.rgb_sub.sub.qos_profile.reliability==expected
+        assert node.depth_sub.sub.qos_profile.reliability==expected
         tf=TransformStamped();tf.header.frame_id='map';tf.child_frame_id='camera_color_optical_frame'
         tf.transform.rotation.w=1.
         node.tf_buffer.set_transform_static(tf,'test')

@@ -196,7 +196,7 @@ bash "$REPO/scripts/check_ranger.sh" --hardware-only
 
 ### 2.3 定位、Nav2和RViz：已遇问题与解决记录
 
-正常启动统一使用2.0的 `start_ranger_stack.sh`，已有实例时复用。默认地图为 `shared_maps/lab_ranger_20261006/lab.yaml`，Nav2配置为 `config/nav2_ranger_local.yaml`，不启动旧VLM、coordinator、agent或bridge。RViz打开后用 **2D Pose Estimate** 设置实车初始位置和朝向，已有正确定位不重设。
+正常启动统一使用2.0的 `start_ranger_stack.sh`，已有实例时复用。2026-10-21起入口加载当前协同环境并读取本轮 `robot_ranger.yaml` 的 `map_path`，当前为 `shared_maps/20261018161152/lab.yaml`；2026-10-17历史验收使用 `shared_maps/lab_ranger_20261006/lab.yaml`。Nav2配置沿用 `config/nav2_ranger_local.yaml`，不启动旧VLM、coordinator、agent或bridge。RViz打开后用 **2D Pose Estimate** 设置实车初始位置和朝向，已有正确定位不重设。
 
 本节替换原来的人工排障流程和逐项ROS核对命令，按“现象—排查结论—简单处理”保留实际记录。以下恢复操作均先结束运动任务并确认实体停稳，退出对应旧进程后再启动，不叠加第二套实例。处理后统一运行中文只读检查，无需逐项读取topic、参数或JSON：
 
@@ -267,6 +267,15 @@ bash "$REPO/scripts/01_camera.sh"
 ```
 
 若已经卡在复位阶段，先结束该相机进程，再执行正常启动，避免再次触发复位。当前 [realsense.yaml](../config/realsense.yaml) 保留全局时间戳配置；无需修改分辨率、外参或健康阈值。当时恢复到1280×720、16UC1真实对齐深度，完整只读检查通过。证据：本轮 `repair-camera-reset-inspect.log`、`build/ranger-local/data-diagnostics/` 及 `build/ranger-local/hardware-restart-20261017_181730/camera-reset-stalled.log`。
+
+**2026-10-21 补充：频繁丢弃原生深度帧与 DDS 大图像停流是两个问题。** 已确认本轮相机启动分辨率、`align_depth.enable`、`enable_sync` 与接入前脚本一致；10月8日迁移记录已包含上述警告，不能仅凭警告认定硬件损坏。
+
+- 曝光/同步对照：`rgb_camera.auto_exposure_priority=true` 时，RGB元数据实际曝光约59682微秒，彩色和对齐流均约16.58Hz，原始深度约30.04Hz。临时关闭该开关后，彩色约29.65Hz、对齐流约28.98Hz，深度约29.98Hz。低照度自动降帧导致深度帧组缺少匹配彩色帧，原有保护逻辑正确拒绝将640×480原生深度冒充1280×720对齐深度；保护逻辑保留。
+- DDS接收对照：相机不重启、参数不变时，8秒BEST_EFFORT订阅收到彩色/对齐CameraInfo各132/134条，但两类图像均为0帧；RELIABLE订阅收到132帧彩色和128帧真实1280×720、16UC1对齐深度。该问题属于大图像接收传输，不能将CameraInfo正常视为图像已正常到达。系统接收缓冲上限为212992字节，增大缓冲尚未做因果对照，不认定它是唯一根因；相关调优背景见 [ROS 2 Humble DDS tuning](https://github.com/ros2/ros2_documentation/blob/humble/source/How-To-Guides/DDS-tuning.rst#cyclone-dds-tuning)。
+
+本轮修正：`config/realsense.yaml` 设置 `rgb_camera.auto_exposure_priority=false`，保留自动曝光和原分辨率；`config/robot.yaml` 设置 `rgbd_reliable_qos=true`，供Ranger观察器使用；`VLMNavigator` 的公共默认仍为BEST_EFFORT；`ranger_check.py` 仅将两条相机图像订阅改为RELIABLE，雷达/里程计QoS保持原值。关闭自动降帧后，低照度下图像可能变暗，应结合现场照明检查识别输入。
+
+曝光对照结束时已恢复原运行值true。随后相机由SIGINT退出，应用新运行值的命令返回 `Node not found`；新配置尚需下次人工启动加载，未自动重启硬件。相机终端重新加载当前环境后执行原 `01_camera.sh`，再使用 `check_ranger.sh --hardware-only` 或完整健康检查确认真实帧数/新鲜度。已有任务观察器也须正常退出后重新启动以加载QoS设置，不能叠加第二个观察器。相关回归为61项启动/检查回归及18项平台适配回归通过，安装模块与源码一致。诊断摘要和临时对照脚本见 `build/ranger-local/camera-diagnostics-20261021/`；USB `control_transfer` 警告的底层原因仍未单独证实，不据此报告相机故障已全部解决。
 
 ### 2.3.5 Ranger持续Failed to send CAN frame
 
@@ -402,7 +411,7 @@ printf 'single experiment exit=%s\n' "$experiment_rc"
 
 必要时在命令中增加 `--target '本轮实际描述'`，不改变B的归属。每个选中点经过 PLANNED/NAVIGATING/ARRIVED，再按初始朝向+45°、90°…360°逐段扫描；每次 Spin 完成、反馈停稳后取新图并等待识别。**一旦本视角确认B为DETECTED，就结束后续旋转**，记录 `SCAN_TARGET_DETECTED`，确认停止后进入 TARGET_FOUND→APPROACHING；上面命令的 `--approach-target` 启用接近。A/C检出不提前结束找B；未检出时最多扫描8个方向。B检出但无有效深度/图像时刻TF时结束扫描并报告 TARGET_DETECTED_UNLOCATED，不发送接近目标。
 
-Ranger单机接近沿用原VLM_Nav方法：把目标参考点的本机map坐标交给Nav2，目标yaw取当前机器人朝向，由Nav2按原规划容差寻找路径；不再先筛目标周围的8个停靠候选。距离进入0.89米后取消导航并确认停稳，最终距离≤0.81米才判成功；未达标最多重试一次，重试在0.81米取消并再次验证。已在成功半径内且停稳时直接成功，已在取消半径内时先停稳验证。`standoff_distance`不再参与这条单机接近流程。事件的 `approach_method=target_reference` 与 `requested_goal` 可核对实际请求。
+Ranger单机与协同接近直接将目标参考点的本机map坐标交给Nav2，yaw使用当前朝向，不再筛目标周围的8个停靠候选。沿用旧版0.76米planner tolerance与0.05米controller goal tolerance，由Nav2选择可达路径终点；保留实际终点车身空间与距离预算检查。等待本次Nav2导航SUCCEEDED、动作终止及真实停稳，单机最终距离≤0.81米才成功；未达标最多重试一次，仍导航到同一目标。已在距离内也须完成本次导航，不再按0.89米主动取消。`standoff_distance`不参与Ranger接近流程。事件的 `approach_method=target_reference` 与 `requested_goal` 可核对实际请求。下方2026-10-17记录保留历史距离取消实现，仅作为历史证据。
 
 R5只读诊断终端（保持运行）：统一启动入口已自动打开时直接查看；未打开时，在新终端执行：
 
@@ -411,7 +420,7 @@ source /home/isee601/ws/VLM_Nav/RangerVLM_env.bash
 bash "$REPO/scripts/monitor_ranger.sh"
 ```
 
-面板每秒原地刷新，仅显示9行：实验目录名；状态/最近阶段/目标/观察点；当前动作及接受/终态；实测速度 `[vx,vy,wz]`、odom时间龄及CAN接收增量；指令速度数组与接收时间龄；路径点数/暂存或接收状态/时间龄；结果/任务停止确认/原因；排障；异常提示。速度单位依次为m/s、m/s、rad/s。无数据使用 `--`，过期、非法速度和CAN无增长会明确标出，不把缓存零速度作为实体停止证明。路径状态来自任务事件，不另建路径拥有者或改变门控。
+面板每秒原地刷新，仅显示9行：实验目录名；状态/最近阶段/目标/观察点；当前动作及接受/终态；实测速度 `[vx,vy,wz]`、odom时间龄及CAN接收增量；底盘 `/cmd_vel` 指令速度、转向、最近10秒换向次数及接收时间龄；路径点数/暂存或接收状态/时间龄；结果/任务停止确认/原因；排障；异常提示。速度单位依次为m/s、m/s、rad/s。`wz>0.03` 显示逆时针，`wz<-0.03` 显示顺时针，其余为零/微小角速度；换向统计按收到的每条指令计算，忽略零/微小及非法速度，能保留1秒刷新之间的方向反转。指令超过1秒未更新显示“指令过期”，不继续显示旧转向。无数据使用 `--`，过期、非法速度和CAN无增长会明确标出，不把缓存零速度作为实体停止证明。路径状态来自任务事件，不另建路径拥有者或改变门控。
 
 “原因”保留具体扫描失败视角及动作终态，后续停止/清理事件不会覆盖。“排障”显示失败动作的原因（有错误码时一并显示）、结果文件中未通过的健康项、最近带reason的业务事件，以及最近一次VLM视角/识别状态或错误类型。Humble的Spin结果没有错误字段，面板按该次失败动作的起止时间匹配 `$ROS_LOG_DIR/behavior_server_*.log` 中的WARN/ERROR；例如 `动作:旋转预测碰撞：Collision Ahead - Exiting Spin`。仅匹配时间窗内的日志，不把旧碰撞归到本轮；日志不存在、已轮转或没有具体原因时显示“未取得具体原因”，不推断为碰撞。日志读取最多取最新8个文件各末尾64KiB，仅在旋转失败后尝试，保持只读低负载。
 

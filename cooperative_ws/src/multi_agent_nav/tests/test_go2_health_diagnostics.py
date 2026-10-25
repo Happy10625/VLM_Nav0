@@ -1,5 +1,6 @@
 """Same safety gates with failure-time evidence; no hardware or API calls."""
 import json
+import logging
 import time
 from types import SimpleNamespace as S
 
@@ -18,6 +19,7 @@ def healthy_adapter():
     a.node.latest_snapshot=S(captured_monotonic=now-.1)
     a.node.last_camera_tf_success=now-.1
     a.node.rgbd_sync_status={'healthy':True}
+    a.node.get_logger=lambda:logging.getLogger('localization_health_test')
     a.node.vlm_input_ready=lambda now:a.node.rgbd_sync_status['healthy']
     a.node.tf_buffer.lookup_transform=lambda *args:S(header=S(stamp=stamp(10)),transform=S(
         translation=S(x=0.,y=0.),rotation=S(x=0.,y=0.,z=0.,w=1.)))
@@ -66,6 +68,34 @@ def test_healthy_diagnostics_match_actual_ready_snapshot():
     assert health.nav_ready and health.localization_valid and health.stopped
     assert all(a.last_health_details['checks'].values())
     assert a.last_health_details['local_costmap']['reason']=='ok'
+
+
+@pytest.mark.parametrize('fault',['stale','tf_error'])
+def test_localization_loss_logs_failure_time_evidence_once_per_loss(fault,caplog):
+    from test_field_preparation import stamp
+    a=healthy_adapter()
+    lookup=a.node.tf_buffer.lookup_transform
+    assert a.get_health().localization_valid
+    def failing_pose(target,source,*args):
+        if source=='base_link':
+            if fault=='tf_error':raise RuntimeError('map and base_link are disconnected')
+            return S(header=S(stamp=stamp(8.5)),transform=S(
+                translation=S(x=0.,y=0.),rotation=S(x=0.,y=0.,z=0.,w=1.)))
+        return lookup(target,source,*args)
+    a.node.tf_buffer.lookup_transform=failing_pose
+    for _ in range(2):
+        health=a.get_health()
+        assert not health.localization_valid and health.nav_ready
+    assert len(caplog.records)==1
+    message=caplog.records[0].getMessage()
+    assert 'map->base_link' in message and 'pose_max_age_s=1.0' in message
+    if fault=='stale':assert 'pose_age_s=1.5' in message
+    else:assert 'RuntimeError: map and base_link are disconnected' in message
+    a.node.tf_buffer.lookup_transform=lookup
+    assert a.get_health().localization_valid
+    a.node.tf_buffer.lookup_transform=failing_pose
+    assert not a.get_health().localization_valid
+    assert len(caplog.records)==2
 
 
 def test_rejected_costmap_update_retains_why_payload_is_missing():

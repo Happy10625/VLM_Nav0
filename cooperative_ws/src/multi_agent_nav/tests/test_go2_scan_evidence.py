@@ -42,6 +42,34 @@ def evidence(tmp_path):
     return e
 
 
+def test_scan_records_use_local_date_and_continue_existing_numbers(tmp_path,monkeypatch):
+    import multi_agent_nav.scan_evidence as recording
+    monkeypatch.setattr(recording.time,'strftime',lambda _: '2026-10-24')
+    root=tmp_path/'vlm'
+    legacy=root/'old-hash_view_00';legacy.mkdir(parents=True)
+    (legacy/'response.txt').write_text('keep legacy')
+    first=evidence(tmp_path)
+    assert first.directory==root/'2026-10-24'/'000001'
+    (first.directory/'response.txt').write_text('keep first')
+    (first.directory.parent/'000005').mkdir()
+    second=evidence(tmp_path)
+    assert second.directory==root/'2026-10-24'/'000006'
+    assert (first.directory/'response.txt').read_text()=='keep first'
+    assert (legacy/'response.txt').read_text()=='keep legacy'
+    monkeypatch.setattr(recording.time,'strftime',lambda _: '2026-10-25')
+    assert evidence(tmp_path).directory==root/'2026-10-25'/'000001'
+
+
+def test_concurrent_record_writers_never_share_a_directory(tmp_path,monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import multi_agent_nav.scan_evidence as recording
+    monkeypatch.setattr(recording.time,'strftime',lambda _: '2026-10-24')
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        directories=list(pool.map(lambda _:evidence(tmp_path).directory,range(12)))
+    assert sorted(p.name for p in directories)==[f'{i:06d}' for i in range(1,13)]
+    assert all((p/'metadata.json').is_file() for p in directories)
+
+
 @pytest.mark.parametrize('visible',[False,True])
 def test_each_view_keeps_exact_sent_jpeg_raw_text_and_annotated_result(tmp_path,visible):
     client,calls,text=client_and_response(visible);e=evidence(tmp_path);client.evidence=e
@@ -62,7 +90,7 @@ def test_each_view_keeps_exact_sent_jpeg_raw_text_and_annotated_result(tmp_path,
     assert meta['parsed_results']['A']['status']==('DETECTED' if visible else 'NOT_DETECTED')
     assert meta['parsed_results']['A']['grounding']['target_visible']==visible
     assert meta['image_stamp_ns']==123 and meta['capture_pose']['yaw']==.3
-    assert e.directory.parent==tmp_path/'vlm'  # scan IDs are metadata, never paths
+    assert e.directory.parent.parent==tmp_path/'vlm'  # scan IDs are metadata, never paths
     assert 'never-record-secret' not in (e.directory/'metadata.json').read_text()
 
 
@@ -198,7 +226,116 @@ def test_stop_target_must_belong_to_requested_scan():
         a.start_scan({'A':'灭火器'},'scan',stop_on_target='B')
 
 
-def test_frame_worker_records_artifacts_without_blocking_ros_or_using_new_images(tmp_path):
+@pytest.mark.parametrize('reason',[
+    'insufficient_valid_depth_samples:0/8',
+    'mixed_depth_samples:3/8,median_m=2.000,max_deviation_m=0.200',
+    'depth_out_of_range:median_m=7.000,limit_m=6.000',
+])
+def test_unreliable_depth_keeps_scan_pending_and_rotates_until_located(reason):
+    from vlm_nav.models import VLMResult, Pixel
+    result=VLMResult(True,.95,Pixel(2,2),None,True,True,True)
+    results={'B':('DETECTED',result)}
+    a,scan,events=scan_adapter(None,results)
+    scan.update(targets={'B':'纸巾'},stop_on_target='B')
+    a.node.ground_pixel_with_reason=lambda *args:(None,reason)
+    a.tick()
+    assert not scan['reply'].done() and a.scan is scan
+    assert scan['observations'][0].status=='UNCERTAIN'
+    assert not scan['observations'][0].navigable
+    assert scan['observations'][0].reason==reason
+    assert not any(e.get('event')=='SCAN_TARGET_DETECTED' for e in events)
+    spins=[]
+    def motion(client,goal,*args):
+        spins.append(goal.target_yaw)
+        reply=Future();reply.set_result('SUCCEEDED');return 'spin',reply
+    a._motion=motion
+    a.tick();a.tick()
+    assert spins==pytest.approx([math.pi/2]) and not scan['reply'].done()
+    assert scan['phase']=='FRAME'
+    pending=Future();pending.set_result(results)
+    scan.update(phase='INFER',pending=pending,view_recorded=False,
+        snapshot=S(stamp=S(sec=2,nanosec=0)))
+    a.node.ground_pixel_with_reason=lambda *args:((2.,3.,1.),'ok')
+    a.tick()
+    assert a.scan is None and scan['reply'].done()
+    assert [o.status for o in scan['reply'].result()]==['UNCERTAIN','DETECTED']
+    assert scan['reply'].result()[-1].navigable
+    assert len([e for e in events if e.get('event')=='SCAN_TARGET_DETECTED'])==1
+
+
+@pytest.mark.parametrize('initial',[False,True])
+@pytest.mark.parametrize('located_on',[1,2,3,None])
+@pytest.mark.parametrize('reason',[
+    'insufficient_valid_depth_samples:0/8',
+    'mixed_depth_samples:3/8,median_m=2.000,max_deviation_m=0.200',
+    'depth_out_of_range:median_m=7.000,limit_m=6.000',
+])
+def test_ranger_retries_unreliable_depth_on_three_fresh_stationary_frames(initial,located_on,reason):
+    import time
+    from vlm_nav.models import VLMResult, Pixel
+    result=VLMResult(True,.95,Pixel(2,2),None,True,True,True)
+    results={'B':('DETECTED',result)}
+    a,scan,events=scan_adapter(None,results)
+    a.config.update(robot_id='ranger',api_timeout=2.)
+    scan.update(targets={'B':'灭火器'},stop_on_target='B',current_view_only=initial)
+    a._motion=lambda *args:pytest.fail('depth retries must not rotate')
+    frames=[]
+    def infer(rgb,targets):
+        frames.append(int(rgb[0,0,0]));return results
+    def submit(work):
+        future=Future();future.set_result(work());return future
+    a.client=S(infer_abc=infer);a.vision.submit=submit
+    a.node.vlm_input_ready=lambda now:True
+    checked=[]
+    def project(snapshot,*args):
+        checked.append(snapshot.stamp.sec)
+        return ((2.,3.,1.),'ok') if snapshot.stamp.sec==located_on else (None,reason)
+    a.node.ground_pixel_with_reason=project
+    for attempt in range(1,(located_on or 3)+1):
+        a.tick()
+        if attempt==(located_on or 3):break
+        assert not scan['reply'].done() and scan['phase']=='FRAME' and scan['index']==0
+        a.node.latest_snapshot=S(captured_monotonic=scan['after']-1)
+        a.tick();assert scan['phase']=='FRAME'  # Never count the same/old frame twice.
+        a.node.latest_snapshot=S(captured_monotonic=time.monotonic()+1,
+            stamp=S(sec=attempt+1,nanosec=0),rgb=np.full((5,5,3),attempt+1,dtype=np.uint8))
+        health=a.get_health
+        a.get_health=lambda:S(**dict(vars(health()),stopped=False))
+        a.tick();assert scan['phase']=='FRAME'
+        a.get_health=health
+        a.tick();assert scan['phase']=='INFER'
+    assert checked==list(range(1,(located_on or 3)+1))
+    assert frames==list(range(2,(located_on or 3)+1))
+    assert len(scan['observations'])==1
+    assert scan['observations'][0].navigable is (located_on is not None)
+    assert scan['reply'].done() is (initial or located_on is not None)
+    if not initial and located_on is None:
+        assert scan['phase']=='SPIN' and scan['index']==1
+    assert len([e for e in events if e.get('event')=='VLM_VIEW_RESULT'])==(located_on or 3)
+
+
+@pytest.mark.parametrize('interruption',['cancel','health','timeout'])
+def test_ranger_depth_retry_can_be_interrupted_before_next_frame(interruption):
+    from vlm_nav.models import VLMResult, Pixel
+    results={'B':('DETECTED',VLMResult(True,.95,Pixel(2,2),None,True,True,True))}
+    a,scan,_=scan_adapter(None,results)
+    a.config['robot_id']='ranger'
+    scan.update(targets={'B':'灭火器'},stop_on_target='B',current_view_only=True)
+    a.node.ground_pixel_with_reason=lambda *args:(None,'insufficient_valid_depth_samples:0/8')
+    a._motion=lambda *args:pytest.fail('interrupted retry must not rotate')
+    a.tick()
+    assert not scan['reply'].done() and scan['phase']=='FRAME'
+    if interruption=='cancel':a.stop_motion('task canceled')
+    elif interruption=='health':a.motion_fault=True
+    else:scan['deadline']=0.
+    a.tick()
+    assert a.scan is None and scan['reply'].done()
+    if interruption=='timeout':assert isinstance(scan['reply'].exception(),TimeoutError)
+    else:assert scan['reply'].cancelled()
+
+
+@pytest.mark.parametrize('initial',[False,True])
+def test_frame_worker_records_artifacts_without_blocking_ros_or_using_new_images(tmp_path,initial):
     import threading,time
     from multi_agent_nav.adapters.go2 import AsyncVision
     client,calls,text=client_and_response();a,scan,events=scan_adapter(None,results={})
@@ -215,19 +352,41 @@ def test_frame_worker_records_artifacts_without_blocking_ros_or_using_new_images
         return original(**kwargs)
     client.client.chat.completions.create=create
     try:
-        reply=a.start_scan({'A':'灭火器'},'scan')
+        if initial:
+            a.config['scan_angles']=[-math.pi/4,-math.pi/2]
+            a._motion=lambda *args:pytest.fail('initial view must not request Spin')
+        reply=a.start_scan({'A':'灭火器'},'scan',**(dict(task_id='new-task',command_id='first-command',current_view_only=True) if initial else {}))
+        active_scan=a.scan
+        if initial:
+            fresh=snapshot.captured_monotonic;snapshot.captured_monotonic=0.
+            a.tick();assert not calls
+            snapshot.captured_monotonic=fresh
+            original_health=a.get_health
+            a.get_health=lambda:S(**dict(vars(original_health()),stopped=False))
+            a.tick();assert not calls
+            a.get_health=original_health
         a.tick();a.tick()
         end=time.monotonic()+3.
-        while a.scan['phase']=='INFER' and time.monotonic()<end:a.tick();time.sleep(.001)
+        while a.scan and a.scan['phase']=='INFER' and time.monotonic()<end:a.tick();time.sleep(.001)
         result=next(r for r in events if r.get('event')=='VLM_VIEW_RESULT')
-        directory=a.scan['evidence'].directory
+        directory=active_scan['evidence'].directory
         meta=json.loads((directory/'metadata.json').read_text())
         assert meta['viewpoint_id']=='p1' and meta['image_stamp_ns']==3_000_000_123
-        assert meta['image_sequence']==7 and meta['navigation_goal_pose']==[1.,2.,.7]
+        assert meta['image_sequence']==7
+        assert meta['depth_attempt']==1
+        assert meta['task_id']==('new-task' if initial else 'task')
+        assert meta['command_id']==('first-command' if initial else 'command')
+        assert meta['navigation_goal_pose']==(None if initial else [1.,2.,.7])
+        assert meta['navigation_goal_id']==('' if initial else 'native-nav')
+        if initial:
+            assert meta['scan_requested_yaw']==meta['scan_initial_yaw']
+            assert reply.done() and not reply.cancelled() and len(reply.result())==1
+            for _ in range(3):a.tick()
         assert result['consumer_status']=='APPLIED' and client.evidence is None
         assert len(calls)==1 and all(name.startswith('cooperative-vision') for name in thread_names)
         a.stop_motion('fixture cleanup')
-        assert reply.cancelled() and (directory/'response.txt').read_text()==text
+        assert reply.cancelled() is (not initial)
+        assert (directory/'response.txt').read_text()==text
     finally:a.vision.close()
 
 

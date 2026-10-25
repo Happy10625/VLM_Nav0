@@ -114,10 +114,11 @@ Go2 的 `adapters/go2.py` 只供参考接口和 ABC 请求，不替代 Ranger ad
 - `get_health`：本机 map 下 base_link 位置、真实停稳、motion_terminal、定位/Nav2健康、当前执行路径及完整 footprint。
 - `compute_path`、`select_approach(local_object, excluded, *, standoff_distance, path_accept)`、
   `read_approach_parameters` 返回 Future；后者返回当前 `xy_goal_tolerance` 和 `planner_tolerance`。
+  Ranger 直接请求目标坐标，`select_approach` 不再枚举圆周候选；原生容差沿用0.76 m规划＋0.05 m位置到达。
   必须检查**实际路径终点**预算，不能用请求 goal 替代。预算和最后停稳验收均用1.00 m；保留原安全余量。
 - `costmap_transform(global_goal=False)`、`costmap_candidate_free(...,global_goal=False)`、
   `observation_candidate_free`、`approach_candidate_free` 使用 Ranger 自己的地图、TF和几何。
-  远端候选全局完整 footprint/旋转空间/路径必须有效；不得仅因 local 窗口不足否决。
+  探索候选须有全局完整 footprint/旋转空间/路径；Ranger目标接近只检查实际路径终点的footprint，不要求完整旋转空间。不得仅因 local 窗口不足否决。
   local 已覆盖的碰撞/未知和缺图/陈旧/缺TF仍失败；运动继续本机局部避障/RegionGuard。
 - `client.choose_candidate(snapshot)` 与 `vision.submit(callable)`（后台 Future）供本地 VLM 选本轮 P ID；
   `start_scan(descriptions, scan_id, *, stop_on_target)` 返回含 ABC 的 Observation 列表 Future。

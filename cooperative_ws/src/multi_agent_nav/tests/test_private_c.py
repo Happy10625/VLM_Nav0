@@ -25,10 +25,14 @@ def local_agent():
     adapter.pose = Pose2D(3,-3)
     machine.tick(0., adapter.get_health())
     sync = Command(task_id='t', recipient_id='ranger', action='SYNC', kind='SYNC_LOCAL_C',
-        common_frame_id='', alignment_id='')
+        phase='SYNCING',common_frame_id='', alignment_id='')
     assert machine.accept(sync,0.).accepted
-    machine.peer_received=0.
-    command = replace(sync,action='EXECUTE',kind='APPROACH_PICKUP',target_id='B',command_id='b',sequence=1)
+    peer=config['alignment']['robots']['go2']
+    machine.receive_peer(AgentState(robot_id='go2',task_id='t',local_map_id=peer['local_map_id'],
+        map_version=peer['map_version'],common_frame_id='',alignment_id='',localization_valid=True,
+        nav_ready=True,stopped=True,run_state='SYNCING'),peer,0.)
+    assert machine.accept(replace(sync,phase='SEARCH_AB'),0.).accepted
+    command = replace(sync,action='EXECUTE',phase='SEARCH_AB',kind='APPROACH_PICKUP',target_id='B',command_id='b',sequence=1)
     return config,machine,adapter,command
 
 
@@ -49,6 +53,38 @@ def test_private_command_accepts_intent_and_rejects_coordinate_or_old_sync():
     assert [effect.kind for effect in machine.take_effects()] == ['LOCAL_EXECUTE']
 
 
+@pytest.mark.parametrize('kind,target,goal_kind',[
+    ('APPROACH_PICKUP','B','PICKUP_NAV'),('APPROACH_DEPOSIT','C','DEPOSIT_NAV')])
+def test_private_legacy_result_cannot_complete_local_approach(kind,target,goal_kind):
+    _,machine,adapter,command=local_agent()
+    if target=='C':
+        machine.phase='DEPOSIT';machine._state.ready=True
+        machine.local_observations['own-c']=Observation(task_id='t',robot_id='ranger',
+            local_map_id=machine.context.local_map_id,map_version=machine.context.map_version,
+            target_id='C',status='DETECTED',position_valid=True,common_position=Pose2D(9,1))
+        command=replace(command,phase='DEPOSIT',observation_id='own-c')
+    command=replace(command,kind=kind,target_id=target)
+    assert machine.accept(command,0).accepted
+    machine.take_effects()
+    machine.navigation_started('current-goal',goal_kind)
+    machine.health=replace(adapter.get_health(),pose=Pose2D(-100,-100),
+        stopped=False,motion_terminal=False)
+    before=machine.state()
+    machine.on_goal_result(GoalResult('t',command.command_id,'current-goal',goal_kind,'SUCCEEDED'),.1)
+    assert machine.state()==before
+
+
+def test_missing_private_executor_pauses_without_navigation(monkeypatch):
+    import multi_agent_nav.go2_exploration as core
+    config,machine,adapter,command=local_agent()
+    runner=AgentRunner(machine,adapter,config['scene']['targets'],lambda _:None,config=config)
+    monkeypatch.delattr(core,'explore_steps')
+    assert machine.accept(command,0).accepted
+    runner.tick(0)
+    assert machine.paused and not machine.state().ready
+    assert not adapter.calls
+
+
 def test_cache_is_local_network_is_zero_and_new_task_discards_cache():
     _,machine,_,command=local_agent()
     assert machine.accept(command,0).accepted
@@ -61,7 +97,7 @@ def test_cache_is_local_network_is_zero_and_new_task_discards_cache():
     assert not sent.position_valid and sent.common_position == Pose2D()
     assert machine.local_observations['local-c'].common_position == Pose2D(9,1)
     machine.stop('test');machine.tick(.1,machine.health);machine.take_effects()
-    sync=replace(command,task_id='next',action='SYNC',kind='SYNC_LOCAL_C')
+    sync=replace(command,task_id='next',action='SYNC',kind='SYNC_LOCAL_C',phase='SYNCING',command_id='',sequence=0,target_id='')
     assert machine.accept(sync,.2).accepted
     assert not machine.local_observations
 
@@ -71,7 +107,7 @@ def test_new_task_resets_published_sequence_and_old_command_identity():
     assert machine.accept(replace(command,sequence=20),0).accepted
     machine._state.requested_resource='door';machine._state.requested_command_id='b'
     machine.stop('test');machine.tick(.1,machine.health);machine.take_effects()
-    assert machine.accept(replace(command,task_id='next',action='SYNC',kind='SYNC_LOCAL_C'),.2).accepted
+    assert machine.accept(replace(command,task_id='next',action='SYNC',kind='SYNC_LOCAL_C',phase='SYNCING',command_id='',sequence=0,target_id=''),.2).accepted
     state=machine.state()
     assert state.sequence==0 and state.command_id==state.goal_id==''
     assert state.requested_resource==state.requested_command_id==''
@@ -144,22 +180,39 @@ def test_actual_path_endpoint_budget_controls_approach(endpoint):
     original=adapter.compute_path
     def compute(goal):
         result=original(goal).result()
-        if goal.x>0 and goal.y<-2 and goal!=Pose2D(3,-3):
+        if goal.x==3 and goal.y==-3:
             result.path[-1]=Pose2D(3-endpoint,-3)
         return completed(result)
     adapter.compute_path=compute
-    # Keep fake candidate validation tied to the actual planner, as in Nav2Adapter.
-    def select(obj,excluded,**kwargs):
-        goal=Pose2D(3-endpoint,-3)
-        path=compute(goal).result()
-        return completed(ApproachResult(goal if kwargs['path_accept'](path) else None))
-    adapter.select_approach=select
     runner=AgentRunner(machine,adapter,config['scene']['targets'],lambda _:None,config=config,success_radius=1.)
     assert machine.accept(command,0).accepted
     for index in range(100):
         now=index*.05;machine.peer_received=machine.sync_received=now;runner.tick(now)
     assert machine.state().ready is (endpoint==.7)
     if endpoint!=.7:assert not any(kind=='PICKUP_NAV' for kind,_,_ in adapter.calls)
+
+
+@pytest.mark.parametrize('endpoint,expected',[(.7,True),(1.2,False)])
+def test_ranger_cooperative_navigates_to_occupied_reference_using_native_tolerance(endpoint,expected):
+    config,machine,adapter,command=local_agent()
+    target=adapter.detections['B'];adapter.pose=Pose2D(0.,-3.,.4)
+    requested=[]
+    def plan(goal):
+        requested.append(goal)
+        return completed(PathResult(True,[adapter.pose,Pose2D(target.x-endpoint,target.y)]))
+    adapter.compute_path=plan
+    adapter.select_approach=lambda *a,**k:pytest.fail('Ranger must not choose a standoff candidate')
+    adapter.costmap_candidate_free=lambda goal,**k:goal.x!=target.x
+    adapter.approach_candidate_free=lambda *a:pytest.fail('target approach needs no full rotation space')
+    runner=AgentRunner(machine,adapter,config['scene']['targets'],lambda _:None,config=config)
+    assert machine.accept(command,0.).accepted
+    for index in range(100):
+        now=index*.05;machine.peer_received=machine.sync_received=now;runner.tick(now)
+    assert requested
+    assert all((p.x,p.y)==(target.x,target.y) for p in requested)
+    assert machine.state().ready is expected
+    assert bool(adapter.calls) is expected
+    if expected:assert adapter.calls[-1][1]==Pose2D(target.x,target.y,.4)
 
 
 def test_private_ignores_legacy_door_regions():
@@ -308,18 +361,28 @@ def test_cooperative_runner_uses_same_local_generated_candidate_core(generated_c
     adapter.client=S(choose_candidate=choose)
     adapter.vision=S(submit=lambda fn:completed(fn()))
     machine.tick(0,adapter.get_health())
-    sync=Command(task_id='t',recipient_id=robot_id,action='SYNC',kind='SYNC_LOCAL_C',common_frame_id='',alignment_id='')
+    sync=Command(task_id='t',recipient_id=robot_id,action='SYNC',kind='SYNC_LOCAL_C',phase='SYNCING',common_frame_id='',alignment_id='')
     assert machine.accept(sync,0).accepted
-    command=replace(sync,action='EXECUTE',command_id='pickup',sequence=1,kind='APPROACH_PICKUP',target_id=target_id)
+    peer_id='ranger' if robot_id=='go2' else 'go2'
+    peer=config['alignment']['robots'][peer_id]
+    machine.receive_peer(AgentState(robot_id=peer_id,task_id='t',local_map_id=peer['local_map_id'],
+        map_version=peer['map_version'],common_frame_id='',alignment_id='',localization_valid=True,
+        nav_ready=True,stopped=True,run_state='SYNCING'),peer,0.)
+    assert machine.accept(replace(sync,phase='SEARCH_AB'),0).accepted
+    command=replace(sync,action='EXECUTE',phase='SEARCH_AB',command_id='pickup',sequence=1,kind='APPROACH_PICKUP',target_id=target_id)
     assert machine.accept(command,0).accepted
     emitted=[]
     runner=AgentRunner(machine,adapter,config['scene']['targets'],emitted.append,config=config,success_radius=1.)
     for index in range(100):
         now=index*.05;machine.sync_received=machine.peer_received=now;runner.tick(now)
     assert machine.state().ready,machine.state().reason
-    assert snapshots and snapshots[0]['candidates'][0]['display_id']=='P1'
-    assert snapshots[0]['furniture_annotated'] is annotated
-    assert [kind for kind,_,_ in adapter.calls]==['VIEWPOINT_NAV','PICKUP_NAV']
+    if robot_id=='ranger':
+        assert not snapshots
+        assert [kind for kind,_,_ in adapter.calls]==['PICKUP_NAV']
+    else:
+        assert snapshots and snapshots[0]['candidates'][0]['display_id']=='P1'
+        assert snapshots[0]['furniture_annotated'] is annotated
+        assert [kind for kind,_,_ in adapter.calls]==['VIEWPOINT_NAV','PICKUP_NAV']
     assert all(command_id=='pickup' for _,_,command_id in adapter.calls)
     assert any(o.status=='CACHED' for o in emitted)
     assert all(o.common_position==Pose2D() and not o.position_valid for o in emitted)

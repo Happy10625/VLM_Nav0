@@ -5,12 +5,13 @@ NAV_KIND = {'SEARCH_VIEWPOINT':'VIEWPOINT_NAV', 'APPROACH_PICKUP':'PICKUP_NAV',
             'WAIT':'WAIT_NAV', 'APPROACH_DEPOSIT':'DEPOSIT_NAV', 'EXIT':'EXIT_NAV'}
 
 class AgentMachine:
-    def __init__(self, context, frame, lost_timeout=3.0, path_start_timeout=1.0):
+    def __init__(self, context, frame, lost_timeout=3.0, path_start_timeout=1.0, task_timeout=600.0):
         import math
         if not math.isfinite(path_start_timeout) or path_start_timeout <= 0:
             raise ValueError('path_start_timeout must be finite and positive')
         self.context, self.frame, self.lost_timeout = context, frame, lost_timeout
         self.path_start_timeout = path_start_timeout
+        self.task_timeout = task_timeout
         self.retired_tasks = set()
         self.navigation_started_at = 0.0
         self.path_acquired = False
@@ -24,6 +25,8 @@ class AgentMachine:
         self.sync_received = None
         self.phase = 'IDLE'
         self.peer_received = None
+        self.peer_transport_received = None
+        self.peer_identity_error = ''
         self.last_sequence = 0
         self.paused = False
         self.retry = 0
@@ -35,6 +38,12 @@ class AgentMachine:
         self.private = context.common_frame_id == context.alignment_id == ''
         self.local_observations = {}
         self.task_started_at = 0.
+        self.peer_state = None
+        self.synced = False
+        self.sync_acknowledged = False
+        self.handshake_committed = False
+        self.task_active = False
+        if self.private:self._state.run_state='PREPARING'
 
     def state(self):
         return replace(self._state)
@@ -45,18 +54,87 @@ class AgentMachine:
 
     def receive_peer(self,state,entry,now):
         expected='ranger' if self.context.robot_id=='go2' else 'go2'
-        if state.robot_id!=expected or state.task_id!=self.context.task_id or state.simulation!=self.context.simulation:
+        if state.robot_id!=expected:
             return False
         identity=(state.local_map_id,state.map_version,state.common_frame_id,state.alignment_id)
+        error=''
         if state.schema_version!=SCHEMA_VERSION or identity!=(entry['local_map_id'],entry['map_version'],
                 self.context.common_frame_id,self.context.alignment_id):
-            self.stop('peer map/mode identity changed');return False
-        if self.private and (state.pose_valid or state.common_pose!=Pose2D()):
-            self.stop('private peer published coordinates');return False
-        if not state.localization_valid or not state.nav_ready or not self.private and not state.pose_valid:
-            self.stop('peer localization/navigation invalid');return False
+            error='peer map/mode identity changed'
+        elif state.simulation!=self.context.simulation:
+            error='peer simulation/live mode changed'
+        elif self.private and (state.pose_valid or state.common_pose!=Pose2D()):
+            error='private peer published coordinates'
+        if error:
+            self.peer_identity_error=error
+            if not self.private or self.task_active or self.handshake_committed:self.stop(error)
+            self._update_waiting(now)
+            return False
+        self.peer_identity_error=''
+        self.peer_transport_received=now
+        if state.task_id!=self.context.task_id:
+            if self.private and (self.task_active or self.handshake_committed) and not state.task_id:
+                self.stop('peer restarted during task')
+            elif self.private and not state.task_id and not self.task_active and not self.handshake_committed:
+                self.peer_state=None
+                self.synced=self.sync_acknowledged=False
+                self._update_waiting(now)
+            return False
+        # An online but unready peer still refreshes transport liveness.
         self.peer_received=now
+        self.peer_state=replace(state)
+        fault=self._peer_fault()
+        if fault and (not self.private or self.task_active or self.handshake_committed):self.stop(fault)
+        self._update_waiting(now)
         return True
+
+    def _peer_fault(self):
+        peer=self.peer_state
+        if peer is None:return ''
+        failed=[name for name in ('localization_valid','nav_ready') if not getattr(peer,name)]
+        if not self.private and not peer.pose_valid:failed.append('pose_valid')
+        if failed:return 'peer health invalid: '+', '.join(failed)
+        if self.private and peer.run_state in ('STOPPING','PAUSED'):return 'peer paused during task'
+        return ''
+
+    def _update_waiting(self,now):
+        if not self.private or self.task_active or self.paused:return
+        failed=[name for name in ('localization_valid','nav_ready','stopped','motion_terminal')
+            if not getattr(self.health,name)]
+        if not self.health.pose.valid:failed.append('pose')
+        task=bool(self.context.task_id)
+        state='SYNCING' if task else 'PREPARING' if failed else 'WAITING_PEER'
+        peer=self.peer_state
+        if failed:
+            reason='local not ready: '+', '.join(failed)
+        elif self.peer_identity_error:
+            reason=self.peer_identity_error
+        elif peer is None or self.peer_received is None:
+            reason='waiting peer current-task state' if task else 'waiting first valid peer state'
+        elif now-self.peer_received>self.lost_timeout:
+            reason='peer current-task state stale' if task else 'valid peer state stale'
+        elif peer.task_id!=self.context.task_id:
+            reason='waiting peer task SYNC'
+        elif not peer.localization_valid or not peer.nav_ready:
+            reason='peer not ready: '+', '.join(name for name in ('localization_valid','nav_ready') if not getattr(peer,name))
+        elif self.handshake_committed:
+            reason=self._peer_fault()
+        elif not clean_startup_state(self._state):
+            reason='local startup state not clean'
+        elif not startup_state(peer,syncing=task):
+            reason='peer startup state not clean/ready: '+peer.run_state
+        elif task and (self.sync_received is None or now-self.sync_received>self.lost_timeout):
+            reason='waiting fresh coordinator SYNC'
+        else:
+            reason=''
+        self.synced=not reason and task
+        if self.synced:
+            self.sync_acknowledged=True
+            state='SYNCED'
+        elif not task and not reason:
+            state='STANDBY'
+        self._state.reply='SYNCED' if self.synced else ''
+        self._state.run_state,self._state.reason=state,reason
 
     def _plan(self):
         if self.private:
@@ -72,9 +150,11 @@ class AgentMachine:
         command=normalize_command(command)
         # SYNC alone establishes a task; EXECUTE can never silently replace it.
         if command.action == 'SYNC' and command.task_id != self.context.task_id:
+            if self.private and command.phase!='SYNCING':
+                return CommandReply(False,'new private task requires SYNCING')
             if command.task_id in self.retired_tasks:
                 return CommandReply(False, 'retired task')
-            if self._state.token or self._state.run_state not in ('IDLE', 'PAUSED') or not self._state.stopped or not self.health.motion_terminal:
+            if self._state.token or self._state.run_state not in ('IDLE', 'PAUSED', 'PREPARING', 'WAITING_PEER', 'STANDBY', 'SYNCING', 'SYNCED') or not self._state.stopped or not self.health.motion_terminal:
                 return CommandReply(False, 'not stopped for new task')
             candidate = replace(self.context, task_id=command.task_id)
             reply = validate_command(command, candidate)
@@ -85,11 +165,15 @@ class AgentMachine:
             self.context = candidate
             self.task_started_at=now
             self.peer_received=None
+            self.peer_state=None
+            self.synced=self.task_active=False
+            self.sync_acknowledged=self.handshake_committed=False
             self._state.task_id = command.task_id
             self._state.ready = self._state.deposited = self._state.exited = False
             self._state.sequence=0
             self._state.command_id=self._state.goal_id=''
             self._state.requested_resource=self._state.requested_command_id=''
+            self._state.resource_id=self._state.token=self._state.permit_command_id=self._state.resource_status=''
             self._state.run_state,self._state.reason='IDLE',''
             self._state.reply = ''
             self.command = None
@@ -102,8 +186,13 @@ class AgentMachine:
         if not reply.accepted:
             return reply
         if command.action == 'SYNC':
+            if self.private and (self.task_active or self.handshake_committed) and command.phase=='SYNCING':
+                return CommandReply(False,'cannot restart active task handshake')
+            if self.private and command.phase=='SEARCH_AB' and self.sync_acknowledged:
+                self.handshake_committed=True
             self.sync_received = now
             self.phase = command.phase
+            self._update_waiting(now)
             return reply
         if command.action in ('PAUSE', 'CANCEL'):
             if command.action == 'CANCEL' and (not self.command or command.cancel_command_id != self.command.command_id):
@@ -134,6 +223,9 @@ class AgentMachine:
             return reply
         if command.sequence <= self.last_sequence:
             return CommandReply(command.command_id == self._state.command_id, 'duplicate/stale command')
+        self._update_waiting(now)
+        if self.private and (not self.synced or self.phase=='SYNCING'):
+            return CommandReply(False,'current task handshake not complete')
         if command.phase != self.phase:
             return CommandReply(False, 'phase must be synchronized before execution')
         if command.kind == 'APPROACH_PICKUP' and (self.phase != 'SEARCH_AB' or self._state.ready):
@@ -160,6 +252,7 @@ class AgentMachine:
                     command.parent_command_id != parent or command.resource_id != self._state.resource_id):
                 return CommandReply(False, 'EXIT must preserve deposit identity')
         self.command, self.last_sequence = command, command.sequence
+        self.task_active=True
         self.retry, self.excluded = 0, []
         self._state.command_id, self._state.sequence = command.command_id, command.sequence
         self._state.reply, self._state.reason = 'ACCEPTED', ''
@@ -222,6 +315,9 @@ class AgentMachine:
     def on_goal_result(self, result, now):
         if self.paused or not self.command or (result.task_id, result.command_id, result.goal_id, result.goal_kind) != (
             self.context.task_id, self.command.command_id, self._state.goal_id, self.goal_kind):
+            return []
+        # Private approaches complete only through the local executor's strict arrival checks.
+        if self.private and result.goal_kind in ('PICKUP_NAV','DEPOSIT_NAV'):
             return []
         self._state.goal_id = ''
         # Terminal is not physical stop; tick/adapter must confirm it before replacement.
@@ -295,12 +391,18 @@ class AgentMachine:
         if self._state.pose_valid:
             self._state.common_pose = self.frame.to_common(health.pose)
         else:self._state.common_pose=Pose2D()
-        if self.context.task_id and not self.paused and (
-            self.sync_received is None or now-self.sync_received > self.lost_timeout or
-            (self.peer_received is None and now-self.task_started_at>self.lost_timeout) or
-            (self.peer_received is not None and now-self.peer_received > self.lost_timeout) or
-            not health.localization_valid or not health.nav_ready):
-            self.stop('SYNC/peer/localization/navigation health lost')
+        self._update_waiting(now)
+        if self.private and self.context.task_id and self.phase not in ('DONE','FAILED') and not self.paused and now-self.task_started_at>self.task_timeout:
+            self.stop('task timeout')
+        if self.context.task_id and (not self.private or self.task_active or self.handshake_committed) and not self.paused:
+            if self.sync_received is None or now-self.sync_received>self.lost_timeout:
+                self.stop('coordinator heartbeat timeout')
+            elif (self.peer_received is None and now-self.task_started_at>self.lost_timeout or
+                    self.peer_received is not None and now-self.peer_received>self.lost_timeout):
+                self.stop('peer heartbeat timeout')
+            elif not self._state.localization_valid or not health.nav_ready:
+                self.stop('local health invalid: '+', '.join(name for name in ('localization_valid','nav_ready') if not getattr(self._state,name)))
+            elif self._peer_fault():self.stop(self._peer_fault())
         if self._state.run_state == 'STOPPING':
             if health.stopped and health.motion_terminal:
                 self._state.run_state = 'PAUSED'
@@ -351,4 +453,5 @@ class AgentMachine:
                 {self._state.resource_id:self._state.token} if self._state.token else {},health)
             if decision.action!='ALLOW':
                 # A replanned path requires cancellation and physical stop before new permission.
-                self.stop('replanned path needs permit or boundary monitor failed')
+                reason=health.reason if not health.path_valid and health.reason else decision.reason
+                self.stop('execution path monitor: '+(reason or f'resource permit required: {decision.resource_id}'))

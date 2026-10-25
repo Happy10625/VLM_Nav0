@@ -27,19 +27,29 @@ global_costmap:
         cost_scaling_factor: 3.0
         inflation_radius: 0.55
       obstacle_layer:
-        observation_sources: fastlio_cloud
+        observation_sources: fastlio_cloud confirmed_obstacles
         fastlio_cloud:
           topic: /vlm_nav/obstacle_cloud
           sensor_frame: body
           data_type: PointCloud2
-          marking: true
+          marking: false
           clearing: true
           raytrace_min_range: 0.2
           raytrace_max_range: 8.0
           obstacle_min_range: 0.2
           obstacle_max_range: 7.5
-          min_obstacle_height: 0.05
-          max_obstacle_height: 1.5
+          min_obstacle_height: 0.10
+          max_obstacle_height: 1.60
+        confirmed_obstacles:
+          topic: /vlm_nav/confirmed_obstacle_cloud
+          sensor_frame: body
+          data_type: PointCloud2
+          marking: true
+          clearing: false
+          obstacle_min_range: 0.2
+          obstacle_max_range: 7.5
+          min_obstacle_height: 0.10
+          max_obstacle_height: 1.60
         plugin: nav2_costmap_2d::ObstacleLayer
 local_costmap:
   local_costmap:
@@ -71,25 +81,37 @@ local_costmap:
         inflation_radius: 0.55
       voxel_layer:
         origin_z: -0.1
-        z_resolution: 0.1
+        # Cover 1.60 m within the 16-layer limit while retaining clearing below z=0.
+        z_resolution: 0.11
         z_voxels: 16
-        observation_sources: fastlio_cloud
+        observation_sources: fastlio_cloud confirmed_obstacles
         fastlio_cloud:
           topic: /vlm_nav/obstacle_cloud
           sensor_frame: body
           data_type: PointCloud2
-          marking: true
+          marking: false
           clearing: true
           raytrace_min_range: 0.2
           raytrace_max_range: 8.0
           obstacle_min_range: 0.2
           obstacle_max_range: 7.5
-          min_obstacle_height: 0.05
-          max_obstacle_height: 1.5
+          min_obstacle_height: 0.10
+          max_obstacle_height: 1.60
+        confirmed_obstacles:
+          topic: /vlm_nav/confirmed_obstacle_cloud
+          sensor_frame: body
+          data_type: PointCloud2
+          marking: true
+          clearing: false
+          obstacle_min_range: 0.2
+          obstacle_max_range: 7.5
+          min_obstacle_height: 0.10
+          max_obstacle_height: 1.60
         plugin: nav2_costmap_2d::VoxelLayer
 planner_server:
   ros__parameters:
     GridBased:
+      # Native target approach: 0.76 m planner + 0.05 m goal tolerance = 0.81 m.
       tolerance: 0.76
       use_final_approach_orientation: true
       allow_unknown: true
@@ -97,6 +119,10 @@ controller_server:
   ros__parameters:
     use_sim_time: false
     odom_topic: /fastlio/odom
+    min_y_velocity_threshold: 0.001
+    controller_frequency: 20.0
+    # Abort on the classified error before a later TF failure can replace its cause.
+    failure_tolerance: 0.0
     goal_checker_plugins:
     - general_goal_checker
     general_goal_checker:
@@ -104,17 +130,33 @@ controller_server:
       xy_goal_tolerance: 0.05
       stateful: true
     FollowPath:
+      plugin: vlm_nav::RangerDWBController
+      trajectory_generator_name: vlm_nav::RangerTrajectoryGenerator
       max_vel_x: 0.2
       max_vel_theta: 0.4
+      acc_lim_x: 2.5
+      decel_lim_x: -2.5
+      acc_lim_theta: 3.2
+      decel_lim_theta: -3.2
       xy_goal_tolerance: 0.05
       trans_stopped_velocity: 0.03
+      max_moving_angular_velocity: 0.29
+      chassis_min_turn_radius: 0.47644
+      heading_lookahead: 0.4
+      heading_scale: 32.0
+      linear_granularity: 0.01
+      angular_granularity: 0.01
+      critics: [ObstacleFootprint, BaseObstacle, PathAlign, PathDist, GoalDist]
+      ObstacleFootprint.scale: 0.02
     progress_checker:
+      plugin: vlm_nav::RangerProgressChecker
       required_movement_radius: 0.1
       movement_time_allowance: 15.0
 bt_navigator:
   ros__parameters:
     use_sim_time: false
     odom_topic: /fastlio/odom
+    default_nav_to_pose_bt_xml: package://vlm_nav/behavior_trees/ranger_checked_turnaround.xml
 behavior_server:
   ros__parameters:
     use_sim_time: false
@@ -123,7 +165,10 @@ behavior_server:
     max_rotational_vel: 0.25
     min_rotational_vel: 0.1
     rotational_acc_lim: 0.3
-velocity_smoother:
+    spin:
+      plugin: vlm_nav::RangerSpin
+ranger_command_guard:
   ros__parameters:
-    use_sim_time: false
-    odom_topic: /fastlio/odom
+    command_timeout: 1.0
+    odom_topic: /odom
+    odom_timeout: 0.5

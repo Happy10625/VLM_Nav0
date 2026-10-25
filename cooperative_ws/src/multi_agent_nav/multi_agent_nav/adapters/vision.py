@@ -193,6 +193,10 @@ def observations_from_results(results,snapshot,project,frame,scan_id,view_index,
             point,reason=project(snapshot,result.target_pixel,False)
             if point is not None and all(math.isfinite(v) for v in point):
                 position=frame.to_common(Pose2D(float(point[0]),float(point[1])))
+            elif reason.startswith(('insufficient_valid_depth_samples:',
+                                    'mixed_depth_samples:','depth_out_of_range:')):
+                # An unreliable depth must not turn a visual hit into a terminal scan result.
+                status='UNCERTAIN'
         stamp=snapshot.stamp.sec+snapshot.stamp.nanosec*1e-9
         output.append(Observation(target_id=target,observation_id=f'{scan_id}/{view_index}/{target}',
             scan_id=scan_id,view_index=view_index,status=status,confidence=result.confidence if result else 0.0,

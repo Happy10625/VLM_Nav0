@@ -125,7 +125,7 @@ def test_private_agent_accepts_both_sync_encodings(mode):
     from multi_agent_nav.models import Health,Pose2D
     machine.tick(0,Health(Pose2D(),True,True,True,[],False,[[.3,.2],[.3,-.2],[-.3,-.2],[-.3,.2]],True))
     sync=Command(task_id='new-task',recipient_id='ranger',action='SYNC' if mode=='legacy' else 'SYNC_LOCAL_C',
-        common_frame_id='',alignment_id='')
+        phase='SYNCING',common_frame_id='',alignment_id='')
     if mode!='upstream_default':sync=replace(sync,kind='SYNC_LOCAL_C' if mode=='legacy' else '')
     context=replace(machine.context,task_id='new-task')
     assert validate_command(sync,context).accepted

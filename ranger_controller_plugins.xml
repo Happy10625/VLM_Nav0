@@ -1,0 +1,14 @@
+<library path="ranger_dwb_controller">
+  <class type="vlm_nav::RangerTrajectoryGenerator" base_class_type="dwb_core::TrajectoryGenerator">
+    <description>Ranger mixed-motion candidates with acceleration-aware rollout and moving angular cap.</description>
+  </class>
+  <class type="vlm_nav::RangerDWBController" base_class_type="nav2_core::Controller">
+    <description>DWB scoring of Ranger arc, braking and in-place rotation trajectories.</description>
+  </class>
+  <class type="vlm_nav::RangerProgressChecker" base_class_type="nav2_core::ProgressChecker">
+    <description>Native progress checker with a typed Ranger recovery reason.</description>
+  </class>
+  <class type="vlm_nav::RangerSpin" base_class_type="nav2_core::Behavior">
+    <description>Native Spin with complete remaining-angle footprint checks.</description>
+  </class>
+</library>

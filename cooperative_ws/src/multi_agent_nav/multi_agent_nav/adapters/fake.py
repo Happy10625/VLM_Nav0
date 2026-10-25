@@ -37,15 +37,16 @@ class FakeAdapter:
     def costmap_transform(self,global_goal=False):
         return Pose2D() if self.online else None
 
-    def costmap_candidate_free(self,candidate,global_goal=False):
+    def costmap_candidate_free(self,candidate,global_goal=False,*,allow_outside=False):
         return self.online and candidate.valid
 
     observation_candidate_free=approach_candidate_free=costmap_candidate_free
 
     def select_approach(self, local_object, excluded_candidates, *, standoff_distance=None,path_accept=None):
         offset = standoff_distance if standoff_distance is not None else (.8 if self.robot_id == 'go2' else 1.0)
-        candidates = [Pose2D(local_object.x-offset, local_object.y, 0),
-                      Pose2D(local_object.x, local_object.y-offset, 1.5707963267948966)]
+        candidates = ([Pose2D(local_object.x,local_object.y,self.pose.yaw)] if self.robot_id=='ranger' else
+                      [Pose2D(local_object.x-offset, local_object.y, 0),
+                       Pose2D(local_object.x, local_object.y-offset, 1.5707963267948966)])
         goal = next((p for p in candidates if p not in excluded_candidates and
             (path_accept is None or path_accept(PathResult(True,[self.pose,p])))), None)
         return completed(ApproachResult(goal if not self.unreachable else None, 'no approach candidate'))
@@ -69,7 +70,7 @@ class FakeAdapter:
             self.cancel_navigation(goal_id)
         return completed(True)
 
-    def start_scan(self, target_descriptions, scan_id, *, stop_on_target=None):
+    def start_scan(self, target_descriptions, scan_id, *, stop_on_target=None, task_id=None, command_id=None, current_view_only=False):
         values = []
         for target in TARGETS:
             pose = self.detections.get(target)

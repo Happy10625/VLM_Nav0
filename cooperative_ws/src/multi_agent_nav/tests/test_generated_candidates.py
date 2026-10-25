@@ -130,6 +130,10 @@ def test_dual_images_have_identical_marks_and_do_not_write_map(generated_config,
         assert tuple(a[149,210])==(125,125,125)  # completed right edge (2,0)
         assert tuple(a[239,60])==(30,100,230)  # robot (-3,-3)
     assert Path(catalog.source['image']).read_bytes()==original
+    saved=Path(images[0]).read_bytes()
+    with pytest.raises(FileExistsError):
+        render_selection(catalog,[],{},Pose2D(),tmp_path/'render')
+    assert Path(images[0]).read_bytes()==saved
 
 
 def run_generated(config,tmp_path,mode='normal',*,robot_id='go2',target_id='A'):
@@ -177,13 +181,18 @@ def run_generated(config,tmp_path,mode='normal',*,robot_id='go2',target_id='A'):
     return adapter,events,requests,outcome
 
 
-def test_fake_select_observe_next_and_current_id_mapping(generated_config,tmp_path):
+def test_fake_select_observe_next_and_current_id_mapping(generated_config,tmp_path,monkeypatch):
+    monkeypatch.setattr('multi_agent_nav.scan_evidence.time.strftime',lambda _: '2026-10-24')
     adapter,events,requests,outcome=run_generated(generated_config,tmp_path)
     from multi_agent_nav.generated_candidates import GeneratedCandidates
     points=GeneratedCandidates(generated_config).points
     assert outcome=='EXHAUSTED' and adapter.scans==len(points) and len(requests)==len(points)
     assert {(c[1].x,c[1].y) for c in adapter.calls}=={tuple(p['pose'][:2]) for p in points}
     assert len({r['decision_id'] for r in requests})==len(points)
+    assert [Path(r['evidence_directory']) for r in requests]==[
+        tmp_path/'requests'/'2026-10-24'/f'{i:06d}' for i in range(1,len(requests)+1)]
+    assert all(Path(image).is_file() and Path(image).parent==Path(r['evidence_directory'])
+               for r in requests for image in r['images'])
     origin=(0.,0.)
     for request in requests:
         order=[(math.hypot(p['pose'][0]-origin[0],p['pose'][1]-origin[1]),p['id']) for p in request['candidates']]
@@ -337,3 +346,35 @@ def test_offline_generated_entry_does_not_initialize_ros(monkeypatch,capsys,gene
     report=json.loads(capsys.readouterr().out)
     assert len([p for p in report['semantic_search']['points'] if p['furniture_id']])==4
     assert any(not p['furniture_id'] for p in report['semantic_search']['points']) and not report['motion_sent']
+
+
+def test_keepout_insets_candidate_centers_without_changing_navigation_mask(generated_config,tmp_path):
+    from vlm_nav.keepout import write_mask,KeepoutMask
+    from multi_agent_nav.generated_candidates import GeneratedCandidates
+    robot=generated_config['robot_go2']
+    output=write_mask(robot['map_path'],[[-4,-4],[-.2,-4],[-.2,4],[-4,4]],tmp_path/'keepout_mask.yaml',0.)
+    mask=KeepoutMask(robot['map_path'],output)
+    before=output.read_bytes(),output.with_suffix('.pgm').read_bytes()
+    baseline=GeneratedCandidates(generated_config)
+    robot.update(keepout_mask_yaml=str(output),keepout_mask_digest=mask.digest)
+    filtered=GeneratedCandidates(generated_config)
+    assert 0<len(filtered.points)<len(baseline.points)
+    assert all(mask.contains(*p['pose'][:2]) for p in filtered.points)
+    assert mask.contains(-.45,2.55)  # A center fits here, but its rotation envelope crosses the boundary.
+    assert all(p['pose'][0]<-.7 for p in filtered.points)
+    assert any(p['furniture_id'] for p in filtered.points)  # Both furniture and free-space points are filtered.
+    assert before==(output.read_bytes(),output.with_suffix('.pgm').read_bytes())
+    assert np.array_equal(filtered.keepout.free,mask.free)
+    assert filtered.unchanged()
+    Image.new('L',(100,100),0).save(output.with_suffix('.pgm'))
+    assert not filtered.unchanged()
+    with pytest.raises(ValueError):GeneratedCandidates(generated_config)
+
+
+@pytest.mark.parametrize('footprint',[
+    [[.3,.2],[.3,-.2],[-.3,-.2],[-.3,.2]],
+    [[0.,.4],[.4,0.],[0.,-.4],[-.4,0.]],
+])
+def test_rotation_radius_covers_nav2_padded_vertices(footprint):
+    from multi_agent_nav.generated_candidates import rotation_radius
+    assert rotation_radius(footprint,.1)==pytest.approx(.5)

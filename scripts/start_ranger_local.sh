@@ -33,6 +33,10 @@ for name in /ranger_base /ranger_mini_v3 /fastlio_odom_adapter /base_to_camera /
 done
 if [[ "${1:-}" == --start-navigation ]]; then
   shift
+  if grep -Fxq /velocity_smoother <<< "$nodes"; then
+    echo "旧velocity_smoother仍在运行；请正常结束原Nav2，避免再次平滑Ranger候选指令。" >&2
+    exit 1
+  fi
   if [[ "$nodes" =~ /amcl|/map_server|/controller_server|/planner_server|/fastlio_odom_adapter|/base_to_camera|/odom_to_fastlio_world ]]; then
     echo "已有定位/Nav2/TF节点，拒绝重复启动；可使用默认附着方式。" >&2
     exit 1

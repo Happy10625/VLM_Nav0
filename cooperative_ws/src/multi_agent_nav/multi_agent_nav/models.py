@@ -4,7 +4,7 @@ import math
 SCHEMA_VERSION = 1
 ROBOTS = ('go2', 'ranger')
 TARGETS = ('A', 'B', 'C')
-PHASES = ('IDLE', 'SEARCH_AB', 'SEARCH_C', 'DEPOSIT', 'DONE', 'PAUSED', 'FAILED')
+PHASES = ('IDLE', 'SYNCING', 'SEARCH_AB', 'SEARCH_C', 'DEPOSIT', 'DONE', 'PAUSED', 'FAILED')
 KINDS = ('SEARCH_VIEWPOINT', 'APPROACH_PICKUP', 'WAIT', 'APPROACH_DEPOSIT', 'EXIT')
 
 @dataclass(frozen=True)
@@ -73,6 +73,18 @@ class AgentState:
     resource_status: str = ''
     requested_resource: str = ''
     requested_command_id: str = ''
+
+def clean_startup_state(state):
+    return (state.sequence == 0 and not any(getattr(state, name) for name in (
+        'command_id', 'goal_id', 'ready', 'deposited', 'exited', 'resource_id', 'token',
+        'permit_command_id', 'resource_status', 'requested_resource', 'requested_command_id')))
+
+def startup_state(state, syncing=False):
+    states = ('SYNCING', 'SYNCED') if syncing else ('WAITING_PEER', 'STANDBY')
+    return (clean_startup_state(state) and state.run_state in states and
+        state.reply == ('SYNCED' if state.run_state == 'SYNCED' else '') and
+        (bool(state.task_id) if syncing else not state.task_id) and
+        state.localization_valid and state.nav_ready and state.stopped)
 
 @dataclass
 class Observation:
@@ -228,6 +240,11 @@ def validate_command(command, context):
         return CommandReply(False,'private local task does not use resource grants')
     if command.action == 'SYNC' and (command.kind == 'SYNC_LOCAL_C') != private:
         return CommandReply(False, 'coordinate mode mismatch')
+    if private and command.action == 'SYNC' and (not command.task_id or command.phase not in PHASES or
+            command.position_valid or command.common_goal != Pose2D() or command.object_position != Pose2D() or
+            any(getattr(command, name) for name in ('command_id','sequence','viewpoint_id','resource_id',
+                'token','parent_command_id','cancel_command_id','target_id','observation_id'))):
+        return CommandReply(False, 'invalid private task sync')
     if command.action not in ('EXECUTE', 'SYNC', 'PAUSE', 'CANCEL', 'GRANT_RESOURCE'):
         return CommandReply(False, 'unknown action')
     if command.action == 'EXECUTE':

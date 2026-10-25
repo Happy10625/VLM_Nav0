@@ -12,21 +12,26 @@ obstacle_cloud_filter:
   ros__parameters:
     input_topic: /cloud_registered_body
     output_topic: /vlm_nav/obstacle_cloud
+    confirmed_topic: /vlm_nav/confirmed_obstacle_cloud
+    confirmation_frame: odom
+    # Confirm the same 5 cm XY cell in three completed 0.8 s observation cycles.
+    confirmation_period: 0.8
+    confirmation_cycles: 3
     target_frame: base_link
     # TODO(real-robot calibration): validate queue depth at the actual cloud rate.
     tf_queue_size: 20
     use_sim_time: false
     # TODO(real-robot calibration): validate both height limits on the robot.
-    min_height: 0.05
-    max_height: 1.50
+    min_height: 0.10
+    max_height: 1.60
     # TODO(real-robot calibration): validate all six self CropBox boundaries.
     # This box is independent of the Nav2 footprint and has no implicit padding.
     self_crop_min_x: -0.36
     self_crop_max_x: 0.36
     self_crop_min_y: -0.25
     self_crop_max_y: 0.25
-    self_crop_min_z: 0.05
-    self_crop_max_z: 1.50
+    self_crop_min_z: 0.10
+    self_crop_max_z: 1.60
     # TODO(real-robot calibration): validate the initial 0.05 m voxel leaf.
     voxel_leaf_size: 0.05
     # diagnostic_updater owns an independent periodic timer. The cloud callback
@@ -43,6 +48,7 @@ vlm_nav:
     map_topic: /map
     rgb_topic: /camera/color/image_raw
     depth_topic: /camera/aligned_depth_to_color/image_raw
+    rgbd_reliable_qos: true
     camera_info_topic: /camera/color/camera_info
     navigate_action: /navigate_to_pose
     compute_path_action: /compute_path_to_pose
@@ -79,6 +85,7 @@ vlm_nav:
     # Direct target grounding is trusted up to this range. Farther readings
     # trigger a Nav2-validated intermediate approach along the VLM direction.
     max_depth: 6.0
+    # Legacy compatibility only; depth now averages the six samples nearest the median.
     max_depth_deviation: 0.20
     # Sparse or mixed target depth triggers a small pixel-directed rotation
     # and a fresh stationary VLM/RGB-D observation.

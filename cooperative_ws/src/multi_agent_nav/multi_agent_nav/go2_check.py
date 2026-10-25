@@ -98,7 +98,7 @@ def parser():
     p.add_argument('--target-id',choices=('A','B','C'))
     p.add_argument('--target',help='single exploration target description; defaults to the selected scene.targets ID')
     p.add_argument('--search-hint', help='location clue for furniture selection only; not visual detection evidence')
-    p.add_argument('--approach-target', action='store_true', help='after grounded detection, approach using existing standoff planner')
+    p.add_argument('--approach-target', action='store_true', help='after grounded detection, approach using the robot target planner')
     p.add_argument('--strategy', choices=('fixed_viewpoints', 'semantic_furniture', 'generated_candidates_vlm'),
                    help='Go2 internal exploration strategy; default fixed_viewpoints')
     p.add_argument('--goal',nargs=3,type=float,metavar=('X','Y','YAW'),help='measured local Go2 map pose; inspect only probes costmap footprint; approach treats X/Y as object position')

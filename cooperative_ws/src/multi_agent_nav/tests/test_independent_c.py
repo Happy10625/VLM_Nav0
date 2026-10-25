@@ -31,6 +31,7 @@ def ready_coordinator():
     coordinator = mission.coordinator
     for robot in ROBOTS:
         coordinator.ingest_state(replace(coordinator.states[robot], task_id=coordinator.task_id, ready=True), 0.)
+    coordinator.phase='SEARCH_AB'  # Unit scenarios below start after the handshake.
     return coordinator
 
 
@@ -167,6 +168,7 @@ def test_cache_upgrade_is_task_local_and_ignores_invalid_coordinates():
     assert any(c.recipient_id == 'ranger' and c.kind == 'APPROACH_DEPOSIT' for c in actions)
     assert any(c.recipient_id == 'go2' and c.kind == 'SEARCH_VIEWPOINT' for c in actions)
     coordinator.pause('new task')
+    for state in coordinator.states.values():state.run_state='PAUSED'
     assert coordinator.start(coordinator.scene['scenario_id'], .1).accepted
     assert not coordinator.local_c and not coordinator.observations
 

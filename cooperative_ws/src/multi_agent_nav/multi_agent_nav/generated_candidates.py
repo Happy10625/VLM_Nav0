@@ -11,6 +11,7 @@ import yaml
 from .config import map_file_info, valid_numbers
 from .region_guard import edges, inside, segments_intersect, path_intersects
 from .models import Pose2D
+from vlm_nav.keepout import configured_mask
 
 
 def rotation_radius(footprint, padding=0.):
@@ -18,7 +19,9 @@ def rotation_radius(footprint, padding=0.):
             or any(not valid_numbers(p,2) for p in footprint)
             or not valid_numbers([padding],1) or padding<0):
         raise ValueError('finite footprint and nonnegative padding required')
-    radius=max(math.hypot(x,y) for x,y in footprint)+padding
+    # Nav2 pads each nonzero coordinate before checking the footprint.
+    radius=max(math.hypot(abs(x)+padding if x else 0.,
+                          abs(y)+padding if y else 0.) for x,y in footprint)
     if radius<=0:raise ValueError('positive footprint radius required')
     return radius
 
@@ -128,7 +131,14 @@ class GeneratedCandidates:
                 if any(path_intersects([Pose2D(x,y)],f['polygon'],self.radius) for f in self.furniture):continue
                 if any(math.hypot(x-p['pose'][0],y-p['pose'][1])<spacing/2 for p in furniture_points):continue
                 self.points.append(dict(id=f'free/{row}/{col}',furniture_id='',pose=[x,y,yaw]))
+        self.keepout=configured_mask(robot)
+        if self.keepout is not None:
+            # Inset candidate centers only; Nav2 needs the original boundary for footprint checks.
+            self.points=[p for p in self.points if circle_free(
+                self.keepout.free,*self.map_xy(*p['pose'][:2]),self.radius,resolution,
+                lambda cells:~cells)]
         self.digests={self.map_path:info['yaml_sha256'],Path(info['image_path']):info['image_sha256']}
+        if self.keepout is not None:self.digests.update(self.keepout.digests)
         if self.semantic_path is not None:
             self.digests[self.semantic_path]=hashlib.sha256(semantic_bytes).hexdigest() if semantic_bytes is not None else None
 
@@ -226,10 +236,12 @@ def render_selection(catalog,candidates,records,robot_pose,directory):
     for offset,label,color in ((65,robot_label+': blue circle and heading',blue),(45,'P IDs: orange / selectable',orange),
                                (25,'Gray: observed / cannot select',gray)):
         draw.text((10,height+footer-offset),label,fill=color,font=font)
-    directory=Path(directory);directory.mkdir(parents=True,exist_ok=False)
+    directory=Path(directory);directory.mkdir(parents=True,exist_ok=True)
     paths=[]
     for base,name in zip(bases,('occupancy.png','semantic.png')):
-        path=directory/name;Image.alpha_composite(base,overlay).convert('RGB').save(path);paths.append(str(path))
+        path=directory/name
+        with path.open('xb') as stream:Image.alpha_composite(base,overlay).convert('RGB').save(stream,format='PNG')
+        paths.append(str(path))
     return paths
 
 

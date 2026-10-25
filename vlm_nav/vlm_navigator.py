@@ -110,7 +110,7 @@ def quaternion_yaw(quaternion):
 class VLMNavigator(Node):
     def __init__(self, *, observation_only=False, parameter_overrides=None, node_name=None):
         super().__init__(node_name or ("multi_agent_go2_rgbd" if observation_only else "vlm_nav"),
-                         parameter_overrides=parameter_overrides)
+                         parameter_overrides=parameter_overrides,use_global_arguments=not observation_only)
         self.observation_only = observation_only
         defaults = {
             "enabled": False,
@@ -125,6 +125,7 @@ class VLMNavigator(Node):
             "depth_topic": "/camera/aligned_depth_to_color/image_raw",
             "camera_info_topic": "/camera/color/camera_info",
             "depth_camera_info_topic": "/camera/depth/camera_info",
+            "rgbd_reliable_qos": False,
             "raw_depth_mode": False,
             "realsense_library": "/usr/local/lib/librealsense2.so.2.53.1",
             "depth_units_report": "~/.config/vlm_nav/raw_depth_units_verified.json",
@@ -363,18 +364,21 @@ class VLMNavigator(Node):
             qos_profile_sensor_data,
         )
         self.perception_group = MutuallyExclusiveCallbackGroup()
+        # Ranger's large images need retransmission on the local CycloneDDS link.
+        image_qos = (QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
+                     if self.p.rgbd_reliable_qos else qos_profile_sensor_data)
         self.rgb_sub = Subscriber(
             self,
             Image,
             self.p.rgb_topic,
-            qos_profile=qos_profile_sensor_data,
+            qos_profile=image_qos,
             callback_group=self.perception_group,
         )
         self.depth_sub = Subscriber(
             self,
             Image,
             self.p.depth_topic,
-            qos_profile=qos_profile_sensor_data,
+            qos_profile=image_qos,
             callback_group=self.perception_group,
         )
         self.rgb_sub.registerCallback(

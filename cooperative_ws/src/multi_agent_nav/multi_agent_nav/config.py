@@ -23,6 +23,32 @@ def map_file_info(path):
     return {'yaml_path':str(path),'image_path':str(image),'yaml_sha256':yaml_hash,
         'image_sha256':image_hash,'map_digest':hashlib.sha256((yaml_hash+image_hash).encode()).hexdigest()}
 
+def file_signature(paths):
+    signature=[]
+    for path in paths:
+        try:
+            stat=Path(path).stat()
+            signature.append((stat.st_dev,stat.st_ino,stat.st_size,stat.st_mtime_ns,stat.st_ctime_ns))
+        except FileNotFoundError:signature.append(None)
+    return tuple(signature)
+
+def map_file_evidence(config,robot):
+    """Run on the serial worker; cache hashes only while the same files stay unchanged."""
+    try:
+        cfg=config['robot_'+robot]
+        path=Path(cfg['map_path']).expanduser().resolve()
+        paths=(path,(path.parent/yaml.safe_load(path.read_text())['image']).resolve())
+        from vlm_nav.keepout import configured_mask
+        mask=configured_mask(cfg)
+        if mask is not None:paths+=tuple(mask.digests)
+        before=file_signature(paths)
+        info=map_file_info(path)
+        valid=before==file_signature(paths) and cfg.get('map_digest')==info['map_digest']
+        if mask is not None:valid=valid and all(hashlib.sha256(p.read_bytes()).hexdigest()==digest for p,digest in mask.digests.items())
+        return ([] if valid else ['map digest changed']),paths,before
+    except (OSError,KeyError,TypeError,ValueError,yaml.YAMLError):
+        return ['readable map YAML/image missing'],(),None
+
 def valid_numbers(value, length):
     return isinstance(value,(list,tuple)) and len(value)==length and all(
         isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v) for v in value)
@@ -45,9 +71,15 @@ def map_file_gates(config,robot,check_files=True):
         return [] if cfg.get('map_digest') else [f'{robot}: map_digest missing']
     try:
         info=map_file_info(cfg['map_path'])
-        return [] if cfg.get('map_digest')==info['map_digest'] else [f'{robot}: map_digest missing or differs from YAML/image files']
     except (OSError,KeyError,TypeError,ValueError):
         return [f'{robot}: readable map YAML/image missing']
+    if cfg.get('keepout_mask_yaml'):
+        try:
+            from vlm_nav.keepout import configured_mask
+            configured_mask(cfg)
+        except (OSError,KeyError,TypeError,ValueError,yaml.YAMLError) as error:
+            return [f'{robot}: keepout mask invalid: {error}']
+    return [] if cfg.get('map_digest')==info['map_digest'] else [f'{robot}: map_digest missing or differs from YAML/image files']
 
 def robot_local_gates(config, robot_id, motion=False, vision=False, check_map_files=True):
     """Independent local checks; never stand in for the cooperative live gates."""

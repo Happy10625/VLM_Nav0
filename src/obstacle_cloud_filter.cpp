@@ -39,7 +39,12 @@ public:
   {
     input_topic_ = declare_parameter<std::string>("input_topic", "/cloud_registered_body");
     output_topic_ = declare_parameter<std::string>("output_topic", "/vlm_nav/obstacle_cloud");
+    confirmed_topic_ = declare_parameter<std::string>(
+      "confirmed_topic", "/vlm_nav/confirmed_obstacle_cloud");
     target_frame_ = declare_parameter<std::string>("target_frame", "base_link");
+    confirmation_frame_ = declare_parameter<std::string>("confirmation_frame", "odom");
+    const int confirmation_cycles = declare_parameter<int>("confirmation_cycles", 0);
+    const double confirmation_period = declare_parameter<double>("confirmation_period", .8);
     tf_queue_size_ = declare_parameter<int>("tf_queue_size", 20);
     parameters_.min_height = declare_parameter<double>("min_height", 0.05);
     parameters_.max_height = declare_parameter<double>("max_height", 1.50);
@@ -51,8 +56,16 @@ public:
     parameters_.self_crop_max_z = declare_parameter<double>("self_crop_max_z", 1.50);
     parameters_.voxel_leaf_size = declare_parameter<double>("voxel_leaf_size", 0.05);
     validate_configuration();
+    if (confirmation_cycles < 0) {
+      throw std::invalid_argument("confirmation_cycles must be nonnegative (0 disables confirmation)");
+    }
+    if (confirmation_cycles > 0) {
+      confirmation_ = std::make_unique<PlanarObstacleConfirmation>(
+        parameters_.voxel_leaf_size, confirmation_period, confirmation_cycles);
+    }
 
     publisher_ = create_publisher<Cloud>(output_topic_, rclcpp::SensorDataQoS());
+    confirmed_publisher_ = create_publisher<Cloud>(confirmed_topic_, rclcpp::SensorDataQoS());
     tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
     tf_buffer_->setCreateTimerInterface(std::make_shared<tf2_ros::CreateTimerROS>(
       get_node_base_interface(), get_node_timers_interface()));
@@ -67,6 +80,10 @@ public:
       static_cast<std::uint32_t>(tf_queue_size_), get_node_logging_interface(),
       get_node_clock_interface());
     cloud_filter_->setTolerance(rclcpp::Duration::from_seconds(0.0));
+    if (confirmation_) {
+      // Queue scans until both exact-time transforms exist instead of losing confirmation on TF lag.
+      cloud_filter_->setTargetFrames({target_frame_, confirmation_frame_});
+    }
     cloud_filter_->registerCallback(
       std::bind(&ObstacleCloudFilterNode::on_cloud, this, std::placeholders::_1));
 
@@ -85,6 +102,7 @@ private:
   struct RuntimeStatistics
   {
     FilterStatistics points;
+    std::size_t confirmed_points{0};
     std::uint64_t processed_count{0};
     double processing_latency_ms{0.0};
     std::optional<SteadyClock::time_point> last_success;
@@ -92,8 +110,10 @@ private:
 
   void validate_configuration()
   {
-    if (input_topic_.empty() || output_topic_.empty() || target_frame_.empty()) {
-      throw std::invalid_argument("input_topic, output_topic, and target_frame must not be empty");
+    if (input_topic_.empty() || output_topic_.empty() || target_frame_.empty() ||
+      confirmed_topic_.empty() || confirmation_frame_.empty() || confirmed_topic_ == output_topic_)
+    {
+      throw std::invalid_argument("nonempty frames/topics and distinct clearing/confirmed topics required");
     }
     if (tf_queue_size_ <= 0) {
       throw std::invalid_argument("tf_queue_size must be greater than zero");
@@ -121,14 +141,35 @@ private:
       output.header.frame_id = target_frame_;
       publisher_->publish(output);
 
+      auto confirmed = output;
+      if (confirmation_) {
+        confirmed.height = 1;
+        confirmed.width = confirmed.row_step = 0;
+        confirmed.data.clear();
+        Cloud fixed;
+        // Accumulate in a fixed frame so chassis motion cannot move the evidence grid.
+        if (pcl_ros::transformPointCloud(confirmation_frame_, output, fixed, *tf_buffer_)) {
+          fixed.header.stamp = output.header.stamp;
+          fixed.header.frame_id = confirmation_frame_;
+          confirmed = confirmation_->filter(fixed);
+        } else {
+          confirmation_->reset();
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+            "Confirmation transform unavailable; marking cloud is empty");
+        }
+      }
+      confirmed_publisher_->publish(confirmed);
+
       const auto completed = SteadyClock::now();
       const auto latency = std::chrono::duration<double, std::milli>(completed - started).count();
       std::lock_guard<std::mutex> lock(statistics_mutex_);
       statistics_.points = points;
+      statistics_.confirmed_points = static_cast<size_t>(confirmed.width) * confirmed.height;
       statistics_.processing_latency_ms = latency;
       statistics_.last_success = completed;
       ++statistics_.processed_count;
     } catch (const std::exception & error) {
+      if (confirmation_) {confirmation_->reset();}
       RCLCPP_ERROR(get_logger(), "Obstacle cloud processing failed: %s", error.what());
     }
   }
@@ -166,17 +207,22 @@ private:
     status.add("after_self_crop", snapshot.points.after_self_crop);
     status.add("after_voxel", snapshot.points.after_voxel);
     status.add("output_points", snapshot.points.output_points);
+    status.add("confirmed_points", snapshot.confirmed_points);
     status.add("processing_latency_ms", snapshot.processing_latency_ms);
     status.add("last_success_age_s", last_success_age);
   }
 
   std::string input_topic_;
   std::string output_topic_;
+  std::string confirmed_topic_;
   std::string target_frame_;
+  std::string confirmation_frame_;
   int tf_queue_size_{20};
   FilterParameters parameters_;
+  std::unique_ptr<PlanarObstacleConfirmation> confirmation_;
 
   rclcpp::Publisher<Cloud>::SharedPtr publisher_;
+  rclcpp::Publisher<Cloud>::SharedPtr confirmed_publisher_;
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
   std::shared_ptr<message_filters::Subscriber<Cloud>> cloud_subscriber_;

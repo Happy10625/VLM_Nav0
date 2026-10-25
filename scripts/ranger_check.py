@@ -22,6 +22,7 @@ def format_check(passed, message):
 
 def gate_text(reason):
     translations = (
+        ('keepout', '场地Keepout掩膜校验失败，请核对本机地图对齐、掩膜文件和摘要'),
         ('stop margin', '停车余量 stop_margin 尚未填写有效实测值'),
         ('camera_calibrated', '相机外参尚未完成现场确认'),
         ('costmap_source_verified', 'costmap 来源尚未完成现场确认'),
@@ -204,7 +205,7 @@ def quiet_native_output(log):
 
 def hardware_probe(duration):
     import rclpy
-    from rclpy.qos import qos_profile_sensor_data
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
     from sensor_msgs.msg import Image, Imu
     from nav_msgs.msg import Odometry
     from livox_ros_driver2.msg import CustomMsg
@@ -228,8 +229,10 @@ def hardware_probe(duration):
             if isinstance(message, Image):
                 row.update(width=message.width, height=message.height, encoding=message.encoding)
         for topic, (message_type, _, _, _) in topics.items():
+            qos = (QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
+                   if message_type is Image else qos_profile_sensor_data)
             node.create_subscription(message_type, topic,
-                                     lambda msg, topic=topic: receive(topic, msg), qos_profile_sensor_data)
+                                     lambda msg, topic=topic: receive(topic, msg), qos)
         deadline = time.monotonic() + duration
         while time.monotonic() < deadline:
             rclpy.spin_once(node, timeout_sec=.05)

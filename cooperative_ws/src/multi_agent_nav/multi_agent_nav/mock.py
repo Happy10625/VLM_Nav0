@@ -26,7 +26,7 @@ def make_machine(config,robot,simulation):
     frame=configured_frame(config,robot)
     context=AgentContext(robot,'',*frame.ids,simulation)
     machine=AgentMachine(context,frame,config['scene'].get('lost_timeout',3.0),
-        config[f'robot_{robot}'].get('path_start_timeout',1.0))
+        config[f'robot_{robot}'].get('path_start_timeout',1.0),config['scene'].get('task_timeout',600.0))
     regions={}
     for key,region in (config['scene'].get('resources',{}).items() if not machine.private else []):
         value=dict(region,polygon=frame.polygon_to_local(region['polygon']))
@@ -65,6 +65,11 @@ class MockMission:
                 lambda obs:self.coordinator.ingest_observation(obs,self.now),config=self.config,success_radius=1.)
             machine.tick(0,adapter.get_health())
             self.coordinator.ingest_state(machine.state(),0)
+        if self.coordinator.private:
+            for robot,machine in self.machines.items():
+                peer='ranger' if robot=='go2' else 'go2'
+                machine.receive_peer(self.machines[peer].state(),self.config['alignment']['robots'][peer],0.)
+                self.coordinator.ingest_state(machine.state(),0.)
 
     def start(self):
         return self.coordinator.start(self.config['scene']['scenario_id'],self.now)
@@ -81,7 +86,8 @@ class MockMission:
             state=self.machines[robot].state()
             self.coordinator.ingest_state(state,self.now)
             peer='ranger' if robot=='go2' else 'go2'
-            if self.online[peer]:self.machines[peer].peer_received=self.now
+            if self.online[peer]:
+                self.machines[peer].receive_peer(state,self.config['alignment']['robots'][robot],self.now)
         for command in self.coordinator.tick(self.now):
             if not self.online[command.recipient_id]:continue
             reply=self.machines[command.recipient_id].accept(command,self.now)

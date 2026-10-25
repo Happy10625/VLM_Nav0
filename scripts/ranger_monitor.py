@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Small read-only dashboard: incremental experiment logs plus chassis telemetry."""
 import argparse
+from collections import deque
 import json
 import math
 import os
@@ -160,16 +161,45 @@ def velocity(row):
     return '[' + ', '.join(f'{v:+.3f}' for v in values) + ']'
 
 
+def receive_velocity(telemetry, kind, message, now):
+    v = message.twist.twist if kind == 'odom' else message
+    row = dict(values=[v.linear.x, v.linear.y, v.angular.z], at=now)
+    if kind == 'odom':
+        row['stamp'] = message.header.stamp.sec + message.header.stamp.nanosec * 1e-9
+    else:
+        history = telemetry.setdefault('cmd_history', deque())
+        history.append((now, v.angular.z if all(math.isfinite(x) for x in row['values']) else 0.))
+        while history and now - history[0][0] > 10.:
+            history.popleft()
+    telemetry[kind] = row
+
+
 def render(view, telemetry, *, now, ros_now, can_delta, odom_max_age=.5, path_max_age=5.):
     row, result = view.latest, view.result
     odom, cmd = telemetry.get('odom', {}), telemetry.get('cmd', {})
     odom_age = max(now - odom['at'], abs(ros_now - odom['stamp'])) if odom else None
     cmd_age = now - cmd['at'] if cmd else None
+    command_velocity = velocity(cmd)
+    if not cmd:
+        direction = '未收到'
+    elif cmd_age > 1.:
+        direction = '指令过期'
+    elif command_velocity == '非法速度':
+        direction = '非法速度'
+    else:
+        direction = '逆时针' if cmd['values'][2] > .03 else '顺时针' if cmd['values'][2] < -.03 else '零/微小角速度'
+    # Count received commands so a 1Hz screen does not hide faster reversals.
+    turns = [w > 0 for at, w in telemetry.get('cmd_history', ()) if now - at <= 10. and abs(w) > .03]
+    reversals = sum(a != b for a, b in zip(turns, turns[1:])) if cmd else '--'
     notes = []
     if not odom:
         notes.append('未收到底盘速度')
     elif odom_age > odom_max_age:
         notes.append('速度过期')
+    if not cmd:
+        notes.append('未收到底盘指令')
+    elif cmd_age > 1.:
+        notes.append('底盘指令过期')
     if can_delta == 0:
         notes.append('CAN无接收增长，odom不能证明通信正常')
     elif can_delta is None:
@@ -212,7 +242,7 @@ def render(view, telemetry, *, now, ros_now, can_delta, odom_max_age=.5, path_ma
         f'任务:{state} | 最近阶段:{view.last_stage} | 目标:{row.get("target_id", result.get("target_id", "-"))}/{target} | 点:{compact(row.get("viewpoint_id", "-"), 35)}',
         f'动作:{view.motion.get("kind", "-")} / {motion_status} | 日志龄:{age(abs(ros_now-row["wall_time"]) if row.get("wall_time") else None)}',
         f'实测速度[vx,vy,wz]={velocity(odom)} | odom:{age(odom_age)} | CAN:{"+"+str(can_delta) if can_delta is not None else "--"}帧/刷新',
-        f'指令速度[vx,vy,wz]={velocity(cmd)} | 接收龄:{age(cmd_age)} （单位:m/s,m/s,rad/s）',
+        f'底盘/cmd_vel[vx,vy,wz]={command_velocity} | {direction} | 10s换向:{reversals} | 接收龄:{age(cmd_age)} （m/s,m/s,rad/s）',
         f'执行路径:{path_state} / {view.path_count}点 | 接收龄:{age(path_age)}',
         f'结果:{compact(outcome, 75)} | 任务停止确认:{confirmed} | 原因:{compact(reason, 100)}',
         '排障:' + ' | '.join(diagnostic),
@@ -244,15 +274,10 @@ def main(argv=None):
     rclpy.init()
     node = rclpy.create_node('ranger_diagnostic', enable_rosout=False, start_parameter_services=False)
 
-    def receive(kind, message):
-        v = message.twist.twist if kind == 'odom' else message
-        row = dict(values=[v.linear.x, v.linear.y, v.angular.z], at=time.monotonic())
-        if kind == 'odom':
-            row['stamp'] = message.header.stamp.sec + message.header.stamp.nanosec * 1e-9
-        telemetry[kind] = row
-
-    node.create_subscription(Odometry, config.get('odom_topic', '/odom'), lambda m: receive('odom', m), qos_profile_sensor_data)
-    node.create_subscription(Twist, '/cmd_vel', lambda m: receive('cmd', m), qos_profile_sensor_data)
+    node.create_subscription(Odometry, config.get('odom_topic', '/odom'),
+        lambda m: receive_velocity(telemetry, 'odom', m, time.monotonic()), qos_profile_sensor_data)
+    node.create_subscription(Twist, '/cmd_vel',
+        lambda m: receive_velocity(telemetry, 'cmd', m, time.monotonic()), qos_profile_sensor_data)
 
     def can_packets():
         try:

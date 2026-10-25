@@ -23,8 +23,8 @@ def scan_converter_node():
             {
                 "target_frame": "base_link",
                 "transform_tolerance": 0.10,
-                "min_height": 0.05,
-                "max_height": 1.50,
+                "min_height": 0.10,
+                "max_height": 1.60,
                 "angle_min": -3.141592653589793,
                 "angle_max": 3.141592653589793,
                 "angle_increment": 0.008726646259972,

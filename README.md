@@ -8,14 +8,41 @@
 本目录借鉴 `Co-NavGPT2` 和其中的 `co_nav2_nav`，但运行和构建不要求修改
 那些源码。Livox、FAST_LIO、RealSense 和 Ranger 驱动仍由现有工作空间提供。
 
-协作 Ranger 可用一条命令按顺序启动硬件、Nav2、轻量RViz和R5只读诊断终端：
+协作 Ranger 在现场验证标志核实后，可用以下入口完成预检、硬件/定位、健康检查、任务桥、agent及state/peer窗口启动：
 
 ```bash
-source /home/isee601/ws/VLM_Nav/RangerVLM_env.bash
-bash "$REPO/scripts/start_ranger_stack.sh"
+bash /home/isee601/ws/VLM_Nav/scripts/start_ranger_cooperative.sh
 ```
 
-启动后保留各组件终端，在RViz设置真实初始位姿，再执行下面的只读检查；已有完整实例时复用，不自动开始探索。
+只需在 RViz 核对本机地图和位姿后输入 `4`，随后自动启动或复用 Ranger 任务桥、启动 agent 并打开 state/peer。不等待 Go2 的步骤确认；双方完整入口可先后独立运行。Go2 完整入口完成双方准备采样后自动 start 一次，Ranger 不发送 start；人工分组件路径则由 Go2 采样通过后手工 start 一次。已有旧 agent 须先停稳并正常退出，预检或本机健康检查失败会停止后续启动。具体流程见[全流程启动入口](docs/双机协同启动与验收.md#21-ranger-全流程启动入口)。
+
+场地边界使用与定位地图对齐的 Keepout 掩膜：两个 costmap 使用不按车体尺寸内缩的边界，轨迹按 footprint + padding 检查；VLM候选中心另按加 padding 后的完整旋转半径向内筛选。更新后须正常重启旧 Nav2/agent，掩膜文件和三项静止验收见[场地Keepout说明](docs/multi_agent/ranger_keepout_20261022.md)。
+
+协同 VLM 记录保存在本机 `experiment_records_root/cooperative/<机器人>/` 下：
+扫描使用 `scans/YYYY-MM-DD/000001/`，选点使用 `selections/YYYY-MM-DD/000001/`。
+日期按记录生成时的本机日期计算，两类记录分别按生成顺序使用六位序号；同日多轮实验及进程重启后接着编号，次日从 `000001` 开始。
+扫描目录保存 `input.jpg`、`result.png`、`request.json`、`response.txt` 和 `metadata.json`；选点目录保存地图输入图及请求、响应和元数据。
+任务、决策和扫描 ID 保留在元数据中，旧哈希目录不自动搬迁。修改后正常重启 agent，新记录使用此规则。
+
+对齐深度定位保留目标像素周围 11×11 区域内 0.20～6.00 m 的有限有效值，至少需要 8 个样本；计算中位数后，取距离中位数最近的 6 个样本求平均作为目标深度，不再使用 ±0.20 m 的一致性门槛。协同扫描识别到目标，但深度样本不足或超过可靠距离时，该次目标观察按 `UNCERTAIN` 处理。Ranger 保持原视角，包含首次最多观察三帧：每次等待停稳后的新 RGB-D 帧，重新调用 VLM 并使用该帧深度定位；任一帧取得有效目标位置就结束扫描，三次深度均失败才继续下一旋转视角（初始原地观察则继续选点探索）。重试沿用扫描超时、健康检查和取消规则，每次请求单独保存图像与结果，`metadata.json` 中的 `depth_attempt` 为本视角第几次尝试；最多增加两次 VLM 请求。Go2 沿用下一视角扫描逻辑。原始 VLM 图片与返回值仍保留，记录中的视觉 `DETECTED` 不代表已获得有效位置。
+
+协同 Ranger 每轮新任务先把当前位置作为首次观察点 `START`（记录 ID 为 `task_start`），保持当前朝向、不旋转，等待新图像并向 VLM 请求识别；已检出但深度不可靠时按上述三帧规则重试。起点获得有效目标位置时直接进入目标接近；未检出或三帧深度均不可靠则让 VLM 选择候选观察点并前往，候选点到达后仍按原有流程环视。起点观察不要求完整旋转空间，也不占用候选点。同一任务的后续搜索指令不重复起点观察；新任务按新的起始位置重新观察。此流程修改重启 Ranger agent 后生效。
+
+Ranger 的协同与新单机探索接近均直接将目标本机地图坐标交给 Nav2，不再生成目标周围的停靠候选。沿用旧版原生容差分工：`GridBased.tolerance=0.76 m`、位置到达容差 `0.05 m`，对应名义 `0.81 m` 停靠范围；不要将两项都设成停靠距离。目标本身允许位于物体占据区，上层检查 Nav2 返回的实际路径终点、代价地图和距离预算，不要求接近终点具有整圈旋转空间。Ranger 等待本次 Nav2 导航 `SUCCEEDED` 和真实停稳，再核对单机 ≤0.81 m / 协同 ≤1.00 m；不再以 0.89 m 距离主动取消导航，已在距离内也须完成本次原生导航。Go2 策略不变。原版独立 `VLMNavigator` 的距离取消流程保持原实现。
+
+Ranger 路径跟踪允许同时平动和转动；平动候选的角速度上限为 0.29 rad/s，最终 `/cmd_vel` 有非零平动时要求 `abs(angular.z) < 0.3 rad/s`。原地旋转保留 0.4 rad/s 上限，扫描／恢复动作仍使用 behavior_server 的 0.25 rad/s 上限。导航层不再保留直行／旋转模式锁存或等待旧轴完全停稳的切换规则。
+加减速由 Ranger 的 DWB 候选生成器负责，候选按预测轨迹接受现有 `ObstacleFootprintCritic` 检查，位置到达容差仍为 0.05 m。预测包含 Mini V3 驱动在 `abs(v/w) < 0.47644 m` 时丢弃平动、改为原地旋转的转换，因此小半径混合指令仍可能实际原地转动。
+实际连接为 `controller_server / behavior_server → /cmd_vel_nav → ranger_command_guard → /cmd_vel → 底盘`，该 Ranger 配置不启动 `velocity_smoother`。guard 透传合法指令；平动角速度达到或超过 0.3 rad/s、1 s 无指令、0.5 s 无新鲜底盘 `/odom` 或控制器停用时发零速。显式停用后锁存到 ACTIVE；SIGINT/SIGTERM 退出前发零速。任务取消和轨迹碰撞检查继续生效。
+导航执行中若 15 s 内移动不足 0.1 m，或 DWB 无有效局部轨迹，Ranger 会先检查剩余 180° 转动范围内的矩形 footprint；允许时原地掉头一次，再重试路径跟踪。转动期间每周期复查，角度采样间隔不超过 0.01 rad，并保持每秒重新规划路径。掉头受阻、30 s 内未完成或再次跟踪失败时停止并返回导航失败；其他错误不触发盲目掉头。FollowPath 切换到 Spin 时会先发零速，但不会立即把整个导航任务判为失败。指令中断、里程计失效、heartbeat 丢失、任务期限和取消的停车机制保留。
+修改后需确认两机停稳，再正常结束并重启 Ranger R2 Nav2 以加载新控制器和 guard，核对定位后建立新任务；若尚未加载之前的深度观察修改，也需重启 Ranger agent。实际制动距离与转向效果仍需低速现场验证。
+
+单独启动硬件、Nav2、轻量RViz和R5只读诊断终端可使用：
+
+```bash
+bash /home/isee601/ws/VLM_Nav/scripts/start_ranger_stack.sh
+```
+
+入口自动加载协同环境，从本轮配置的 `robot_ranger.yaml` 读取地图路径。启动后保留各组件终端，在RViz设置真实初始位姿，再执行下面的只读检查；已有完整实例时复用，不自动开始探索。具体组件及排障步骤见 [双机协同启动与验收](docs/双机协同启动与验收.md#4-本机硬件与定位组件终端保持运行)。
 
 协作 Ranger 单机验收使用中文只读检查入口，完整诊断保存在日志文件中：
 
@@ -56,7 +83,9 @@ RGB + aligned depth + CameraInfo
 Livox → FAST_LIO → /cloud_registered_body → tf2 转到 base_link
       → PCL PassThrough → CropBox(negative) → VoxelGrid
       → /vlm_nav/obstacle_cloud
-           ├→ Nav2 global ObstacleLayer / local VoxelLayer
+           ├→ Nav2 清除射线（逐帧）
+           ├→ odom 中 XY 栅格连续 3 × 0.8 s 确认
+           │    → /vlm_nav/confirmed_obstacle_cloud → Nav2 障碍标记
            └→ /scan → SLAM Toolbox → /map
 ```
 
@@ -201,6 +230,7 @@ VLM_Nav/scripts/start_rviz.sh /path/to/custom.rviz
 
 在 RViz 中重点确认 `/map`、`/scan`、TF、全局/局部代价地图和规划路径正常，
 验证期间保持 `enabled=false`。
+默认配置及 Ranger 的“固定地图轻量验证.rviz”均默认开启 Global Costmap 和 Local Costmap，分别订阅 `/global_costmap/costmap`、`/local_costmap/costmap`，以半透明代价地图配色叠加显示；已打开的 RViz 需重新加载配置。
 
 在实体急停可用、场地封闭、人工监护并完成手动 Nav2 验证后：
 
@@ -234,7 +264,8 @@ ros2 topic echo (接口)
 - VLM 像素调试图：`/vlm_nav/debug_image`
 - 延迟、丢帧和错误计数：`/vlm_nav/diagnostics`
 - 标准 Behavior Server 代价地图：`/local_costmap/costmap_raw`
-- 规划/建图共用障碍点云：`/vlm_nav/obstacle_cloud`
+- 逐帧清除/扫描转换点云：`/vlm_nav/obstacle_cloud`
+- 确认后的障碍标记点云：`/vlm_nav/confirmed_obstacle_cloud`
 - 点云过滤诊断：`/diagnostics`（硬件 ID `obstacle_cloud_filter`）
 - Nav2 动作：`/compute_path_to_pose`、`/navigate_to_pose`、`/spin`
 

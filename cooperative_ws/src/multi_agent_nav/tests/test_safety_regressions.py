@@ -1,4 +1,5 @@
 from dataclasses import replace
+import pytest
 from test_agent import machine,command,navigate
 from test_coordinator import coord
 from multi_agent_nav.models import Health,Command,Pose2D,GoalResult,ResourceRequest
@@ -85,3 +86,25 @@ def test_executing_path_startup_waits_only_while_stopped_and_is_bounded():
     agent=started()
     agent.tick(1.1,health)
     assert agent.paused  # A planner that never publishes cannot wait forever.
+
+
+@pytest.mark.parametrize('fault,expected',[
+    ('path_timeout','execution path missing or receive timeout'),
+    ('boundary','unpermitted boundary/stopping envelope'),
+    ('permit','resource permit required: door'),
+])
+def test_path_monitor_preserves_the_actual_stop_cause(fault,expected):
+    agent=machine()
+    regions={} if fault=='path_timeout' else {'door':{'polygon':[[1,-1],[3,-1],[3,1],[1,1]]}}
+    health=Health(pose=Pose2D(.8,0) if fault=='boundary' else Pose2D(),
+        localization_valid=True,nav_ready=True,stopped=False,
+        path=[Pose2D(),Pose2D(4,0)],path_valid=fault!='path_timeout',
+        footprint=[[-.38,-.18],[.38,-.18],[.38,.18],[-.38,.18]],
+        reason='execution path missing or receive timeout' if fault=='path_timeout' else '')
+    navigate(agent,command())
+    agent.guard=RegionGuard(regions,.1)
+    agent.path_acquired=True
+    agent._monitor_region(health,2.)
+    assert agent.paused and agent.state().run_state=='STOPPING'
+    assert expected in agent.state().reason
+    assert agent.take_effects()[0].kind=='STOP'

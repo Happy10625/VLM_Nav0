@@ -22,6 +22,8 @@ def generate_launch_description():
             DeclareLaunchArgument("publish_camera_tf", default_value="true"),
             DeclareLaunchArgument("localization_mode", default_value="slam"),
             DeclareLaunchArgument("map", default_value=""),
+            DeclareLaunchArgument("keepout_mask_yaml", default_value=""),
+            DeclareLaunchArgument("keepout_mask_digest", default_value=""),
             DeclareLaunchArgument("amcl_scan_topic", default_value="/scan"),
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(
@@ -40,6 +42,9 @@ def generate_launch_description():
                 launch_arguments={
                     "localization_mode": LaunchConfiguration("localization_mode"),
                     "overrides_file": LaunchConfiguration("nav2_overrides_file"),
+                    "map": LaunchConfiguration("map"),
+                    "keepout_mask_yaml": LaunchConfiguration("keepout_mask_yaml"),
+                    "keepout_mask_digest": LaunchConfiguration("keepout_mask_digest"),
                 }.items(),
             ),
             IncludeLaunchDescription(

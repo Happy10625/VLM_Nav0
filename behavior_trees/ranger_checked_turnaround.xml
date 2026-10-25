@@ -1,0 +1,16 @@
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <PipelineSequence name="RangerNavigateWithCheckedTurnaround">
+      <RateController hz="1.0">
+        <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+      </RateController>
+      <RecoveryNode number_of_retries="1" name="FollowPathWithOneTurnaround">
+        <FollowPath path="{path}" controller_id="FollowPath" goal_checker_id="general_goal_checker"/>
+        <Sequence name="ClassifyAndTurnAround">
+          <RangerRecoveryNeeded service_name="controller_server/get_parameters" server_timeout="1000"/>
+          <Spin spin_dist="3.141592653589793" time_allowance="30.0"/>
+        </Sequence>
+      </RecoveryNode>
+    </PipelineSequence>
+  </BehaviorTree>
+</root>

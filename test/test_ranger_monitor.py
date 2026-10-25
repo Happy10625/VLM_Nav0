@@ -2,6 +2,7 @@
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace as S
 
 import pytest
 
@@ -78,6 +79,53 @@ def test_missing_and_nonfinite_velocity_never_print_fake_zero(monitor):
     assert '[--, --, --]' in text and '[+0.000, +0.000, +0.000]' not in text
     bad = {'odom': {'values': [float('nan'), 0., 0.], 'at': 100., 'stamp': 100.}}
     assert '非法速度' in monitor.render(view, bad, now=100., ros_now=100., can_delta=1)
+
+
+def test_chassis_command_direction_and_fast_reversals_survive_screen_refresh(monitor):
+    telemetry = {}
+    for at, wz in ((99., .2), (99.1, 0.), (99.2, -.2), (99.3, .01), (99.4, .2)):
+        message = S(linear=S(x=.1, y=0.), angular=S(z=wz))
+        monitor.receive_velocity(telemetry, 'cmd', message, at)
+    text = monitor.render(monitor.ExperimentView(), telemetry, now=99.5, ros_now=99.5, can_delta=1)
+    assert '/cmd_vel' in text and '[+0.100, +0.000, +0.200]' in text
+    assert '逆时针' in text and '10s换向:2' in text
+    assert len(text.splitlines()) == 9
+    monitor.receive_velocity(telemetry, 'cmd', S(linear=S(x=0., y=0.), angular=S(z=-.2)), 99.6)
+    text = monitor.render(monitor.ExperimentView(), telemetry, now=99.7, ros_now=99.7, can_delta=1)
+    assert '顺时针' in text and '10s换向:3' in text
+    text = monitor.render(monitor.ExperimentView(), telemetry, now=111., ros_now=111., can_delta=1)
+    assert '指令过期' in text and '10s换向:0' in text
+    assert '顺时针' not in text and '逆时针' not in text
+
+
+@pytest.mark.parametrize('wz,expected', [(0., '零/微小角速度'), (float('nan'), '非法速度')])
+def test_command_zero_and_invalid_values_are_not_counted_as_reversals(monitor, wz, expected):
+    telemetry = {}
+    monitor.receive_velocity(telemetry, 'cmd', S(linear=S(x=0., y=0.), angular=S(z=wz)), 100.)
+    text = monitor.render(monitor.ExperimentView(), telemetry, now=100., ros_now=100., can_delta=1)
+    assert expected in text and '10s换向:0' in text
+    assert '顺时针' not in text and '逆时针' not in text
+
+
+def test_command_history_is_bounded_and_old_samples_do_not_add_reversals(monitor):
+    telemetry = {}
+    for i in range(400):
+        monitor.receive_velocity(telemetry, 'cmd',
+            S(linear=S(x=0., y=0.), angular=S(z=.2 if i % 2 else -.2)), i / 20.)
+    assert len(telemetry['cmd_history']) <= 201
+    text = monitor.render(monitor.ExperimentView(), telemetry, now=30., ros_now=30., can_delta=1)
+    assert '10s换向:0' in text
+
+
+def test_odometry_receipt_keeps_header_stamp_and_does_not_add_command_history(monitor):
+    telemetry = {}
+    message = S(twist=S(twist=S(linear=S(x=.1, y=0.), angular=S(z=-.2))),
+                header=S(stamp=S(sec=99, nanosec=500000000)))
+    monitor.receive_velocity(telemetry, 'odom', message, 100.)
+    assert telemetry['odom']['stamp'] == 99.5
+    text = monitor.render(monitor.ExperimentView(), telemetry, now=100.1, ros_now=100.1, can_delta=1)
+    assert '实测速度[vx,vy,wz]=[+0.100, +0.000, -0.200]' in text
+    assert '速度过期' in text and '未收到底盘指令' in text
 
 
 def test_path_buffer_acceptance_and_clear_are_distinct(monitor, tmp_path):

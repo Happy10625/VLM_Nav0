@@ -9,6 +9,7 @@ if [[ "${1:-}" == --help || "${1:-}" == -h || $# == 0 ]]; then
   agent       启动本机新任务agent；有真实gates时只发布阻塞状态
   coordinator 仅Go2：启动唯一coordinator，不自动开始任务
   check       静止PAUSED传输检查12秒（两机agent与bridge须已运行）
+  wait        只读无限等待：双方各3条干净新鲜 WAITING_PEER/STANDBY；每5秒说明原因
   state/peer  显示本机/对端任务状态，Ctrl+C只结束显示
   watch       仅Go2：显示coordinator状态，Ctrl+C只结束显示
   start       仅Go2：live预检通过后显式开始一次真实任务
@@ -19,7 +20,7 @@ HELP
 fi
 side="$1" action="${2:-preflight}"
 case "$side" in ranger|go2) ;; *) echo '机器人须为 ranger 或 go2。' >&2; exit 2;; esac
-case "$action" in preflight|bridge|agent|coordinator|check|state|peer|watch|start|pause) ;; *) echo '未知 ACTION；使用 --help。' >&2; exit 2;; esac
+case "$action" in preflight|bridge|agent|coordinator|check|wait|state|peer|watch|start|pause) ;; *) echo '未知 ACTION；使用 --help。' >&2; exit 2;; esac
 (( $# <= 2 )) || { echo '不接受额外参数；配置通过环境文件指定。' >&2; exit 2; }
 case "$action" in coordinator|start|pause|watch)
   [[ "$side" == go2 ]] || { echo '该命令仅在Go2控制电脑执行。' >&2; exit 2; };;
@@ -46,7 +47,7 @@ bridge=validate_bridge(yaml.safe_load(Path(os.environ['COOP_BRIDGE_YAML']).read_
 cfg=load_config(directory)
 if cfg['scene'].get('share_c_coordinates') is not False:raise ValueError('本流程要求share_c_coordinates=false')
 installed={}
-for name in ('agent','coordinator','models','planner','runner','generated_candidates'):
+for name in ('agent','agent_node','coordinator','models','planner','runner','go2_exploration','generated_candidates','config','coordinator_node','mock','semantic_search'):
     module=importlib.import_module('multi_agent_nav.'+name);path=Path(module.__file__)
     source=repo/'cooperative_ws/src/multi_agent_nav/multi_agent_nav'/f'{name}.py'
     installed[name]={'file':str(path),'matches_source':path.read_bytes()==source.read_bytes()}
@@ -65,7 +66,17 @@ for label,action,kind in [('action','SYNC_LOCAL_C','WAIT'),('kind','SYNC','SYNC_
     sync[label]=validate_command(Command(task_id='offline',recipient_id=side,action=action,kind=kind,common_frame_id='',alignment_id='',simulation=False),context).accepted
 if side=='ranger' and not sync['action']:raise ValueError('Ranger尚未支持远端action=SYNC_LOCAL_C；先同步接收兼容补丁')
 schemas={name:hashlib.sha256(json.dumps(getattr(msg,name).get_fields_and_field_types(),sort_keys=True).encode()).hexdigest() for name in ('AgentState','Observation','Command')}
+from vlm_nav.keepout import configured_mask
+from ament_index_python.packages import get_package_share_directory
+import vlm_nav.keepout as keepout_module
+keepout_source=repo/'vlm_nav/keepout.py'
+if Path(keepout_module.__file__).read_bytes()!=keepout_source.read_bytes():raise ValueError('Keepout安装与源码不一致')
+if side=='ranger':
+    for name in ('navigation.launch.py','system.launch.py','ranger_local.launch.py'):
+        installed_launch=Path(get_package_share_directory('vlm_nav'))/'launch'/name
+        if installed_launch.read_bytes()!=(repo/'launch'/name).read_bytes():raise ValueError('Nav2启动文件安装与源码不一致：'+name)
 robot=cfg['robot_'+side];geometry=GeneratedCandidates(cfg,side)
+mask=configured_mask(robot)
 key=os.getenv(robot.get('api_key_env','DASHSCOPE_API_KEY')) or os.getenv('OPENAI_API_KEY')
 endpoint=robot.get('endpoint') or os.getenv('DASHSCOPE_BASE_URL') or os.getenv('DASHSCOPE_WORKSPACE_ID') or os.getenv('OPENAI_BASE_URL')
 model=robot.get('model') or os.getenv('DASHSCOPE_MODEL') or os.getenv('OPENAI_MODEL')
@@ -74,6 +85,7 @@ gates=live_gates(cfg,local_robot=side)
 print(json.dumps(dict(side=side,config_dir=str(directory),bridge=bridge,interfaces=interfaces,installed=installed,
     schema_sha256=schemas,sync_encodings=sync,targets=cfg['scene']['targets'],scenario_id=cfg['scene']['scenario_id'],
     map_identity=cfg['alignment']['robots'],candidate_count=len(geometry.points),api_environment_complete=api_ready,
+    keepout_mask_yaml=str(mask.path) if mask is not None else None,keepout_mask_digest=mask.digest if mask is not None else None,
     live_gates=gates,motion_sent=False),ensure_ascii=False,indent=2))
 if sys.argv[1]=='live' and (gates or not api_ready):sys.exit(1)
 PY
@@ -106,6 +118,7 @@ case "$action" in
     exec ros2 run multi_agent_nav "$executable" --ros-args -r "__node:=$node_name" \
       -p simulation:=false -p topic_prefix:=/multi_agent -p "config_dir:=$COOP_CONFIG" "${params[@]}";;
   check) exec python3 "$repo/scripts/check_multi_agent_comm.py" --side "$side" check --config-dir "$COOP_CONFIG";;
+  wait) exec python3 "$repo/scripts/wait_cooperative_ready.py" --side "$side" --config-dir "$COOP_CONFIG";;
   state) exec ros2 topic echo "/multi_agent/$side/state" multi_agent_task_msgs/msg/AgentState;;
   peer)
     peer=go2;[[ "$side" == go2 ]] && peer=ranger

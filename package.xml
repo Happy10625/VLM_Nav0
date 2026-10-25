@@ -19,20 +19,28 @@
   <depend>sensor_msgs</depend>
   <depend>tf2</depend>
   <depend>tf2_ros</depend>
+  <depend>dwb_core</depend>
+  <depend>dwb_plugins</depend>
+  <depend>pluginlib</depend>
+  <depend>action_msgs</depend>
+  <depend>nav2_controller</depend>
+  <depend>nav2_behaviors</depend>
+  <depend>nav2_behavior_tree</depend>
+  <depend>rcl_interfaces</depend>
 
   <build_depend>libpcl-all-dev</build_depend>
   <exec_depend>libpcl-common</exec_depend>
   <exec_depend>libpcl-filters</exec_depend>
 
   <exec_depend>rclpy</exec_depend>
-  <exec_depend>rcl_interfaces</exec_depend>
-  <exec_depend>action_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>nav2_msgs</exec_depend>
   <exec_depend>nav2_bringup</exec_depend>
   <exec_depend>nav2_amcl</exec_depend>
   <exec_depend>nav2_map_server</exec_depend>
   <exec_depend>nav2_lifecycle_manager</exec_depend>
+  <exec_depend>lifecycle_msgs</exec_depend>
+  <exec_depend>dwb_critics</exec_depend>
   <exec_depend>nav_msgs</exec_depend>
   <exec_depend>rviz2</exec_depend>
   <exec_depend>sensor_msgs_py</exec_depend>
@@ -44,10 +52,12 @@
   <exec_depend>pointcloud_to_laserscan</exec_depend>
   <exec_depend>slam_toolbox</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-pil</exec_depend>
   <exec_depend>python3-opencv</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
 
   <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>dwb_critics</test_depend>
   <test_depend>ament_cmake_pytest</test_depend>
   <test_depend>python3-pytest</test_depend>
   <export>

@@ -46,7 +46,6 @@ scan_angles:
 - 5.497787143782138
 - 6.283185307179586
 scan_timeout: 240.0
-standoff_distance: 0.81
 arrival_config_files:
 - /home/isee601/ws/VLM_Nav/config/robot.yaml
 model: null

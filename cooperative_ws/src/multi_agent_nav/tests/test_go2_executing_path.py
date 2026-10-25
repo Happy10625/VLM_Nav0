@@ -2,6 +2,7 @@
 from collections import deque
 from concurrent.futures import Future
 from types import SimpleNamespace as S
+import logging
 
 import pytest
 from geometry_msgs.msg import PoseStamped
@@ -25,6 +26,7 @@ def navigation(monkeypatch, request):
     a.config = dict(path_receive_timeout=5., path_source_verified=False, footprint=[[0., 0.]],
                    odom_max_age=.5, stationary_duration=.5)
     a.node = S(get_clock=lambda: S(now=lambda: S(nanoseconds=round(now[0]*1e9))),
+               get_logger=lambda: logging.getLogger('executing_path_test'),
                navigator=S(send_goal_async=send,server_is_ready=lambda:False),
                path_planner=S(server_is_ready=lambda:False),spinner=S(server_is_ready=lambda:False),
                external_gate_receipts={},p=S(external_gate_timeout=2.),
@@ -143,6 +145,21 @@ def test_pending_path_keeps_original_receipt_time(navigation, accepted_at, valid
         assert a.path_at == 10.1
         now[0] = 15.101
         assert not a.get_health().path_valid
+
+
+def test_execution_path_timeout_logs_receipt_age_once(navigation,caplog):
+    a,now,requests=navigation
+    a.config['path_topic']='/plan'
+    begin(navigation)
+    a.on_path_update(path(10.1))
+    assert a.get_health().path_valid
+    now[0]=16.1
+    assert not a.get_health().path_valid
+    assert not a.get_health().path_valid
+    messages=[r.getMessage() for r in caplog.records if 'Execution path receive timeout' in r.getMessage()]
+    assert len(messages)==1
+    assert 'topic=/plan' in messages[0] and 'receive_age_s=6.000' in messages[0]
+    assert 'timeout_s=5.0' in messages[0]
 
 
 def test_newest_valid_pending_plan_replaces_previous_candidate(navigation):

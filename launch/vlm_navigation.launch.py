@@ -47,7 +47,7 @@ def generate_launch_description():
                 arguments=[
 		    "--x", "-0.16",
 		    "--y", "0.0",
-		    "--z", "1.185",
+		    "--z", "1.595",
 		    "--roll", "0.0",
 		    "--pitch", "0.45204034",  # 俯角 25.90°
 		    "--yaw", "0.0",

@@ -5,23 +5,36 @@ import json
 import os
 from pathlib import Path
 import time
-import uuid
 
 import cv2
 import numpy as np
 from vlm_nav.arm_image_recorder import ArmImageRecorder
 
 
+def reserve_record_directory(root):
+    day=Path(root)/time.strftime('%Y-%m-%d')
+    day.mkdir(parents=True,exist_ok=True)
+    number=max((int(p.name) for p in day.iterdir() if p.name.isdecimal()),default=0)+1
+    while True:
+        directory=day/f'{number:06d}'
+        try:directory.mkdir()
+        except FileExistsError:number+=1
+        else:return directory
+
+
 class ScanEvidence:
     def __init__(self,root,metadata,*,directory=None):
-        self.directory=Path(directory) if directory else Path(root)/f'{uuid.uuid4().hex}_view_{metadata["view_index"]:02d}'
+        self.root=root
+        self.directory=Path(directory) if directory else None
         self.data=dict(metadata,api_returned=False,validation_success=False)
         self.write_failed=False
         self.input_jpeg=None
         self.started=time.monotonic()
 
     def begin(self,existing=False):
-        try:self.directory.mkdir(parents=True,exist_ok=existing)
+        try:
+            if self.directory is None:self.directory=reserve_record_directory(self.root)
+            else:self.directory.mkdir(parents=True,exist_ok=existing)
         except OSError:
             self.write_failed=True
             raise OSError('VLM evidence directory creation failed') from None
