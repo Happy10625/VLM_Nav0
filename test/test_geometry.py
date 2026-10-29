@@ -37,18 +37,17 @@ def test_depth_rejection_reports_actionable_reason():
     assert reason.startswith("pixel_out_of_bounds:")
 
 
-def test_depth_averages_six_samples_closest_to_median_without_deviation_cutoff():
+def test_depth_rejects_mixed_neighborhood_like_106_baseline():
     depth = np.array([[0.2, 1.0, 2.0, 2.1, 2.2, 2.4, 2.6, 5.8]])
 
     value, reason = depth_at_pixel_with_reason(depth, 4, 0, max_depth=6.0)
 
-    # Median is 2.15; exclude 0.2 and 5.8, then average the remaining six.
-    assert reason == "ok"
-    assert math.isclose(value, 2.05)
-    assert math.isclose(depth_at_pixel(depth, 4, 0, max_depth=6.0), 2.05)
+    assert reason == "mixed_depth_samples:3/8,median_m=2.150,max_deviation_m=0.200"
+    assert value is None
+    assert depth_at_pixel(depth, 4, 0, max_depth=6.0) is None
 
 
-def test_depth_still_requires_eight_valid_samples_before_averaging_six():
+def test_depth_requires_eight_valid_samples():
     depth = np.array([[1., 2., 2., 2., 2., 3., 4., 0., np.nan, np.inf, 0.1]])
 
     value, reason = depth_at_pixel_with_reason(depth, 5, 0)
@@ -57,11 +56,11 @@ def test_depth_still_requires_eight_valid_samples_before_averaging_six():
     assert reason == "insufficient_valid_depth_samples:7/8"
 
 
-def test_depth_cannot_average_six_samples_when_minimum_is_configured_lower():
+def test_depth_honors_configured_minimum_like_106_baseline():
     value, reason = depth_at_pixel_with_reason(np.ones((1, 5)), 2, 0, min_samples=1)
 
-    assert value is None
-    assert reason == "insufficient_valid_depth_samples:5/6"
+    assert value == 1.
+    assert reason == "ok"
 
 
 def test_depth_rejection_distinguishes_target_beyond_reliable_range():

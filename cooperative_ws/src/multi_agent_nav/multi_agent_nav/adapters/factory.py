@@ -15,8 +15,12 @@ def create_runtime(robot_id,config,*,read_only=False,global_goal_checks=False,no
         robot_config['scan_angles']=[-(i+1)*math.pi/4 for i in range(8)]
     observer=make_observer(robot_config,read_only=read_only,node_name=node_name)
     try:
-        return observer,Adapter(observer,robot_config,frame,read_only=read_only,
+        adapter=Adapter(observer,robot_config,frame,read_only=read_only,
             global_goal_checks=global_goal_checks)
+        if robot_id=='ranger' and not read_only:
+            from ..ranger_visualization import RangerVisualization
+            adapter.visualization=RangerVisualization(observer,frame)
+        return observer,adapter
     except BaseException:
         observer.destroy_node()
         raise

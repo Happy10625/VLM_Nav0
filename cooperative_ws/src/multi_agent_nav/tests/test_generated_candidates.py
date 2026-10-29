@@ -256,18 +256,22 @@ def test_candidate_api_sends_only_two_images_ids_and_history(monkeypatch,tmp_pat
     for path in images:path.write_bytes(b'png')
     captured=[]
     def completion(self,messages,max_tokens):
+        assert max_tokens==128
         captured.extend(messages)
         return S(choices=[S(message=S(content='{"candidate_id":"P1","reason":"side"}'))])
     monkeypatch.setattr(OpenAICompatibleVLMClient,'_completion',completion)
     reply=client.choose_candidate(dict(images=list(map(str,images)),task_id='task',decision_id='decision',furniture_annotated=annotated,
+        observed_exclusion_radius=3.,
         main_target='target',candidates=[dict(display_id='P1',id='internal',pose=[1.,2.,3.])],
         furniture=[dict(id='table',polygon=[[1.,2.],[3.,4.]])],history=[],records={'internal':{'pose':[1,2,3]}}))
     assert reply['candidate_id']=='P1'
+    assert 'reason' in captured[0]['content'] and '不超过20字' in captured[0]['content']
     assert len([c for c in captured[1]['content'] if c['type']=='image_url'])==2
     text=captured[1]['content'][0]['text']
     assert 'internal' not in text and 'pose' not in text and 'polygon' not in text
     assert json.loads(text)['allowed_candidate_ids']==['P1']
     assert json.loads(text)['furniture_annotated'] is annotated
+    assert 'within 3 m' in json.loads(text)['legend']
 
 
 @pytest.mark.parametrize('raw',[
@@ -279,6 +283,13 @@ def test_candidate_api_sends_only_two_images_ids_and_history(monkeypatch,tmp_pat
 def test_candidate_parser_rejects_extra_fields_duplicate_and_foreign_id(raw):
     from multi_agent_nav.generated_candidates import parse_candidate_selection
     with pytest.raises(ValueError):parse_candidate_selection(raw,['P1','P2'])
+
+
+@pytest.mark.parametrize('length',[20,21,200])
+def test_candidate_long_reason_keeps_valid_selection(length):
+    from multi_agent_nav.generated_candidates import parse_candidate_selection
+    reply=parse_candidate_selection(json.dumps(dict(candidate_id='P1',reason='近'*length)),['P1'])
+    assert reply==dict(candidate_id='P1',reason='近'*20)
 
 
 @pytest.mark.parametrize('cost',[253,254,255])

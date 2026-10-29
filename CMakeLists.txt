@@ -143,8 +143,15 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_ranger_monitor test/test_ranger_monitor.py)
   ament_add_pytest_test(test_latest_frame_worker test/test_latest_frame_worker.py)
   ament_add_pytest_test(test_navigation_gate test/test_navigation_gate.py)
+  ament_add_pytest_test(test_ranger_single_robot_parity test/test_ranger_single_robot_parity.py
+    APPEND_ENV "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/cooperative_ws/src/multi_agent_nav")
+  ament_add_pytest_test(test_ranger_approach_transport test/test_ranger_approach_transport.py
+    APPEND_ENV "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/cooperative_ws/src/multi_agent_nav")
   ament_add_pytest_test(test_pipeline test/test_pipeline.py)
+  ament_add_pytest_test(test_nav_ready_checkpoint test/test_nav_ready_checkpoint.py
+    APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/cooperative_ws/src/multi_agent_nav:${CMAKE_CURRENT_SOURCE_DIR}/cooperative_ws/src/multi_agent_nav/tests)
   ament_add_pytest_test(test_vlm_client test/test_vlm_client.py)
+  ament_add_pytest_test(test_api_response_probe test/test_api_response_probe.py)
   ament_add_pytest_test(test_obstacle_chain_config test/test_obstacle_chain_config.py)
   ament_add_pytest_test(test_obstacle_cloud_filter_runtime test/test_obstacle_cloud_filter_runtime.py TIMEOUT 20)
 endif()

@@ -97,6 +97,56 @@ def test_costmap_coordinates_include_tf_and_rotated_grid_origin():
         translation=S(x=20,y=0),rotation=S(x=0,y=0,z=0,w=1)))
     assert not a.costmap_candidate_free(Pose2D())
 
+@pytest.mark.parametrize('global_goal',[False,True])
+@pytest.mark.parametrize('fault',['exact','past','future','missing','disconnected','fallback_missing'])
+def test_ranger_costmap_uses_latest_tf_only_after_extrapolation(global_goal,fault):
+    from tf2_ros import ExtrapolationException,LookupException,ConnectivityException
+    from multi_agent_nav.adapters.ranger import RangerAdapter
+    a=adapter();a.__class__=RangerAdapter;a.config['robot_id']='ranger'
+    a.on_costmap(costmap(),global_goal=global_goal)
+    calls=[]
+    def lookup(target,source,when):
+        calls.append((target,source,when.nanoseconds))
+        if fault=='missing' or fault=='fallback_missing' and when.nanoseconds==0:
+            raise LookupException('missing frame')
+        if fault=='disconnected':raise ConnectivityException('disconnected frames')
+        if fault in ('past','future','fallback_missing') and when.nanoseconds:
+            raise ExtrapolationException(fault)
+        return S(transform=S(translation=S(x=1.,y=2.),rotation=S(x=0.,y=0.,z=0.,w=1.)))
+    a.node.tf_buffer.lookup_transform=lookup
+    result=a.costmap_transform(global_goal=global_goal)
+    assert calls[0]==('odom','map',10_000_000_000)
+    fallback=fault in ('past','future','fallback_missing')
+    assert calls[1:]==([('odom','map',0)] if fallback else [])
+    if fault in ('exact','past','future'):
+        assert result==Pose2D(1.,2.,0.)
+        details=a.last_costmap_checks['global' if global_goal else 'local']
+        assert details['tf_time_source']==('latest_on_extrapolation' if fallback else 'message_stamp')
+    else:assert result is None
+
+
+@pytest.mark.parametrize('fault',['stamp','receipt'])
+@pytest.mark.parametrize('global_goal',[False,True])
+def test_ranger_stale_costmap_never_uses_latest_tf(fault,global_goal):
+    a=adapter();a.config['robot_id']='ranger'
+    grid=costmap();a.on_costmap(grid,global_goal=global_goal)
+    if fault=='stamp':grid.header.stamp=stamp(8.)
+    elif global_goal:a.global_costmap_at-=2.
+    else:a.costmap_at-=2.
+    a.node.tf_buffer.lookup_transform=lambda *args:pytest.fail('stale costmap queried TF')
+    assert a.costmap_transform(global_goal=global_goal) is None
+
+
+def test_go2_costmap_keeps_timestamped_tf_requirement():
+    from tf2_ros import ExtrapolationException
+    a=adapter();a.config['robot_id']='go2';a.on_costmap(costmap());calls=[]
+    def lookup(target,source,when):
+        calls.append(when.nanoseconds)
+        raise ExtrapolationException('future')
+    a.node.tf_buffer.lookup_transform=lookup
+    assert a.costmap_transform() is None
+    assert calls==[10_000_000_000]
+
 def test_actual_footprint_is_not_snapped_to_grid_cell_center():
     a=adapter();m=costmap();m.data[40*80+44]=254
     a.on_costmap(m)
@@ -294,6 +344,7 @@ def test_full_gates_only_read_the_current_pcs_map_files():
     ('inspect',[],True,'',0),('inspect',[],True,'rgbd_blink',0),
     ('inspect',[],True,'rgbd_late',0),('inspect',[],True,'arm_stale',0),
     ('inspect',[],True,'odom_stale',0),('navigate',[],True,'',0),
+    ('inspect',[],True,'odom_missing',0),('inspect',[],True,'odom_late',0),
     ('navigate',['multi_agent_coordinator'],True,'',1),('navigate',['multi_agent_task_agent'],True,'',1),
     ('navigate',[],False,'',1),('navigate',[],True,'permit',1),
     ('navigate',[],True,'moving',1),('navigate',[],True,'terminal',1),
@@ -352,9 +403,11 @@ def test_independent_entry_runtime_with_one_stub_go2_no_ros_or_peer(monkeypatch,
             if change=='path_finished' and not self.active:self.path=[]
         def get_health(self):
             h=replace(super().get_health(),motion_terminal=terminal)
+            odom_missing=change=='odom_missing' or (change=='odom_late' and now[0]<1.)
             self.last_health_details=dict(checks=dict(depth_units_verified=True,
+                odom_fresh=not odom_missing and change!='odom_stale',
                 control_armed_gate=change!='arm_stale',external_gates_fresh=change!='arm_stale'),
-                odom_age_s=10. if change=='odom_stale' else .05,odom_max_age_s=.5)
+                odom_age_s=None if odom_missing else 10. if change=='odom_stale' else .05,odom_max_age_s=.5)
             h.nav_ready=h.nav_ready and node.vlm_input_ready(now[0])
             if self.planned and change=='permit':h.nav_ready=False
             if self.planned and change=='moving':h.stopped=False
@@ -405,7 +458,14 @@ def test_independent_entry_runtime_with_one_stub_go2_no_ros_or_peer(monkeypatch,
     if action=='inspect':
         assert report['costmap_probe']['footprint_free'] is True
         assert report['health_window']['samples']>10
-        assert report['health_window']['non_motion_inputs_stable']==(change not in ('rgbd_blink','rgbd_late','odom_stale'))
+        assert report['health_window']['non_motion_inputs_stable']==(change not in ('rgbd_blink','rgbd_late','odom_stale','odom_missing'))
+        if change in ('odom_missing','odom_late'):
+            window=report['health_window']
+            assert window['failure_counts']['odom_fresh']>0
+            assert 'odom_fresh' in window['transitions'][0]['failed_gates']
+            assert window['transitions'][0]['health_details']['odom_age_s'] is None
+            assert ('odom_fresh' in window['transitions'][-1]['failed_gates'])==(change=='odom_missing')
+            assert not report['motion_sent'] and 'navigate' not in calls
         if change=='rgbd_blink':assert report['health_window']['post_input_ready_failure_counts']['rgbd_ready']>0
         if change=='rgbd_late':assert report['health_window']['post_input_ready_observed_s']<2.
         if change=='arm_stale':assert report['health_window']['failure_counts']['external_gates_fresh']>0

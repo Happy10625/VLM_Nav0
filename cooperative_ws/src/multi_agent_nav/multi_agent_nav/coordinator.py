@@ -23,6 +23,7 @@ class Coordinator:
         self.lost_timeout = scene.get('lost_timeout', 3.0)
         self.task_timeout = scene.get('task_timeout', 600.0)
         self.private = scene.get('share_c_coordinates',True) is False
+        self.nav_pause_phase = None
 
     def _identity(self, data):
         return data.robot_id in ROBOTS and data.schema_version == SCHEMA_VERSION and (
@@ -89,6 +90,7 @@ class Coordinator:
         self.task_received_at.clear()
         self.task_id = uuid.uuid4().hex
         self.phase, self.started, self.reason = 'SYNCING' if self.private else 'SEARCH_AB', now, ''
+        self.nav_pause_phase=None
         self.observations, self.commands, self.reservations, self.rejected = {}, {}, {}, set()
         self.planner = RulePlanner()
         self.sequence = {r:0 for r in ROBOTS}
@@ -103,14 +105,48 @@ class Coordinator:
                        common_frame_id='' if self.private else 'lab_ref',
                        alignment_id='' if self.private else self.alignment_id, simulation=self.simulation, **kwargs)
 
-    def pause(self, reason):
-        if self.phase=='PAUSED':return [self.control(r,'PAUSE') for r in ROBOTS] if self.task_id else []
+    def pause(self, reason, *, nav_ready=False):
+        if self.phase=='PAUSED':
+            if self.nav_pause_phase and not nav_ready:
+                self.nav_pause_phase=None
+                self.reason=reason
+            return self._pause_commands() if self.task_id else []
+        self.nav_pause_phase=self.phase if self.private and nav_ready else None
         self.phase, self.reason = 'PAUSED', reason
         if self.resources:
             for robot in ROBOTS:
                 self.resources.freeze(robot, reason)
                 if robot in self.commands:self.resources.cancel_queued(robot,self.commands[robot].command_id)
-        return [self.control(r, 'PAUSE') for r in ROBOTS] if self.task_id else []
+        return self._pause_commands() if self.task_id else []
+
+    def _pause_commands(self):
+        return [self.control(r,'PAUSE',kind='NAV_READY_WAIT' if self.nav_pause_phase else 'WAIT') for r in ROBOTS]
+
+    def _nav_recovery(self, now):
+        waiting=[]
+        for robot in ROBOTS:
+            state=self.states.get(robot)
+            if not state or now-self.received_at[robot]>self.lost_timeout:
+                waiting.append(robot)
+                continue
+            if (state.task_id!=self.task_id or not state.localization_valid
+                    or state.run_state in ('STOPPING','PAUSED') and not is_recoverable_pause(state.reason)):
+                return self.pause(f'{robot}: fault during nav_ready recovery')
+        if now-self.started>self.task_timeout:return self.pause('task timeout')
+        if waiting:
+            self.phase='PAUSED'
+            self.reason='waiting heartbeat: '+', '.join(waiting)
+        elif not all(s.nav_ready for s in self.states.values()):
+            self.phase='PAUSED'
+            self.reason='; '.join(robot+': health invalid: nav_ready'+
+                (NAV_READY_DETAIL+state.reason.partition(NAV_READY_DETAIL)[2] if NAV_READY_DETAIL in state.reason else '')
+                for robot,state in self.states.items() if not state.nav_ready)
+        elif self.phase=='PAUSED' and all(s.stopped and s.run_state=='PAUSED' for s in self.states.values()):
+            self.phase,self.reason=self.nav_pause_phase,''
+        elif self.phase!='PAUSED' and all(s.run_state not in ('STOPPING','PAUSED') for s in self.states.values()):
+            self.nav_pause_phase=None
+        output=[self.control(r,'SYNC',ack_sequence=self.acked[r]) for r in ROBOTS]
+        return output+self._pause_commands() if self.phase=='PAUSED' else output
 
     def _complete_commands(self):
         for robot, command in list(self.commands.items()):
@@ -135,6 +171,7 @@ class Coordinator:
     def tick(self, now):
         if not self.task_id:
             return []
+        if self.nav_pause_phase:return self._nav_recovery(now)
         if self.phase not in ('PAUSED','DONE','FAILED') and now-self.started>self.task_timeout:
             return self.pause('task timeout')
         if self.phase=='SYNCING':
@@ -150,17 +187,20 @@ class Coordinator:
             for robot in ROBOTS:
                 state = self.states.get(robot)
                 if not state or now-self.received_at[robot]>self.lost_timeout:
-                    self.pause(f'{robot}: heartbeat timeout')
+                    self.pause(f'{robot}: heartbeat timeout',nav_ready=True)
                 elif not ((self.private or state.pose_valid) and state.localization_valid and state.nav_ready):
-                    self.pause(f'{robot}: health invalid: '+', '.join(name for name in ('localization_valid','nav_ready') if not getattr(state,name)))
+                    detail=state.reason.partition(NAV_READY_DETAIL)[2] if not state.nav_ready else ''
+                    self.pause(f'{robot}: health invalid: '+', '.join(name for name in ('localization_valid','nav_ready') if not getattr(state,name))
+                        +(NAV_READY_DETAIL+detail if detail else ''),
+                        nav_ready=state.localization_valid and not state.nav_ready)
                 elif state.run_state in ('STOPPING','PAUSED'):
-                    self.pause(f'{robot}: agent paused: '+state.reason)
+                    self.pause(f'{robot}: agent paused: '+state.reason,nav_ready=is_recoverable_pause(state.reason))
                 if self.phase=='PAUSED':break
             if now-self.started > self.task_timeout:
                 self.pause('task timeout')
         output = [self.control(r, 'SYNC', ack_sequence=self.acked[r]) for r in ROBOTS]
         if self.phase == 'PAUSED':
-            return output + [self.control(r, 'PAUSE') for r in ROBOTS]
+            return output + self._pause_commands()
         if self.phase in ('DONE','FAILED'):
             return output
         if any(self.states[r].task_id != self.task_id for r in ROBOTS):

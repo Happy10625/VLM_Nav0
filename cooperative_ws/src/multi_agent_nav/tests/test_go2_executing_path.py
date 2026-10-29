@@ -214,7 +214,7 @@ def test_canceling_navigation_immediately_invalidates_path(navigation):
 
 def test_spin_cannot_make_an_execution_path_valid(navigation):
     a, now, requests = navigation
-    a._motion(a.node.navigator, object(), 'task', 'scan', 'SCAN_SPIN')
+    a._motion(a.node.navigator, S(target_yaw=.5), 'task', 'scan', 'SCAN_SPIN')
     accept(requests[-1])
     a.on_path_update(path())
     assert not a.path and not a.get_health().path_valid

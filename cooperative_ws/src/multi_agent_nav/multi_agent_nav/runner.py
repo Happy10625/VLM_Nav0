@@ -3,7 +3,7 @@ from dataclasses import replace
 from pathlib import Path
 import math
 import tempfile
-from .models import Effect, Observation, TARGETS, Pose2D
+from .models import Effect, Observation, TARGETS, Pose2D, is_recoverable_pause, RecoverablePause
 
 def other_motion_owners(names,robot_id):
     allowed={'multi_agent_task_agent',f'multi_agent_{robot_id}_agent'}
@@ -26,8 +26,10 @@ class AgentRunner:
         if not math.isfinite(success_radius) or success_radius<=0:raise ValueError('positive success radius required')
         self.local_steps=None
         self.local_identity=None
+        self.local_completion=None
         self.now=0.
         self.adapter.motion_guard=self.motion_guard
+        self.adapter.local_pause_enabled=machine.private
         if machine.private:
             root=Path(config['robot_'+machine.context.robot_id].get('experiment_records_root',tempfile.gettempdir()))
             self.adapter.selection_evidence_dir=root/'cooperative'/machine.context.robot_id/'selections'
@@ -35,18 +37,29 @@ class AgentRunner:
 
     def motion_guard(self):
         machine=self.machine;health=self.adapter.get_health()
-        if machine.paused or not machine.command or not health.localization_valid or not health.nav_ready:
+        if machine.paused or not machine.command or not health.localization_valid or not health.pose.valid:
             raise RuntimeError('motion identity/health invalid')
+        if self.local_steps is not None and (self.local_identity!=(machine.command.task_id,machine.command.command_id)
+                or self.local_identity[0]!=machine.context.task_id):
+            raise RuntimeError('local motion identity changed')
         if self.owners():raise RuntimeError('another local motion owner is active')
-        if machine.sync_received is None or machine.peer_received is None or any(
-                self.now-received>machine.lost_timeout for received in (machine.sync_received,machine.peer_received)):
-            raise RuntimeError('motion heartbeat expired')
+        if not health.nav_ready:
+            raise RecoverablePause('local health invalid: nav_ready'+
+                (' | nav_ready: '+health.nav_ready_reason if health.nav_ready_reason else ''))
+        for kind,received in (('coordinator',machine.sync_received),('peer',machine.peer_received)):
+            if received is None or self.now-received>machine.lost_timeout:
+                raise RecoverablePause(kind+' heartbeat timeout')
 
     def _record_local(self,event):
         machine=self.machine
-        if event['state']=='NAVIGATING':
+        if event['state']=='APPROACH_PLANNING' and machine.context.robot_id=='ranger':
+            machine._state.goal_id=''
+            machine._state.run_state='LOCAL_EXECUTING'
+        elif event['state']=='APPROACH_NAVIGATE':
+            machine._state.goal_id=event['goal_id']
+        elif event['state']=='NAVIGATING':
             machine.navigation_started(event['goal_id'],event['goal_kind'],self.now)
-        elif event['state'] in ('ARRIVED','NAV_FAILED','TARGET_APPROACHED','SCANNING'):
+        elif event['state'] in ('ARRIVED','NAV_FAILED','TARGET_APPROACHED','SCANNING','APPROACH_STOPPING','SENSOR_WAITING'):
             machine._state.goal_id=''
             machine._state.run_state='LOCAL_EXECUTING'
         record=getattr(self.adapter,'record_event',None)
@@ -69,13 +82,14 @@ class AgentRunner:
             machine.task_started_at+machine.task_timeout,self.descriptions[command.target_id],
             self._record_local,self.owners,None,self.motion_guard,clock=lambda:self.now,
             robot_id=machine.context.robot_id,target_id=command.target_id,
-            success_radius=self.success_radius,require_navigation_success=True,
+            success_radius=None if hasattr(self.adapter,'begin_local_execution') else self.success_radius,require_navigation_success=True,
             scan_at_start=machine.context.robot_id=='ranger' and command.sequence==1,
             task_id=command.task_id,command_id=command.command_id,on_observation=self._local_observation,
             initial_observation=machine.local_observations.get(command.observation_id) if command.kind=='APPROACH_DEPOSIT' else None)
 
     def _advance_local(self):
         machine=self.machine;command=machine.command
+        if machine.local_suspended:return
         if machine.paused or not command or self.local_identity!=(command.task_id,command.command_id):
             self.local_steps.close();self.local_steps=None
             return
@@ -84,18 +98,41 @@ class AgentRunner:
             next(self.local_steps)
         except StopIteration as completed:
             self.local_steps=None
-            health=self.adapter.get_health()
-            if not health.stopped or not health.motion_terminal:machine.stop('local completion stop unconfirmed');return
-            if completed.value=='TARGET_APPROACHED' and command.kind in ('APPROACH_PICKUP','APPROACH_DEPOSIT'):
-                if command.kind=='APPROACH_PICKUP':machine._state.ready=True
-                else:machine._state.deposited=True
-            elif completed.value!='TARGET_FOUND' or command.kind!='SEARCH_VIEWPOINT':
-                machine.fail('local execution: '+str(completed.value));return
-            machine._state.reply,machine._state.run_state='SUCCEEDED','IDLE'
-            machine._state.goal_id=''
+            self.local_completion=(self.local_identity,completed.value)
         except Exception as error:
             self.local_steps.close();self.local_steps=None
-            machine.stop('local execution: '+str(error))
+            machine.stop(str(error) if machine.private and isinstance(error,RecoverablePause)
+                         else 'local execution: '+str(error))
+
+    def _complete_local(self):
+        machine=self.machine;command=machine.command
+        identity,outcome=self.local_completion
+        if machine.paused or not command or identity!=(command.task_id,command.command_id) or identity[0]!=machine.context.task_id:
+            self.local_completion=None
+            return
+        health=self.adapter.get_health()
+        if self.owners():
+            machine.stop('another local motion owner is active')
+            return
+        if outcome=='TARGET_APPROACHED' and hasattr(self.adapter,'approach_steps'):
+            approach=getattr(self.adapter,'completed_approach',None)
+            if (approach is None or approach.state!='SUCCEEDED' or
+                    (approach.task_id,approach.command_id)!=identity):
+                machine.fail('local approach success evidence missing')
+                self.local_completion=None
+                return
+            distance=approach.target_reference_distance((health.pose.x,health.pose.y,health.pose.yaw))
+            if not (health.nav_ready and health.localization_valid and health.stopped and health.motion_terminal
+                    and distance<=approach.p.target_success_radius):return
+        elif not (health.nav_ready and health.localization_valid and health.stopped and health.motion_terminal):return
+        self.local_completion=None
+        if outcome=='TARGET_APPROACHED' and command.kind in ('APPROACH_PICKUP','APPROACH_DEPOSIT'):
+            if command.kind=='APPROACH_PICKUP':machine._state.ready=True
+            else:machine._state.deposited=True
+        elif outcome!='TARGET_FOUND' or command.kind!='SEARCH_VIEWPOINT':
+            machine.fail('local execution: '+str(outcome));return
+        machine._state.reply,machine._state.run_state='SUCCEEDED','IDLE'
+        machine._state.goal_id=''
 
     def tick(self,now):
         self.now=now
@@ -103,7 +140,8 @@ class AgentRunner:
             if hasattr(self.adapter,'advance'):self.adapter.advance(now)
             if hasattr(self.adapter,'tick'):self.adapter.tick()
         except Exception as error:
-            self.machine.stop('adapter tick failed: '+str(error))
+            self.machine.stop(str(error) if self.machine.private and isinstance(error,RecoverablePause)
+                              else 'adapter tick failed: '+str(error))
             self.dispatch(self.machine.take_effects(),now)
         if self.local_steps and self.machine._state.run_state=='NAVIGATING' and any(
                 (result.task_id,result.command_id,result.goal_id,result.goal_kind)==(
@@ -136,20 +174,38 @@ class AgentRunner:
         if self.local_steps:
             self._advance_local()
             self.dispatch(self.machine.take_effects(),now)
+        if self.local_completion is not None:
+            self._complete_local()
+            self.dispatch(self.machine.take_effects(),now)
 
     def dispatch(self,effects,now):
         for effect in effects:
             command=self.machine.command
             if effect.kind=='STOP':
+                self.local_completion=None
+                goal_id,reason=effect.payload
+                if (self.machine.private and is_recoverable_pause(reason) and self.local_steps
+                        and getattr(self.adapter,'approach',None) is None
+                        and hasattr(self.adapter,'pause_local_execution')):
+                    if not self.machine.local_suspended:
+                        self.machine.local_suspended=True
+                        self.adapter.pause_local_execution(reason)
+                    continue
+                self.machine.local_suspended=False
                 if self.local_steps:self.local_steps.close();self.local_steps=None
                 for future,*_ in self.pending:future.cancel()
                 self.pending.clear()
-                goal_id,reason=effect.payload
                 if goal_id:self.adapter.cancel_navigation(goal_id)
                 self.adapter.stop_motion(reason)
             elif effect.kind=='OBSERVATION':self.on_observation(effect.payload)
             elif command and not self.machine.paused:
                 try:
+                    if effect.kind=='LOCAL_RESUME':
+                        self.machine.navigation_started_at=now
+                        self.machine.path_acquired=False
+                        self.adapter.resume_local_execution()
+                        self.machine.local_suspended=False
+                        continue
                     if effect.kind=='LOCAL_EXECUTE':self._start_local();continue
                     if effect.kind=='APPROACH':future=self.adapter.select_approach(*effect.payload);goal=None
                     elif effect.kind in ('PLAN','PLAN_TRANSIT'):
@@ -163,6 +219,7 @@ class AgentRunner:
                         continue
                     else:continue
                     self.pending.append((future,(command.task_id,command.command_id),effect.kind,goal))
-                except Exception:
-                    self.machine.stop(f'{effect.kind.lower()} adapter failure')
+                except Exception as error:
+                    self.machine.stop(str(error) if self.machine.private and isinstance(error,RecoverablePause)
+                                      else f'{effect.kind.lower()} adapter failure')
                     self.dispatch(self.machine.take_effects(),now)

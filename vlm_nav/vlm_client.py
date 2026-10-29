@@ -174,7 +174,7 @@ def validate_frontier_decision(payload: Any, valid_ids: Iterable[int]) -> Fronti
     # The reason is diagnostic text, not a motion-safety field. Providers can
     # exceed a requested character limit by a few characters, so keep the
     # valid frontier decision and truncate the display/log text locally.
-    return FrontierDecision(selected, confidence, reason.strip()[:199])
+    return FrontierDecision(selected, confidence, reason.strip()[:20])
 
 
 def build_grounding_prompt(
@@ -262,8 +262,8 @@ def build_frontier_prompt(target: str, candidates) -> str:
         )
     lines.append(
         "Return exactly one JSON object with selected_frontier_id (integer), confidence "
-        "(0.0 to 1.0), and reason. reason must be one short sentence strictly under "
-        "200 characters; do not repeat all candidate statistics."
+        "(0.0 to 1.0), and reason. Use compact JSON. reason is diagnostic only: "
+        "at most 20 characters, preferably Chinese; do not repeat candidate statistics."
     )
     return "\n".join(lines)
 
@@ -426,7 +426,7 @@ class OpenAICompatibleVLMClient:
                 ],
             },
         ]
-        response = self._completion(messages, 220)
+        response = self._completion(messages, 128)
         content = response.choices[0].message.content
         if not content:
             raise ValueError("VLM returned empty frontier content")

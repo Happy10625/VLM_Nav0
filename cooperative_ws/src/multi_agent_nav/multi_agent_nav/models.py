@@ -7,6 +7,21 @@ TARGETS = ('A', 'B', 'C')
 PHASES = ('IDLE', 'SYNCING', 'SEARCH_AB', 'SEARCH_C', 'DEPOSIT', 'DONE', 'PAUSED', 'FAILED')
 KINDS = ('SEARCH_VIEWPOINT', 'APPROACH_PICKUP', 'WAIT', 'APPROACH_DEPOSIT', 'EXIT')
 
+RECOVERABLE_PAUSES = ('local health invalid: nav_ready', 'peer health invalid: nav_ready',
+    'peer paused for nav_ready', 'coordinator nav_ready pause',
+    'peer heartbeat timeout', 'coordinator heartbeat timeout',
+    'peer paused for recovery', 'coordinator recoverable pause',
+    'local navigation not ready', 'peer navigation not ready',
+    'coordinator SYNC heartbeat lost', 'peer heartbeat lost for current task')
+NAV_READY_DETAIL = ' | nav_ready: '
+
+def is_recoverable_pause(reason):
+    return reason.partition(NAV_READY_DETAIL)[0] in RECOVERABLE_PAUSES
+
+class RecoverablePause(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class Pose2D:
     x: float = 0.0
@@ -148,6 +163,7 @@ class Health:
     footprint: list = field(default_factory=list)
     motion_terminal: bool = True
     reason: str = ''
+    nav_ready_reason: str = ''
 
 @dataclass
 class PathResult:

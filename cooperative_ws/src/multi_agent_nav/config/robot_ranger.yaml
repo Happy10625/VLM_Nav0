@@ -22,7 +22,7 @@ path_topic: /plan
 path_source_verified: false
 path_start_timeout: 1.0
 path_receive_timeout: 5.0
-pose_max_age: 1.0
+pose_max_age: 1.5
 costmap_topic: /local_costmap/costmap_raw
 goal_costmap_topic: /global_costmap/costmap_raw
 costmap_source_verified: false
@@ -33,7 +33,7 @@ stop_margin: 0.20
 stationary_linear_speed: 0.03
 stationary_angular_speed: 0.05
 stationary_duration: 0.5
-odom_max_age: 0.5
+odom_max_age: 0.75
 odom_topic: /odom
 cancel_timeout: 5.0
 scan_angles:

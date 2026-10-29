@@ -106,6 +106,7 @@ def parse_selection(raw, candidates):
             or payload['furniture_id'] not in candidates
             or not isinstance(payload['reason'], str)):
         raise ValueError('invalid furniture selection or unknown furniture ID')
+    payload['reason']=payload['reason'].strip()[:20]
     return payload
 
 

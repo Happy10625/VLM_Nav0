@@ -67,7 +67,7 @@ def test_ranger_approach_entry_uses_object_reference_and_validates_actual_path(f
         return
     assert requested==[Pose2D(5.,2.,.4)] and not result.done()
     pending.set_result(PathResult(fault!='unreachable',[] if fault=='empty' else [Pose2D(),endpoint]))
-    assert result.result().goal==(Pose2D(5.,2.,.4) if fault=='none' else None)
+    assert result.result().goal==(Pose2D(5.,2.,.4) if fault in ('none','blocked') else None)
 
 
 def test_ranger_accepts_recorded_three_second_reply_and_allows_evidence_finalization(monkeypatch):

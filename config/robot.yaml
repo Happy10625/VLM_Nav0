@@ -85,7 +85,7 @@ vlm_nav:
     # Direct target grounding is trusted up to this range. Farther readings
     # trigger a Nav2-validated intermediate approach along the VLM direction.
     max_depth: 6.0
-    # Legacy compatibility only; depth now averages the six samples nearest the median.
+    # Reject mixed neighborhoods before taking the near-median depth.
     max_depth_deviation: 0.20
     # Sparse or mixed target depth triggers a small pixel-directed rotation
     # and a fresh stationary VLM/RGB-D observation.

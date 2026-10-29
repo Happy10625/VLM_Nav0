@@ -263,75 +263,8 @@ def test_unreliable_depth_keeps_scan_pending_and_rotates_until_located(reason):
     assert len([e for e in events if e.get('event')=='SCAN_TARGET_DETECTED'])==1
 
 
-@pytest.mark.parametrize('initial',[False,True])
-@pytest.mark.parametrize('located_on',[1,2,3,None])
-@pytest.mark.parametrize('reason',[
-    'insufficient_valid_depth_samples:0/8',
-    'mixed_depth_samples:3/8,median_m=2.000,max_deviation_m=0.200',
-    'depth_out_of_range:median_m=7.000,limit_m=6.000',
-])
-def test_ranger_retries_unreliable_depth_on_three_fresh_stationary_frames(initial,located_on,reason):
-    import time
-    from vlm_nav.models import VLMResult, Pixel
-    result=VLMResult(True,.95,Pixel(2,2),None,True,True,True)
-    results={'B':('DETECTED',result)}
-    a,scan,events=scan_adapter(None,results)
-    a.config.update(robot_id='ranger',api_timeout=2.)
-    scan.update(targets={'B':'灭火器'},stop_on_target='B',current_view_only=initial)
-    a._motion=lambda *args:pytest.fail('depth retries must not rotate')
-    frames=[]
-    def infer(rgb,targets):
-        frames.append(int(rgb[0,0,0]));return results
-    def submit(work):
-        future=Future();future.set_result(work());return future
-    a.client=S(infer_abc=infer);a.vision.submit=submit
-    a.node.vlm_input_ready=lambda now:True
-    checked=[]
-    def project(snapshot,*args):
-        checked.append(snapshot.stamp.sec)
-        return ((2.,3.,1.),'ok') if snapshot.stamp.sec==located_on else (None,reason)
-    a.node.ground_pixel_with_reason=project
-    for attempt in range(1,(located_on or 3)+1):
-        a.tick()
-        if attempt==(located_on or 3):break
-        assert not scan['reply'].done() and scan['phase']=='FRAME' and scan['index']==0
-        a.node.latest_snapshot=S(captured_monotonic=scan['after']-1)
-        a.tick();assert scan['phase']=='FRAME'  # Never count the same/old frame twice.
-        a.node.latest_snapshot=S(captured_monotonic=time.monotonic()+1,
-            stamp=S(sec=attempt+1,nanosec=0),rgb=np.full((5,5,3),attempt+1,dtype=np.uint8))
-        health=a.get_health
-        a.get_health=lambda:S(**dict(vars(health()),stopped=False))
-        a.tick();assert scan['phase']=='FRAME'
-        a.get_health=health
-        a.tick();assert scan['phase']=='INFER'
-    assert checked==list(range(1,(located_on or 3)+1))
-    assert frames==list(range(2,(located_on or 3)+1))
-    assert len(scan['observations'])==1
-    assert scan['observations'][0].navigable is (located_on is not None)
-    assert scan['reply'].done() is (initial or located_on is not None)
-    if not initial and located_on is None:
-        assert scan['phase']=='SPIN' and scan['index']==1
-    assert len([e for e in events if e.get('event')=='VLM_VIEW_RESULT'])==(located_on or 3)
-
-
-@pytest.mark.parametrize('interruption',['cancel','health','timeout'])
-def test_ranger_depth_retry_can_be_interrupted_before_next_frame(interruption):
-    from vlm_nav.models import VLMResult, Pixel
-    results={'B':('DETECTED',VLMResult(True,.95,Pixel(2,2),None,True,True,True))}
-    a,scan,_=scan_adapter(None,results)
-    a.config['robot_id']='ranger'
-    scan.update(targets={'B':'灭火器'},stop_on_target='B',current_view_only=True)
-    a.node.ground_pixel_with_reason=lambda *args:(None,'insufficient_valid_depth_samples:0/8')
-    a._motion=lambda *args:pytest.fail('interrupted retry must not rotate')
-    a.tick()
-    assert not scan['reply'].done() and scan['phase']=='FRAME'
-    if interruption=='cancel':a.stop_motion('task canceled')
-    elif interruption=='health':a.motion_fault=True
-    else:scan['deadline']=0.
-    a.tick()
-    assert a.scan is None and scan['reply'].done()
-    if interruption=='timeout':assert isinstance(scan['reply'].exception(),TimeoutError)
-    else:assert scan['reply'].cancelled()
+# Ranger depth rotation/probe, fresh-frame confirmation and interruption contracts
+# are exercised through RangerSingleRobotExecution in test/test_ranger_single_robot_parity.py.
 
 
 @pytest.mark.parametrize('initial',[False,True])

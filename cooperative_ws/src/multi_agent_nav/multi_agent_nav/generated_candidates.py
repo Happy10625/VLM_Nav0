@@ -43,6 +43,7 @@ def circle_free(raw, x, y, radius, resolution, blocked):
 class GeneratedCandidates:
     def __init__(self,config,robot_id='go2'):
         self.robot_id=robot_id
+        self.observed_radius=3. if robot_id=='ranger' else 0.
         robot=config['robot_'+robot_id];options=robot['generated_candidates']
         distance=options['observation_distance']
         if not valid_numbers([distance],1) or distance<=0:
@@ -142,6 +143,16 @@ class GeneratedCandidates:
         if self.semantic_path is not None:
             self.digests[self.semantic_path]=hashlib.sha256(semantic_bytes).hexdigest() if semantic_bytes is not None else None
 
+    def observed_points(self,records):
+        return [p for p in self.points if records.get(p['id'],{}).get('status')=='observed']
+
+    def uncovered_points(self,records):
+        if not self.observed_radius:return self.points
+        observed=self.observed_points(records)
+        return [p for p in self.points if not any(
+            math.hypot(p['pose'][0]-q['pose'][0],p['pose'][1]-q['pose'][1])<=self.observed_radius
+            for q in observed)]
+
     def unchanged(self):
         for path,digest in self.digests.items():
             try:actual=hashlib.sha256(path.read_bytes()).hexdigest()
@@ -184,13 +195,20 @@ def render_selection(catalog,candidates,records,robot_pose,directory):
         reserved.append(box)
     overlay=Image.new('RGBA',bases[0].size,(0,0,0,0));draw=ImageDraw.Draw(overlay)
     blue,orange,gray=(30,100,230),(240,140,20),(125,125,125)
+    observed=catalog.observed_points(records)
+    if catalog.observed_radius:
+        coverage=Image.new('RGBA',(width,height),(0,0,0,0));areas=ImageDraw.Draw(coverage)
+        radius=catalog.observed_radius/catalog.source['resolution']*scale
+        for point in observed:
+            x,y=catalog.pixel(*point['pose'][:2])
+            areas.ellipse((x-radius,y-radius,x+radius,y+radius),fill=(*gray,35),outline=(*gray,160),width=2)
+        overlay.paste(coverage,(0,0))
     rx,ry=catalog.pixel(robot_pose.x,robot_pose.y)
     if not (0<=rx<width and 0<=ry<height):raise ValueError('robot outside map image')
     robot_label=getattr(catalog,'robot_id','go2').capitalize()
     marks=[(rx,ry,robot_label,blue)]
     marks.extend((*catalog.pixel(*p['pose'][:2]),p['display_id'],orange) for p in candidates)
-    marks.extend((*catalog.pixel(*p['pose'][:2]),'observed',gray) for p in catalog.points
-                 if records.get(p['id'],{}).get('status')=='observed')
+    marks.extend((*catalog.pixel(*p['pose'][:2]),'observed',gray) for p in observed)
     footer_index=0
     for x,y,label,color in marks:
         reserved.append((x-8,y-8,x+8,y+8))
@@ -233,8 +251,10 @@ def render_selection(catalog,candidates,records,robot_pose,directory):
     for sign in (-1,1):
         angle=yaw+sign*.5
         draw.line((ax,ay,ax-8*math.cos(angle),ay+8*math.sin(angle)),fill=blue,width=3)
+    observed_legend=(f'Gray disks: observed / excluded within {catalog.observed_radius:g} m'
+                     if catalog.observed_radius else 'Gray: observed / cannot select')
     for offset,label,color in ((65,robot_label+': blue circle and heading',blue),(45,'P IDs: orange / selectable',orange),
-                               (25,'Gray: observed / cannot select',gray)):
+                               (25,observed_legend,gray)):
         draw.text((10,height+footer-offset),label,fill=color,font=font)
     directory=Path(directory);directory.mkdir(parents=True,exist_ok=True)
     paths=[]
@@ -258,6 +278,7 @@ def parse_candidate_selection(raw,allowed):
             or not isinstance(reply['candidate_id'],str) or reply['candidate_id'] not in allowed
             or not isinstance(reply['reason'],str)):
         raise ValueError('invalid or unavailable candidate ID')
+    reply['reason']=reply['reason'].strip()[:20]
     return reply
 
 

@@ -73,7 +73,8 @@ def test_private_factory_applies_clockwise_scan_to_actual_adapter_without_changi
     from multi_agent_nav.adapters.factory import create_runtime
     config=load_config();config['scene']['share_c_coordinates']=False
     module=import_module('multi_agent_nav.adapters.'+robot_id)
-    monkeypatch.setattr(module,'make_observer',lambda *args,**kwargs:S(create_subscription=lambda *a:None,destroy_node=lambda:None))
+    monkeypatch.setattr(module,'make_observer',lambda *args,**kwargs:S(create_subscription=lambda *a:None,
+        create_publisher=lambda *a:S(publish=lambda message:None),destroy_node=lambda:None))
     original=list(config['robot_'+robot_id]['scan_angles'])
     _,adapter=create_runtime(robot_id,config,global_goal_checks=True)
     try:

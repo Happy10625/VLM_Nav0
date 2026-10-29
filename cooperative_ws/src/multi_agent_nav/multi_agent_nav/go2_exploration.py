@@ -4,7 +4,7 @@ import math
 import time
 import uuid
 from .config import valid_numbers, go2_local_gates, robot_local_gates, file_signature
-from .models import Pose2D
+from .models import Pose2D, RecoverablePause
 from .region_guard import RegionGuard
 from vlm_nav.arrival import target_distance, stop_radius, arrival_decision, load_contract
 from .semantic_search import FixedViewpoints, SemanticFurniture, SelectionState, load_catalog
@@ -76,16 +76,37 @@ def explore_steps(adapter, config, frame, deadline, target, record, owners,
             stop, before_motion, clock=time.monotonic, *, robot_id='go2', target_id='A',
             success_radius=None, require_navigation_success=False, task_id=None, command_id=None,
             on_observation=None, initial_observation=None, scan_at_start=False):
+    local=robot_id=='ranger' and hasattr(adapter,'begin_local_execution')
+    task_id=task_id or robot_id+'_explore/'+uuid.uuid4().hex
+    if local:
+        command_id=command_id or uuid.uuid4().hex
+        adapter.begin_local_execution(task_id,command_id,target_id,target)
+    try:
+        return (yield from _explore_steps(adapter,config,frame,deadline,target,record,owners,
+            stop,before_motion,clock,robot_id=robot_id,target_id=target_id,
+            success_radius=success_radius,require_navigation_success=require_navigation_success,
+            task_id=task_id,command_id=command_id,on_observation=on_observation,
+            initial_observation=initial_observation,scan_at_start=scan_at_start or local and not require_navigation_success))
+    finally:
+        if local:adapter.node.end_execution()
+
+
+def _explore_steps(adapter, config, frame, deadline, target, record, owners,
+            stop, before_motion, clock=time.monotonic, *, robot_id='go2', target_id='A',
+            success_radius=None, require_navigation_success=False, task_id=None, command_id=None,
+            on_observation=None, initial_observation=None, scan_at_start=False):
     if robot_id not in ('go2','ranger') or target_id not in ('A','B','C'):
         raise ValueError('unknown robot or target ID')
     original_record=record
     def record(event):
+        if getattr(adapter,'visualization',None):adapter.visualization.record(event)
         original_record(dict(event,robot_id=robot_id,target_id=target_id,
             common_frame_id=frame.ids[2],local_map_id=frame.ids[0],map_version=frame.ids[1]))
     guard = RegionGuard({} if require_navigation_success else config['scene']['resources'], config['robot_'+robot_id]['stop_margin'])
     task_id = task_id or robot_id+'_explore/' + uuid.uuid4().hex
     main_command_id = command_id
     cooperative = require_navigation_success
+    background_preparation = cooperative or robot_id=='ranger'
     yield None
     current = {}
     strategy = config['robot_'+robot_id].get('exploration_strategy', 'fixed_viewpoints')
@@ -107,7 +128,7 @@ def explore_steps(adapter, config, frame, deadline, target, record, owners,
         finally:
             if not future.done():future.cancel()
     geometry=catalog=None
-    if cooperative and semantic:
+    if background_preparation and semantic:
         prepared=yield from background(lambda:GeneratedCandidates(config,robot_id) if generated else load_catalog(config,robot_id))
         if generated:geometry=prepared
         else:catalog=prepared
@@ -120,11 +141,19 @@ def explore_steps(adapter, config, frame, deadline, target, record, owners,
     policy = GeneratedCandidatesVLM(adapter.client) if generated else SemanticFurniture(adapter.client) if semantic else FixedViewpoints(points)
     state = SelectionState(points)
     if generated:state.task_id = task_id
+    completed_points=None
+    if generated and robot_id=='ranger':
+        saved=getattr(adapter,'generated_observations',None)
+        if saved is None or saved[0]!=task_id:
+            adapter.generated_observations=(task_id,{})
+        completed_points=adapter.generated_observations[1]
+        state.records.update({pid:dict(row) for pid,row in completed_points.items() if pid in state.records})
     selection_epoch = None
     history = []
     decision_id = None
     if generated:
         record(dict(state='CANDIDATE_GEOMETRY',task_id=state.task_id,candidates=points,
+                    records=state.records.copy(),observed_radius=geometry.observed_radius,
                     rotation_radius=geometry.radius,semantic_yaml=str(geometry.semantic_path) if geometry.semantic_path else None))
 
     def catalog_unchanged():
@@ -132,20 +161,35 @@ def explore_steps(adapter, config, frame, deadline, target, record, owners,
 
     def verify_catalog():
         if not semantic:return
-        unchanged=(yield from background(catalog_unchanged)) if cooperative else catalog_unchanged()
+        unchanged=(yield from background(catalog_unchanged)) if background_preparation else catalog_unchanged()
         if not unchanged:raise ExplorationStopped('local map/candidate assets changed during task')
 
     def emit(state, **fields):
         record(dict(current, state=state, robot_id=robot_id,target_id=target_id,**fields))
 
+    execution=adapter.node if robot_id=='ranger' and hasattr(adapter,'begin_local_execution') else None
+    if execution is not None:
+        execution.execution_emit=emit
+        execution.execution_on_observation=on_observation
+        execution.execution_descriptions=dict(config['scene']['targets'],**{target_id:target}) if generated or cooperative else {target_id:target}
+
     def update(status, **details):
         state.update(current['viewpoint_id'], status, clock(), **details)
+        if completed_points is not None and status=='observed' and current['viewpoint_id']!='task_start':
+            completed_points[current['viewpoint_id']]=dict(state.records[current['viewpoint_id']])
         if generated and status in ('navigation_failed','observation_failed') and 'display_id' in current:
             history.append(dict(decision_id=decision_id,candidate_id=current['display_id'],
                 furniture_id=current['furniture_id'],result=status))
         emit('OBSERVATION_RECORD', observation_status=status, records=state.records.copy())
 
+    execution_path_token=None
+    execution_path_acquired=False
+    resume_sequence=getattr(adapter,'navigation_resume_sequence',0)
+    resume_started=0.
+    resume_path_acquired=False
     def health_check(path=None, navigating=False, began=0., acquired=False):
+        nonlocal execution_path_token,execution_path_acquired
+        nonlocal resume_sequence,resume_started,resume_path_acquired
         health = adapter.get_health()
         if assets_signature is not None and file_signature(asset_paths)!=assets_signature:
             raise ExplorationStopped('local map/candidate assets changed during task')
@@ -160,9 +204,31 @@ def explore_steps(adapter, config, frame, deadline, target, record, owners,
                 if not ok and key not in failed:failed.append(key)
             emit('HEALTH_FAILED',failed_gates=failed,health=asdict(health),health_details=details,
                  costmap_checks=getattr(adapter,'last_costmap_checks',{}),other_goal_owners=other)
+            if cooperative and not other and health.localization_valid and health.pose.valid:
+                raise RecoverablePause('local health invalid: nav_ready'+
+                    (' | nav_ready: '+health.nav_ready_reason if health.nav_ready_reason else ''))
             raise ExplorationStopped('motion owner/localization/Nav2/costmap health lost: '+', '.join(failed))
-        if navigating:
+        if execution is not None and execution.goal_pose is not None and execution.state not in ('APPROACH_STOPPING','SENSOR_WAITING'):
+            navigating=True
+            began=execution.goal_started
+            if execution.goal_token!=execution_path_token:
+                execution_path_token=execution.goal_token
+                execution_path_acquired=False
+            acquired=execution_path_acquired
+        if execution is not None and execution.state in ('APPROACH_STOPPING','SENSOR_WAITING'):
+            navigating=False
+        if getattr(adapter,'approach',None) is not None:
+            checked = replace(health, path_valid=True)
+            checked_path = [health.pose]
+        elif navigating:
+            if resume_sequence!=getattr(adapter,'navigation_resume_sequence',0):
+                resume_sequence=adapter.navigation_resume_sequence
+                resume_started=clock();resume_path_acquired=False
+            if began<resume_started:
+                began=resume_started;acquired=resume_path_acquired
             acquired = acquired or bool(health.path_valid and health.path)
+            if began==resume_started:resume_path_acquired=acquired
+            if execution is not None and execution.goal_pose is not None:execution_path_acquired=acquired
             waiting = not acquired and health.stopped and clock()-began < config['robot_'+robot_id].get('path_start_timeout', 1.)
             checked = replace(health, path_valid=True) if waiting else health
             checked_path = [health.pose] if waiting else health.path
@@ -175,7 +241,14 @@ def explore_steps(adapter, config, frame, deadline, target, record, owners,
         return health, acquired
 
     def stopped():
-        result = stop() if stop else adapter.stop_motion('exploration stop')
+        if execution is not None:
+            while execution.execution_recovering:
+                health_check()
+                if execution.state in ('FAILED','API_ERROR'):raise ExplorationStopped(execution.last_failure_reason)
+                yield None
+            result=adapter.hold_motion('exploration stop')
+        else:
+            result = stop() if stop else adapter.stop_motion('exploration stop')
         expires=min(deadline,clock()+config['robot_'+robot_id].get('cancel_timeout',5.))
         while hasattr(result,'done') and not result.done():
             health_check()
@@ -187,7 +260,7 @@ def explore_steps(adapter, config, frame, deadline, target, record, owners,
         while True:
             health,_=health_check()
             if health.stopped and health.motion_terminal:return
-            if not cooperative or clock()>=expires:
+            if (not cooperative and execution is None) or clock()>=expires:
                 raise ExplorationStopped('stop prerequisites changed')
             yield None
 
@@ -220,6 +293,12 @@ def explore_steps(adapter, config, frame, deadline, target, record, owners,
         emit('NAVIGATING', task_id=task_id, command_id=main_command_id or command_id, goal_id=goal_id, goal_kind=kind)
         began = clock(); acquired = False; terminal = None
         while terminal is None:
+            if execution is not None:
+                while adapter.results:
+                    reply=adapter.results.popleft()
+                    if (reply.task_id,reply.command_id,reply.goal_id,reply.goal_kind)==(task_id,main_command_id or command_id,goal_id,kind):
+                        terminal=reply.status
+                if terminal is not None:break
             health, acquired = health_check(navigating=True, began=began, acquired=acquired)
             if not cooperative and robot_id!='ranger' and target is not None and target_distance((health.pose.x,health.pose.y), (target.x,target.y)) <= radius:
                 emit('APPROACH_DISTANCE_STOP', cancel_radius=radius)
@@ -289,6 +368,27 @@ def explore_steps(adapter, config, frame, deadline, target, record, owners,
         return (yield from navigate(goal, uuid.uuid4().hex, 'DEPOSIT_NAV' if target_id=='C' else 'PICKUP_NAV', object_pose, radius, result, epoch))
 
     def approach_target(observation):
+        nonlocal scan_at_start
+        if execution is not None:
+            object_pose=frame.to_local(observation.common_position)
+            if execution.target_reference_position is None:
+                execution.set_confirmed_target_reference_position((object_pose.x,object_pose.y,0.))
+            target=execution.target_reference_position
+            emit('APPROACH_PLANNING',object_pose=asdict(Pose2D(target[0],target[1])),
+                observation_id=observation.observation_id)
+            steps=adapter.approach_steps(Pose2D(target[0],target[1]),task_id,main_command_id,
+                'DEPOSIT_NAV' if target_id=='C' else 'PICKUP_NAV',record,clock,check_motion=health_check)
+            try:
+                while True:
+                    before_motion()
+                    health_check()
+                    try:next(steps)
+                    except StopIteration as completed:
+                        if completed.value=='RESUME_SEARCH':scan_at_start=True
+                        return completed.value
+                    yield None
+            finally:
+                steps.close()
         contract = (dict(target_success_radius=success_radius,approach_cancel_radius=success_radius,arrival_retry_limit=1)
             if cooperative else load_contract(config['robot_'+robot_id].get('arrival_config_files')))
         success = contract['target_success_radius'] if success_radius is None else success_radius
@@ -366,7 +466,8 @@ def explore_steps(adapter, config, frame, deadline, target, record, owners,
         yield from verify_catalog()
         candidates = []
         health, _ = health_check()
-        ordered=sorted(points,key=lambda p:(math.hypot(p['pose'][0]-health.pose.x,p['pose'][1]-health.pose.y),p['id'])) if generated else points
+        available=geometry.uncovered_points(state.records) if generated else points
+        ordered=sorted(available,key=lambda p:(math.hypot(p['pose'][0]-health.pose.x,p['pose'][1]-health.pose.y),p['id'])) if generated else points
         for candidate in ordered:
             if candidate['id'] not in state.eligible(clock()):
                 continue
@@ -412,14 +513,15 @@ def explore_steps(adapter, config, frame, deadline, target, record, owners,
         if getattr(adapter,'selection_evidence_dir',None) is not None:
             from .scan_evidence import reserve_record_directory
             allocate=lambda:reserve_record_directory(adapter.selection_evidence_dir)
-            directory=(yield from background(allocate)) if cooperative else allocate()
+            directory=(yield from background(allocate)) if background_preparation else allocate()
             snapshot['evidence_directory']=str(directory)
         if generated:
+            snapshot['observed_exclusion_radius']=geometry.observed_radius
             for index,candidate in enumerate(candidates,1):candidate['display_id']=f'P{index}'
             health, _ = health_check()
             def render():
                 return render_selection(geometry,candidates,snapshot['records'],health.pose,snapshot['evidence_directory'])
-            images=(yield from background(render)) if cooperative else render()
+            images=(yield from background(render)) if background_preparation else render()
             health_check()
             snapshot.update(furniture_annotated=bool(geometry.furniture),history=history[-12:],images=images)
         else:
@@ -461,9 +563,22 @@ def explore_steps(adapter, config, frame, deadline, target, record, owners,
 
     path_accept=None
     if initial_observation is not None:
-        return (yield from approach_target(initial_observation))
+        if getattr(adapter,'visualization',None):adapter.visualization.observe([initial_observation])
+        outcome=yield from approach_target(initial_observation)
+        if outcome!='RESUME_SEARCH':return outcome
 
     while True:
+        if execution is not None:
+            while execution.execution_recovering:
+                health_check()
+                if execution.state in ('FAILED','API_ERROR'):raise ExplorationStopped(execution.last_failure_reason)
+                yield None
+            if execution.target_reference_position is not None:
+                from .models import Observation
+                p=execution.target_reference_position
+                outcome=yield from approach_target(Observation(target_id=target_id,status='DETECTED',
+                    position_valid=True,common_position=frame.to_common(Pose2D(float(p[0]),float(p[1])))))
+                if outcome!='RESUME_SEARCH':return outcome
         initial_point=scan_at_start
         scan_at_start=False
         if initial_point:
@@ -553,12 +668,14 @@ def explore_steps(adapter, config, frame, deadline, target, record, owners,
                 for observation in scan_results:on_observation(observation)
             observations = [o for o in scan_results if o.target_id == target_id]
         except Exception:
-            if not semantic:raise
+            if not semantic or execution is not None and execution.state in ('FAILED','API_ERROR'):raise
             (yield from stopped())
             update('observation_failed', reason='scan failed')
             continue
-        (yield from stopped())
-        view_count=1 if initial_point else len(config['robot_'+robot_id]['scan_angles'])
+        if execution is None or execution.target_reference_position is None:
+            yield from stopped()
+        view_count=(len(execution.scan_headings) if execution is not None and execution.scan_headings else
+            1 if initial_point else len(config['robot_'+robot_id]['scan_angles']))
         incomplete_abc = generated and (len(scan_results)!=len(descriptions)*view_count
                 or {(o.target_id,o.view_index) for o in scan_results} !=
                    {(t,i) for t in descriptions for i in range(view_count)}
@@ -594,11 +711,14 @@ def explore_steps(adapter, config, frame, deadline, target, record, owners,
             outcome = 'TARGET_FOUND' if any(o.navigable for o in detections) else 'TARGET_DETECTED_UNLOCATED'
             emit(outcome)
             if outcome == 'TARGET_FOUND' and config['robot_'+robot_id].get('approach_on_detection', False):
-                return (yield from approach_target(max((o for o in detections if o.navigable), key=lambda o:o.confidence)))
+                outcome=yield from approach_target(max((o for o in detections if o.navigable), key=lambda o:o.confidence))
+                if outcome=='RESUME_SEARCH':continue
             return outcome
         emit('NOT_DETECTED' if all(o.status == 'NOT_DETECTED' for o in observations) else 'UNCERTAIN')
     if semantic and (any(row['status'] != 'observed' for row in state.records.values()) or generated and not points):
-        emit('WAITING_VIEWPOINTS', records=state.records, reason='候选暂不可达或观察失败；不代表目标不存在')
+        reason=('本任务候选已覆盖、暂不可达或观察失败；不代表目标不存在' if generated and robot_id=='ranger'
+                else '候选暂不可达或观察失败；不代表目标不存在')
+        emit('WAITING_VIEWPOINTS', records=state.records, reason=reason)
         return 'WAITING_VIEWPOINTS'
     emit('EXHAUSTED', reason='当前视角已检查完；目标是否存在未知')
     return 'EXHAUSTED'

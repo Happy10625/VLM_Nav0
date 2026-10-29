@@ -37,7 +37,8 @@ class Nav2Adapter:
         self.scan=None
         self.client=None
         # Ranger's worker also encodes images and saves evidence around the HTTP request.
-        self.vision=AsyncVision(config['api_timeout']+(5. if config.get('robot_id')=='ranger' else 0.))
+        self.vision=AsyncVision(config['api_timeout']+(5. if config.get('robot_id')=='ranger' else 0.),
+            max_workers=2 if config.get('robot_id')=='ranger' else 1)
         self.node.create_subscription(Odometry,config.get('odom_topic','/odometry'),self.on_odometry,qos_profile_sensor_data)
         self.node.create_subscription(Costmap,config.get('costmap_topic','/local_costmap/costmap_raw'),
             self.on_costmap,QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL))
@@ -59,6 +60,8 @@ class Nav2Adapter:
         now=time.monotonic()
         stamp=message.header.stamp.sec+message.header.stamp.nanosec*1e-9
         ros_now=self.node.get_clock().now().nanoseconds*1e-9
+        self.last_odom_update=dict(header_age_s=abs(ros_now-stamp),received_monotonic=now,
+            reason='header_stale' if abs(ros_now-stamp)>self.config['odom_max_age'] else 'accepted')
         if abs(ros_now-stamp)>self.config['odom_max_age']:
             self.stationary_since=None
             self.odom_at=0.0
@@ -101,8 +104,9 @@ class Nav2Adapter:
             self.costmap_at=time.monotonic()
 
     def costmap_transform(self,global_goal=False):
-        """Map pose → costmap frame, at the payload stamp; no odom-as-map shortcut."""
+        """Map pose → costmap frame; Ranger retries extrapolation with latest TF."""
         from rclpy.time import Time
+        from tf2_ros import ExtrapolationException
         from vlm_nav.vlm_navigator import quaternion_yaw
         message=self.global_costmap if global_goal else self.costmap
         received=self.global_costmap_at if global_goal else self.costmap_at
@@ -123,7 +127,13 @@ class Nav2Adapter:
         try:
             if message.header.frame_id=='map':pose=Pose2D()
             else:
-                tf=self.node.tf_buffer.lookup_transform(message.header.frame_id,'map',Time.from_msg(message.header.stamp)).transform
+                details['tf_time_source']='message_stamp'
+                try:
+                    tf=self.node.tf_buffer.lookup_transform(message.header.frame_id,'map',Time.from_msg(message.header.stamp)).transform
+                except ExtrapolationException:
+                    if self.config.get('robot_id')!='ranger':raise
+                    details['tf_time_source']='latest_on_extrapolation'
+                    tf=self.node.tf_buffer.lookup_transform(message.header.frame_id,'map',Time()).transform
                 pose=Pose2D(tf.translation.x,tf.translation.y,quaternion_yaw(tf.rotation))
             details.update(available=pose.valid,reason='ok' if pose.valid else 'invalid_tf')
             return pose if pose.valid else None
@@ -203,7 +213,12 @@ class Nav2Adapter:
         except OSError:
             # Evidence failure must not prevent cancellation or sending zero.
             self.evidence_write_failed=True
-            self.motion_fault=True
+            self._set_motion_fault('evidence_write_failed')
+
+    def _set_motion_fault(self,reason):
+        if not getattr(self,'motion_fault',False) or not getattr(self,'motion_fault_reason',''):
+            self.motion_fault_reason=reason
+        self.motion_fault=True
 
     def _clear_path(self,reason):
         self.path=[]
@@ -296,7 +311,14 @@ class Nav2Adapter:
             rgbd_frame_age_s=now-snapshot.captured_monotonic if snapshot else None,
             camera_tf_age_s=now-camera_tf_at if camera_tf_at else None,
             rgbd_sync_healthy=getattr(self.node,'rgbd_sync_status',{}).get('healthy'),
-            odom_age_s=now-self.odom_at,odom_max_age_s=self.config['odom_max_age'])
+            rgbd_wait_timeout_s=getattr(self.node.p,'rgbd_wait_timeout',None),
+            image_tf_timeout_s=getattr(self.node.p,'tf_failure_timeout',None),
+            raw_depth_mode=getattr(self.node.p,'raw_depth_mode',False),
+            camera_extrinsic_ready=getattr(self.node,'camera_extrinsic_matrix',None) is not None,
+            raw_depth_available=getattr(snapshot,'raw_depth_snapshot',None) is not None,
+            odom_age_s=now-self.odom_at if self.odom_at else None,odom_max_age_s=self.config['odom_max_age'],
+            odom_update=dict(getattr(self,'last_odom_update',{})),
+            task_map=dict(getattr(self,'task_map_health',{})),task_keepout=dict(getattr(self,'task_keepout_health',{})))
         path_valid=bool(self.path) and now-self.path_at<=self.config.get('path_receive_timeout',5.0)
         if self.path and not path_valid and not getattr(self,'path_timeout_logged',False):
             self.path_timeout_logged=True
@@ -305,7 +327,71 @@ class Nav2Adapter:
                 f'receive_age_s={now-self.path_at:.3f}; timeout_s={self.config.get("path_receive_timeout",5.0)}')
             self._motion_event('PATH_RECEIVE_TIMEOUT',receive_age_s=now-self.path_at)
         return Health(pose,valid,ready,stopped,list(self.path),path_valid,self.config['footprint'],not self.motions,
-                      'execution path missing or receive timeout' if not path_valid else '')
+                      'execution path missing or receive timeout' if not path_valid else '',self.nav_ready_reason())
+
+    def nav_ready_reason(self, ignored=('localization_valid',)):
+        details=self.last_health_details
+        config=getattr(self,'config',{})
+        params=getattr(self.node,'p',None)
+        failures={}
+        for name,ok in details['checks'].items():
+            if ok or name in ignored:continue
+            codes=['not_ready'];evidence={}
+            if name in ('navigate_server','planner_server','spin_server'):
+                action={'navigate_server':'navigate_action','planner_server':'compute_path_action','spin_server':'spin_action'}[name]
+                codes=['unavailable'];evidence={'action':getattr(params,action,None)}
+            elif name=='local_costmap':
+                evidence=dict(details.get('local_costmap',{}));codes=[evidence.get('reason','unavailable')]
+                update=evidence.pop('last_update',{})
+                if codes==['no_payload'] and update and not update.get('accepted'):
+                    codes=['rejected_'+update.get('reason','payload')]
+                    evidence['header_age_s']=update.get('header_age_s')
+                evidence.pop('available',None);evidence.pop('reason',None)
+                evidence['topic']=config.get('costmap_topic')
+            elif name=='odom_fresh':
+                codes=['receipt_stale' if details.get('odom_age_s') is not None else 'no_valid_message']
+                evidence=dict(age_s=details.get('odom_age_s'),max_age_s=details.get('odom_max_age_s'),topic=config.get('odom_topic'))
+                update=details.get('odom_update',{})
+                if update.get('reason')=='header_stale':
+                    codes=['header_stale'];evidence['header_age_s']=update.get('header_age_s')
+            elif name=='active_task_map':
+                evidence=dict(details.get('task_map',{}));codes=[]
+                if evidence.get('path_matches') is False:codes.append('path_mismatch' if evidence.get('observed_path') else 'path_unverified')
+                if evidence.get('digest_verified') is False:codes.append('digest_unverified')
+                if evidence.get('verification_age_s') is not None and evidence['verification_age_s']>evidence.get('max_age_s',math.inf):codes.append('verification_stale')
+            elif name=='active_task_keepout':
+                evidence=dict(details.get('task_keepout',{}));codes=[]
+                for item in ('mask','info'):
+                    if evidence.get(item+'_matches') is False:
+                        received=evidence.get(item+'_received')
+                        codes.append(item+('_missing' if received is False else '_mismatch' if received is True else '_unverified'))
+            elif name=='motion_fault_clear':
+                codes=[getattr(self,'motion_fault_reason','evidence_write_failed' if getattr(self,'evidence_write_failed',False) else 'latched_fault')]
+            elif name=='depth_units_verified':
+                codes=['unverified'];evidence={'report':getattr(params,'depth_units_report',None)}
+            elif name=='rgbd_ready':
+                codes=[]
+                evidence={k:details.get(k) for k in ('rgbd_frame_age_s','rgbd_wait_timeout_s','camera_tf_age_s','image_tf_timeout_s','rgbd_sync_healthy')}
+                if details.get('rgbd_frame_age_s') is None:codes.append('no_frame')
+                elif details.get('rgbd_wait_timeout_s') is not None and details['rgbd_frame_age_s']>details['rgbd_wait_timeout_s']:codes.append('frame_stale')
+                if details.get('camera_tf_age_s') is None:codes.append('image_tf_missing')
+                elif details.get('image_tf_timeout_s') is not None and details['camera_tf_age_s']>details['image_tf_timeout_s']:codes.append('image_tf_stale')
+                if details.get('raw_depth_mode'):
+                    for field,code in (('rgbd_sync_healthy','sync_unhealthy'),('camera_extrinsic_ready','extrinsic_missing'),('raw_depth_available','raw_depth_missing')):
+                        if not details.get(field):codes.append(code)
+            elif name=='external_gates_fresh':
+                ages=details.get('external_gate_ages_s',{})
+                codes=['stale' if ages else 'no_messages']
+                evidence=dict({key+'_age_s':v for key,v in ages.items()},max_age_s=details.get('external_gate_timeout_s'))
+            elif name in ('nav_ready_gate','control_armed_gate','platform_motion_permission'):
+                codes=['false']
+                evidence={'topic':getattr(params,{'nav_ready_gate':'nav_ready_topic','control_armed_gate':'control_armed_topic',
+                    'platform_motion_permission':'motion_permission_topic'}[name],None)}
+            for code in codes or ['not_ready']:failures[name+'.'+code]={k:v for k,v in evidence.items() if v is not None}
+        details['nav_ready_failures']=failures
+        def value(v):return f'{v:.3f}' if isinstance(v,float) else str(v)
+        return '; '.join(code+'('+', '.join(k+'='+value(v) for k,v in evidence.items())+')' if evidence else code
+            for code,evidence in failures.items())
 
     def compute_path(self,local_goal):
         from nav2_msgs.action import ComputePathToPose
@@ -416,23 +502,42 @@ class Nav2Adapter:
         attempt()
         return output
 
-    def _motion(self,client,goal,task_id,command_id,kind,target=None):
+    def _motion(self,client,goal,task_id,command_id,kind,target=None,*,on_accept=None,on_result=None,_resume=None):
         if getattr(self,'read_only',False):raise RuntimeError('read-only adapter cannot send motion goals')
         if getattr(self,'motion_guard',None):self.motion_guard()
-        goal_id=uuid.uuid4().hex
-        motion={'handle':None,'cancel':False,'reply':Future(),'task':task_id,'command':command_id,'kind':kind,'since':time.monotonic(),
+        goal_id,reply=_resume if _resume is not None else (uuid.uuid4().hex,Future())
+        motion={'handle':None,'cancel':False,'reply':reply,'task':task_id,'command':command_id,'kind':kind,'since':time.monotonic(),
                 'native_uuid':'','target':target}
+        yaw_target=self.get_health().pose.yaw+goal.target_yaw if kind=='SCAN_SPIN' else None
+        def restart():
+            if yaw_target is not None:goal.target_yaw=normalize_angle(yaw_target-self.get_health().pose.yaw)
+            else:goal.pose.header.stamp=self.node.get_clock().now().to_msg()
+            if kind!='SCAN_SPIN':
+                self._clear_path('navigation resumed')
+                self.path_after_stamp=self.node.get_clock().now().nanoseconds*1e-9
+                self.navigation_resume_sequence=getattr(self,'navigation_resume_sequence',0)+1
+            self._motion(client,goal,task_id,command_id,kind,target,on_accept=on_accept,on_result=on_result,
+                _resume=(goal_id,reply))
+        motion['restart']=restart
         self.motions[goal_id]=motion
         self.last_motion=(goal_id,motion)
         self._motion_event('MOTION_REQUESTED',goal_id,motion)
         def finish(status,native_status=None):
+            if motion.get('finished'):return
             self.motions.pop(goal_id,None)
             motion.pop('pending_path',None)
+            if motion.get('suspended'):
+                if kind!='SCAN_SPIN':self._clear_path('suspended motion terminal')
+                motion['terminal']=(status,native_status)
+                return
+            motion['finished']=True
             if kind!='SCAN_SPIN':
                 self._clear_path('motion terminal: '+status)
-                self.results.append(GoalResult(task_id,command_id,goal_id,kind,status))
+                if on_result is None:self.results.append(GoalResult(task_id,command_id,goal_id,kind,status))
             self._motion_event('MOTION_TERMINAL',goal_id,motion,status=status,native_status=native_status)
             if not motion['reply'].done():motion['reply'].set_result(status)
+            if on_result is not None:on_result(native_status if native_status is not None else 6,goal_id)
+        motion['finish']=finish
         def accepted(done):
             try:
                 handle=done.result()
@@ -445,17 +550,18 @@ class Nav2Adapter:
                 elif self.motions.get(goal_id) is motion:
                     pending=motion.pop('pending_path',None)
                     if pending:self._set_execution_path(*pending)
+                if on_accept is not None and not motion.get('suspended'):on_accept(handle,goal_id)
                 def completed(done):
                     try:
                         status=done.result().status
                         finish({4:'SUCCEEDED',5:'CANCELED',6:'ABORTED'}.get(status,'ABORTED'),status)
-                    except Exception:self.motion_fault=True;finish('ABORTED')
+                    except Exception:self._set_motion_fault('action_result_error');finish('ABORTED')
                 handle.get_result_async().add_done_callback(completed)
             except Exception:
-                self.motion_fault=True
+                self._set_motion_fault('action_response_error')
                 finish('ABORTED')
         try:client.send_goal_async(goal).add_done_callback(accepted)
-        except Exception:self.motion_fault=True;finish('ABORTED')
+        except Exception:self._set_motion_fault('action_send_error');finish('ABORTED')
         return goal_id,motion['reply']
 
     def start_navigation(self,local_goal,task_id,command_id,goal_kind):
@@ -478,11 +584,17 @@ class Nav2Adapter:
         self._motion_event('CANCEL_REQUESTED',goal_id,motion)
         if motion['handle']:
             try:return motion['handle'].cancel_goal_async()
-            except Exception:self.motion_fault=True
+            except Exception:self._set_motion_fault('cancel_request_error')
         future.set_result(False)  # acceptance pending; health still motion_terminal=false
         return future
 
     def stop_motion(self,reason):
+        self.execution_paused=False
+        for motion in getattr(self,'paused_motions',[]):
+            motion['suspended']=False
+            motion['reply'].cancel()
+        self.paused_motions=[]
+        self.paused_callbacks=[]
         self.selection_epoch = getattr(self, 'selection_epoch', 0) + 1
         if getattr(self,'read_only',False):raise RuntimeError('read-only adapter cannot publish stopping commands')
         from geometry_msgs.msg import Twist
@@ -500,6 +612,48 @@ class Nav2Adapter:
             self._record_scan_view(scan,[],'CANCELED','Canceled')
         future=Future();future.set_result(True)
         return future
+
+    def pause_local_execution(self,reason):
+        if getattr(self,'read_only',False):raise RuntimeError('read-only adapter cannot pause motion')
+        from geometry_msgs.msg import Twist
+        self.execution_paused=True
+        self.paused_at=time.monotonic()
+        self.paused_callbacks=[]
+        self.paused_motions=list(self.motions.values())
+        for goal_id,motion in list(self.motions.items()):
+            motion['suspended']=True
+            motion['already_canceling']=motion['cancel']
+            self.cancel_navigation(goal_id)
+        if self.scan and self.scan['phase']=='INFER':
+            self.vision.discard()
+            self.scan.update(phase='FRAME',pending=None)
+        self.node.stop_pub.publish(Twist())
+        self._motion_event('LOCAL_NAV_PAUSED',reason=reason,viewpoint_id=getattr(self,'scan_viewpoint_id',''),
+            view_index=self.scan['index'] if self.scan else None)
+
+    def resume_local_execution(self):
+        health=self.get_health()
+        if not (health.nav_ready and health.localization_valid and health.stopped and health.motion_terminal):
+            raise RuntimeError('local resume prerequisites changed')
+        self.execution_paused=False
+        elapsed=time.monotonic()-self.paused_at
+        for name in ('goal_started','target_confirmation_started','arrival_stop_started',
+                     'arrival_cancel_requested_at','arrival_action_terminal_at'):
+            value=getattr(self.node,name,0.)
+            if value>0:setattr(self.node,name,value+elapsed)
+        if self.scan:
+            self.scan['after']=time.monotonic()
+            if self.scan['deadline'] is not None:self.scan['deadline']+=elapsed
+        motions,self.paused_motions=self.paused_motions,[]
+        for motion in motions:
+            motion['suspended']=False
+            status,native_status=motion['terminal']
+            if status=='CANCELED' and not motion['already_canceling']:motion['restart']()
+            else:motion['finish'](status,native_status)
+        callbacks,self.paused_callbacks=self.paused_callbacks,[]
+        for callback in callbacks:callback()
+        self._motion_event('LOCAL_NAV_RESUMED',viewpoint_id=getattr(self,'scan_viewpoint_id',''),
+            view_index=self.scan['index'] if self.scan else None)
 
     def start_scan(self,target_descriptions,scan_id,*,stop_on_target=None,task_id=None,command_id=None,current_view_only=False):
         if getattr(self,'read_only',False):raise RuntimeError('read-only adapter cannot start Spin/scan')
@@ -525,32 +679,36 @@ class Nav2Adapter:
             evidence_dir=str(evidence.directory) if evidence and evidence.directory is not None else None,
             observations=[asdict(o) for o in observations])
 
-    def tick(self):
+    def tick(self,*,advance_scan=True):
         from nav2_msgs.action import Spin
         from rclpy.duration import Duration
         self.vision.poll()
         now=time.monotonic()
         for motion in self.motions.values():
             if motion['cancel'] and now-motion['since']>self.config.get('cancel_timeout',5.0):
-                self.motion_fault=True  # keep handle occupied; no replacement movement
+                self._set_motion_fault('cancel_timeout')  # keep handle occupied; no replacement movement
+        if getattr(self,'execution_paused',False):return
         scan=self.scan
         evidence=getattr(self,'_scan_evidence',None) or (scan.get('evidence') if scan else None)
         if evidence and evidence.write_failed:
             self._scan_evidence=None
-            self.evidence_write_failed=True;self.motion_fault=True
+            self.evidence_write_failed=True;self._set_motion_fault('evidence_write_failed')
             self.stop_motion('VLM evidence write failed');return
         if not scan:return
+        if getattr(self,'local_pause_enabled',False) and self.get_health().localization_valid and not self.get_health().nav_ready:
+            return  # The task owner suspends this scan without canceling its progress.
         if not self.get_health().nav_ready or not self.get_health().localization_valid:
             self.stop_motion('scan health lost')
             return
-        if now>scan['deadline']:
+        if scan['deadline'] is not None and now>scan['deadline']:
             scan['reply'].set_exception(TimeoutError('scan timeout'))
             self.stop_motion('scan timeout')
             return
+        if not advance_scan:return
         phase=scan['phase']
         if phase=='SPIN':
             if not self.get_health().stopped or not self.vision.available:return
-            headings=self.config['scan_angles']
+            headings=scan.get('headings',self.config['scan_angles'])
             if scan['index']>=len(headings):
                 scan['reply'].set_result(scan['observations']);self.scan=None;return
             yaw=self.get_health().pose.yaw
@@ -582,18 +740,30 @@ class Nav2Adapter:
                     frame_id=snapshot.frame_id,image_sequence=snapshot.sequence,
                     image_shape=list(snapshot.rgb.shape),capture_pose=asdict(self.get_health().pose),
                     scan_initial_yaw=scan['initial'],scan_requested_yaw=normalize_angle(scan['initial']+
-                        (0. if scan.get('current_view_only') else self.config['scan_angles'][scan['index']])),
+                        (0. if scan.get('current_view_only') else scan.get('headings',self.config['scan_angles'])[scan['index']])),
                     task_id=nav.get('task',''),command_id=nav.get('command',''),
                     navigation_goal_id=nav_id,native_action_uuid=nav.get('native_uuid',''),
                     navigation_goal_pose=nav.get('target'),api_timeout_s=self.config['api_timeout'],
-                    adapter_timeout_s=self.vision.timeout))
-            def infer():
+                    adapter_timeout_s=self.vision.timeout,attempt=scan.get('vlm_attempt',1),
+                    request_timeout_s=scan.get('request_timeout',self.vision.timeout)))
+            request_config=dict(self.config,api_timeout=scan['request_timeout'],cancellable_request=True) if 'request_timeout' in scan else None
+            cancellation=Future() if request_config is not None else None
+            def infer(snapshot=snapshot,targets=dict(scan['targets']),evidence=evidence,request_config=request_config,cancellation=cancellation):
                 results={};error_type=None
+                client=None
                 try:
                     if evidence:evidence.begin()
-                    if self.client is None:self.client=self.create_vision_client(self.config)
-                    self.client.evidence=evidence
-                    results=self.client.infer_abc(snapshot.rgb,scan['targets'])
+                    # Timed-out Ranger requests may still return; their clients/evidence stay isolated.
+                    if request_config is not None:
+                        client=self.create_vision_client(request_config)
+                        if hasattr(client,'client'):
+                            cancellation.add_done_callback(lambda _:client.client.close())
+                        if cancellation.cancelled():raise TimeoutError('VLM request canceled')
+                    else:
+                        if self.client is None:self.client=self.create_vision_client(self.config)
+                        client=self.client
+                    client.evidence=evidence
+                    results=client.infer_abc(snapshot.rgb,targets)
                     return results
                 except Exception as error:
                     error_type=type(error).__name__;raise
@@ -605,13 +775,20 @@ class Nav2Adapter:
                                 evidence.write_failed=True
                                 raise OSError('VLM evidence finalization failed') from None
                     finally:
-                        if self.client is not None:self.client.evidence=None
+                        if client is not None:
+                            client.evidence=None
+                            if request_config is not None and hasattr(client,'client'):client.client.close()
                         if evidence and evidence.write_failed:
-                            self.evidence_write_failed=True;self.motion_fault=True
+                            self.evidence_write_failed=True;self._set_motion_fault('evidence_write_failed')
             scan['snapshot']=snapshot
+            scan['task_epoch']=self.node.task_epoch if hasattr(self.node,'task_epoch') else None
             scan['evidence']=evidence;scan['view_recorded']=False
             self._scan_evidence=evidence
+            scan['request_started']=now
             scan['pending']=self.vision.submit(infer)
+            if cancellation is not None:
+                scan['pending'].add_done_callback(lambda done,cancellation=cancellation:
+                    cancellation.cancel() if done.cancelled() else None)
             scan['phase']='INFER'
         elif phase=='INFER' and scan['pending'].done():
             error_type=None
@@ -620,13 +797,10 @@ class Nav2Adapter:
             observations=observations_from_results(results,scan['snapshot'],self.node.ground_pixel_with_reason,
                 self.frame,scan['id'],scan['index'],targets=scan['targets'],robot_id=self.config.get('robot_id','go2'))
             self._record_scan_view(scan,observations,'TIMEOUT' if error_type=='TimeoutError' else 'ERROR' if error_type else 'APPLIED',error_type)
-            if (self.config.get('robot_id')=='ranger' and scan.get('depth_attempt',1)<3 and
-                    any(o.target_id==scan.get('stop_on_target') and o.status=='UNCERTAIN' and
-                        results.get(o.target_id,(None,))[0]=='DETECTED' for o in observations)):
-                # Re-infer a fresh RGB-D pair so target pixels stay aligned with depth.
-                scan['depth_attempt']=scan.get('depth_attempt',1)+1
-                scan['phase']='FRAME';scan['after']=now
-                return
+            if hasattr(self,'consume_local_observation'):
+                observations=self.consume_local_observation(scan,results,observations,error_type)
+                if observations is None:return
+            if getattr(self,'visualization',None):self.visualization.observe(observations)
             scan['depth_attempt']=1
             scan['observations']+=observations
             detected=next((o for o in observations if o.target_id==scan.get('stop_on_target') and o.status=='DETECTED'),None)

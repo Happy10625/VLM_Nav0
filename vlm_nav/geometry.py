@@ -233,7 +233,7 @@ def depth_at_pixel(
     min_samples: int = 8,
     max_deviation: float = 0.20,
 ) -> Optional[float]:
-    """Average six samples nearest the median, rejecting sparse regions."""
+    """Return a robust local depth, rejecting sparse and mixed-depth regions."""
     depth, _ = depth_at_pixel_with_reason(
         depth_m,
         u,
@@ -257,10 +257,7 @@ def depth_at_pixel_with_reason(
     min_samples: int = 8,
     max_deviation: float = 0.20,
 ) -> Tuple[Optional[float], str]:
-    """Average six samples nearest the median, or explain insufficient depth.
-
-    max_deviation is accepted for compatibility but no longer used.
-    """
+    """Return robust local depth plus an actionable rejection reason."""
     if depth_m.ndim != 2:
         return None, f"invalid_depth_shape:{tuple(depth_m.shape)}"
     if not (0 <= v < depth_m.shape[0] and 0 <= u < depth_m.shape[1]):
@@ -277,7 +274,6 @@ def depth_at_pixel_with_reason(
     values = finite_positive[
         (finite_positive >= min_depth) & (finite_positive <= max_depth)
     ]
-    min_samples = max(6, min_samples)
     if values.size < min_samples:
         if beyond_range.size >= min_samples:
             return (
@@ -290,8 +286,14 @@ def depth_at_pixel_with_reason(
             f"insufficient_valid_depth_samples:{values.size}/{min_samples}",
         )
     median = float(np.median(values))
-    nearest = np.argsort(np.abs(values - median), kind="stable")[:6]
-    return float(np.mean(values[nearest])), "ok"
+    near = values[np.abs(values - median) <= max_deviation]
+    if near.size < min_samples:
+        return (
+            None,
+            f"mixed_depth_samples:{near.size}/{min_samples},"
+            f"median_m={median:.3f},max_deviation_m={max_deviation:.3f}",
+        )
+    return float(np.median(near)), "ok"
 
 
 def project_pixel(

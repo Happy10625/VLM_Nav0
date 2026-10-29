@@ -63,6 +63,7 @@ def test_initial_scan_completes_before_vlm_selects_and_navigates(initial_run,sta
     assert run.requests[0]['history'][0]['candidate_id']=='START'
     assert run.requests[0]['history'][0]['result']==status
     assert all(p['id']!='task_start' for p in run.requests[0]['candidates'])
+    assert run.adapter.generated_observations[1]=={}
     assert next(e for e in run.events if e['state']=='SCANNING')['pose']==[3.,-3.,0.]
 
 
@@ -117,3 +118,30 @@ def test_new_task_scans_its_new_starting_pose(initial_run):
     assert run.scans[-1][0]==Pose2D(-2.,-3.,.5)
     assert run.scans[-1][3]['task_id']=='new-task'
     assert not run.requests and not run.adapter.calls
+
+
+def test_stationary_vlm_wait_does_not_pause_for_missing_or_unchanged_path(initial_run):
+    run=initial_run
+    assert run.machine.accept(run.command,0.).accepted
+    advance(run,lambda:bool(run.scans))
+    health=run.adapter.get_health
+    run.adapter.get_health=lambda:replace(health(),path=[],path_valid=False,stopped=True,
+        reason='execution path missing or receive timeout')
+    for _ in range(170):
+        now=run.runner.now+.1
+        run.machine.peer_received=run.machine.sync_received=now
+        run.runner.tick(now)
+        assert not run.machine.paused
+        assert run.machine.state().run_state=='LOCAL_EXECUTING'
+    assert not run.adapter.calls and not run.requests
+
+
+def test_shared_exploration_emits_the_same_candidate_set_to_visualization(initial_run):
+    run=initial_run;shown=[]
+    run.adapter.visualization=S(record=shown.append,observe=lambda _:None)
+    assert run.machine.accept(run.command,0.).accepted
+    advance(run,lambda:bool(run.scans));run.pending.set_result(observations(run))
+    advance(run,lambda:bool(run.requests))
+    request=next(e for e in shown if e['state']=='CANDIDATE_REQUEST')
+    assert request['decision_id']==run.requests[0]['decision_id']
+    assert request['candidates']==run.requests[0]['candidates']

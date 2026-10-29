@@ -14,13 +14,20 @@ from test_private_c import private_config
 
 
 @pytest.mark.parametrize('stage',['geometry','render','digest'])
-def test_map_preparation_yields_and_cancels_pending_work(generated_config,tmp_path,monkeypatch,stage):
+@pytest.mark.parametrize('robot_id,cooperative',[('go2',True),('ranger',True),('ranger',False)])
+def test_map_preparation_yields_and_cancels_pending_work(generated_config,tmp_path,monkeypatch,stage,robot_id,cooperative):
     import multi_agent_nav.go2_exploration as core
     config=private_config()
-    config['robot_go2'].update(generated_config['robot_go2'])
-    config['alignment']['robots']['go2'].update(generated_config['alignment']['robots']['go2'])
-    machine,frame=make_machine(config,'go2',True)
-    adapter=FakeAdapter('go2')
+    config['robot_'+robot_id].update(generated_config['robot_go2'])
+    config['alignment']['robots'][robot_id].update(generated_config['alignment']['robots']['go2'])
+    if robot_id=='ranger':
+        from pathlib import Path
+        import yaml
+        path=Path(config['robot_ranger']['generated_candidates']['semantic_yaml'])
+        document=yaml.safe_load(path.read_text());document['source_robot']='ranger'
+        path.write_text(yaml.safe_dump(document))
+    machine,frame=make_machine(config,robot_id,True)
+    adapter=FakeAdapter(robot_id)
     adapter.client=S(choose_candidate=lambda _:pytest.fail('not a model request'))
     adapter.selection_evidence_dir=tmp_path/'selections'
     pending=Future();jobs=[]
@@ -34,7 +41,7 @@ def test_map_preparation_yields_and_cancels_pending_work(generated_config,tmp_pa
     elif stage=='render':monkeypatch.setattr(core,'render_selection',lambda *a:pytest.fail('render ran in ROS callback'))
     else:monkeypatch.setattr(core.GeneratedCandidates,'unchanged',lambda *a:pytest.fail('digest ran in ROS callback'))
     steps=explore_steps(adapter,config,frame,100.,'target',lambda _:None,lambda:[],None,
-        lambda:None,clock=lambda:0.,robot_id='go2',target_id='A',success_radius=1.,require_navigation_success=True)
+        lambda:None,clock=lambda:0.,robot_id=robot_id,target_id='A',success_radius=1.,require_navigation_success=cooperative)
     try:
         for _ in range(5):next(steps)
         assert jobs and not adapter.calls
@@ -74,7 +81,7 @@ def test_last_digest_wait_rechecks_motion_prerequisites_before_approach(change,m
     config=private_config();config['robot_ranger']['exploration_strategy']='generated_candidates_vlm'
     _,frame=make_machine(config,'ranger',True)
     adapter=FakeAdapter('ranger');adapter.client=S();adapter.selection_epoch=0
-    geometry=S(points=[],radius=.5,semantic_path=None,digests={},unchanged=lambda:True)
+    geometry=S(points=[],radius=.5,observed_radius=2.5,semantic_path=None,digests={},unchanged=lambda:True)
     monkeypatch.setattr(core,'GeneratedCandidates',lambda *a:geometry)
     pending=Future()
     adapter.vision=S(submit=lambda fn:pending if fn.__name__=='catalog_unchanged' else completed(fn()))
@@ -92,7 +99,8 @@ def test_last_digest_wait_rechecks_motion_prerequisites_before_approach(change,m
         if change=='epoch':adapter.selection_epoch=1
         if change=='footprint':adapter.costmap_candidate_free=lambda *a,**k:False
         pending.set_result(change!='digest_changed')
-        with pytest.raises(core.ExplorationStopped):next(steps)
+        expected=core.RecoverablePause if change=='health' else core.ExplorationStopped
+        with pytest.raises(expected):next(steps)
         assert not adapter.calls
     finally:steps.close()
 

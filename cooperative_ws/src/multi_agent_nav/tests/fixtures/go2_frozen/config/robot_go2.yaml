@@ -1,0 +1,5 @@
+# Test-only projection of frozen VLM parameters; never loaded by runtime.
+vlm_nav:
+  ros__parameters:
+    arrival_odom_topic: /odometry
+    require_external_safety_gates: true

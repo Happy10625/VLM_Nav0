@@ -1,4 +1,5 @@
 from dataclasses import replace
+from collections import deque
 from .models import *
 
 NAV_KIND = {'SEARCH_VIEWPOINT':'VIEWPOINT_NAV', 'APPROACH_PICKUP':'PICKUP_NAV',
@@ -27,8 +28,15 @@ class AgentMachine:
         self.peer_received = None
         self.peer_transport_received = None
         self.peer_identity_error = ''
+        self.peer_history = deque(maxlen=32)
+        self.peer_receive_count = self.peer_accept_count = 0
+        self.heartbeat_diagnostic = None
         self.last_sequence = 0
         self.paused = False
+        self.pause_reply = ''
+        self.local_suspended = False
+        self.awaiting_peer_resume = False
+        self.resume_effect = None
         self.retry = 0
         self.excluded = []
         self.selected_goal = None
@@ -46,13 +54,21 @@ class AgentMachine:
         if self.private:self._state.run_state='PREPARING'
 
     def state(self):
-        return replace(self._state)
+        state=replace(self._state)
+        if not self.health.nav_ready and self.health.nav_ready_reason and NAV_READY_DETAIL not in state.reason:
+            state.reason+=NAV_READY_DETAIL+self.health.nav_ready_reason
+        return state
 
     def take_effects(self):
         effects, self.effects = self.effects, []
         return effects
 
     def receive_peer(self,state,entry,now):
+        received=dict(received_monotonic=now,stamp=state.stamp,robot_id=state.robot_id[:160],
+            task_id=state.task_id[:160],local_task_id=self.context.task_id[:160],
+            run_state=state.run_state[:160],result='robot mismatch',peer_received=self.peer_received)
+        self.peer_history.append(received)
+        self.peer_receive_count+=1
         expected='ranger' if self.context.robot_id=='go2' else 'go2'
         if state.robot_id!=expected:
             return False
@@ -66,6 +82,7 @@ class AgentMachine:
         elif self.private and (state.pose_valid or state.common_pose!=Pose2D()):
             error='private peer published coordinates'
         if error:
+            received['result']=error
             self.peer_identity_error=error
             if not self.private or self.task_active or self.handshake_committed:self.stop(error)
             self._update_waiting(now)
@@ -73,6 +90,7 @@ class AgentMachine:
         self.peer_identity_error=''
         self.peer_transport_received=now
         if state.task_id!=self.context.task_id:
+            received['result']='task mismatch'
             if self.private and (self.task_active or self.handshake_committed) and not state.task_id:
                 self.stop('peer restarted during task')
             elif self.private and not state.task_id and not self.task_active and not self.handshake_committed:
@@ -82,7 +100,10 @@ class AgentMachine:
             return False
         # An online but unready peer still refreshes transport liveness.
         self.peer_received=now
+        received.update(result='accepted',peer_received=now)
+        self.peer_accept_count+=1
         self.peer_state=replace(state)
+        if state.run_state not in ('STOPPING','PAUSED'):self.awaiting_peer_resume=False
         fault=self._peer_fault()
         if fault and (not self.private or self.task_active or self.handshake_committed):self.stop(fault)
         self._update_waiting(now)
@@ -93,8 +114,13 @@ class AgentMachine:
         if peer is None:return ''
         failed=[name for name in ('localization_valid','nav_ready') if not getattr(peer,name)]
         if not self.private and not peer.pose_valid:failed.append('pose_valid')
-        if failed:return 'peer health invalid: '+', '.join(failed)
-        if self.private and peer.run_state in ('STOPPING','PAUSED'):return 'peer paused during task'
+        if failed:
+            detail=peer.reason.partition(NAV_READY_DETAIL)[2] if not peer.nav_ready else ''
+            return 'peer health invalid: '+', '.join(failed)+(NAV_READY_DETAIL+detail if detail else '')
+        if self.private and peer.run_state in ('STOPPING','PAUSED'):
+            if is_recoverable_pause(peer.reason):
+                return '' if self.awaiting_peer_resume and peer.run_state=='PAUSED' and peer.stopped else 'peer paused for recovery'
+            return 'peer paused during task'
         return ''
 
     def _update_waiting(self,now):
@@ -179,9 +205,12 @@ class AgentMachine:
             self.command = None
             self.local_observations.clear()
             self.effects.clear()
+            if self.local_suspended:self.effects.append(Effect('STOP',('', 'new task replaces suspended execution')))
             self.selected_goal=self.transit_goal=None
             self.last_sequence = 0
             self.paused = False
+            self.awaiting_peer_resume=False
+            self.resume_effect=None
         reply = validate_command(command, self.context)
         if not reply.accepted:
             return reply
@@ -197,7 +226,8 @@ class AgentMachine:
         if command.action in ('PAUSE', 'CANCEL'):
             if command.action == 'CANCEL' and (not self.command or command.cancel_command_id != self.command.command_id):
                 return CommandReply(False, 'cancel command mismatch')
-            self.stop('coordinator pause/cancel')
+            self.stop('coordinator recoverable pause' if self.private and command.action=='PAUSE'
+                and command.kind=='NAV_READY_WAIT' else 'coordinator pause/cancel')
             return reply
         if command.action == 'GRANT_RESOURCE':
             if command.kind == 'RELEASE':
@@ -242,6 +272,8 @@ class AgentMachine:
             return CommandReply(False, 'deposit requires READY and deposit phase')
         if self.paused or self._state.run_state == 'STOPPING':
             return CommandReply(False, 'paused: new task required')
+        if self.awaiting_peer_resume:
+            return CommandReply(False, 'waiting for peer recovery acknowledgement')
         if self.command and self._state.reply not in ('SUCCEEDED', 'FAILED', 'CANCELED'):
             return CommandReply(False, 'one active command')
         if not self._state.stopped or not self.health.motion_terminal:
@@ -376,12 +408,36 @@ class AgentMachine:
         self._state.reply, self._state.reason, self._state.run_state = 'FAILED', reason, 'IDLE'
 
     def stop(self, reason):
+        self.resume_effect=None
+        if reason.startswith('local health invalid:') and not self.health.nav_ready and self.health.nav_ready_reason:
+            reason+=NAV_READY_DETAIL+self.health.nav_ready_reason
         if self._state.run_state == 'STOPPING' or self.paused:
+            # A manual stop or a nonrecoverable fault must revoke automatic recovery.
+            if self.private and is_recoverable_pause(self._state.reason) and not is_recoverable_pause(reason):
+                self._state.reason=reason
+                if self.local_suspended:self.effects.append(Effect('STOP',('',reason)))
+            elif self.private and is_recoverable_pause(self._state.reason) and (
+                    reason.startswith(('local health invalid:','peer health invalid:'))
+                    or reason in ('peer heartbeat timeout','coordinator heartbeat timeout')):
+                self._state.reason=reason
             return
+        self.pause_reply=self._state.reply
+        self.pause_state,self.pause_goal_id=self._state.run_state,self._state.goal_id
         self.paused = True
         self.effects.append(Effect('STOP', (self._state.goal_id, reason)))
         self._state.goal_id = ''
         self._state.run_state, self._state.reply, self._state.reason = 'STOPPING', 'CANCELED', reason
+
+    def _heartbeat_timeout(self, reason, now):
+        if self.paused and self._state.reason==reason:return
+        timers={name:getattr(self,name) for name in ('peer_received','peer_transport_received','sync_received')}
+        # Capture the check before stop effects or later callbacks can change its evidence.
+        self.heartbeat_diagnostic=dict(reason=reason,robot_id=self.context.robot_id,task_id=self.context.task_id,
+            now=now,lost_timeout=self.lost_timeout,task_started_at=self.task_started_at,
+            ages={name:None if value is None else now-value for name,value in timers.items()},
+            peer_receive_count=self.peer_receive_count,peer_accept_count=self.peer_accept_count,
+            peer_history=list(self.peer_history),**timers)
+        self.stop(reason)
 
     def tick(self, now, health):
         self.health = health
@@ -392,20 +448,48 @@ class AgentMachine:
             self._state.common_pose = self.frame.to_common(health.pose)
         else:self._state.common_pose=Pose2D()
         self._update_waiting(now)
-        if self.private and self.context.task_id and self.phase not in ('DONE','FAILED') and not self.paused and now-self.task_started_at>self.task_timeout:
+        recovering=self.private and self.paused and is_recoverable_pause(self._state.reason)
+        if self.private and self.context.task_id and self.phase not in ('DONE','FAILED') and (not self.paused or recovering) and now-self.task_started_at>self.task_timeout:
             self.stop('task timeout')
-        if self.context.task_id and (not self.private or self.task_active or self.handshake_committed) and not self.paused:
-            if self.sync_received is None or now-self.sync_received>self.lost_timeout:
-                self.stop('coordinator heartbeat timeout')
+        if self.context.task_id and (not self.private or self.task_active or self.handshake_committed) and (not self.paused or recovering):
+            if not self._state.localization_valid:
+                self.stop('local health invalid: localization_valid')
+            elif self.sync_received is None or now-self.sync_received>self.lost_timeout:
+                self._heartbeat_timeout('coordinator heartbeat timeout',now)
             elif (self.peer_received is None and now-self.task_started_at>self.lost_timeout or
                     self.peer_received is not None and now-self.peer_received>self.lost_timeout):
-                self.stop('peer heartbeat timeout')
-            elif not self._state.localization_valid or not health.nav_ready:
-                self.stop('local health invalid: '+', '.join(name for name in ('localization_valid','nav_ready') if not getattr(self._state,name)))
+                self._heartbeat_timeout('peer heartbeat timeout',now)
+            elif not health.nav_ready:
+                self.stop('local health invalid: nav_ready')
             elif self._peer_fault():self.stop(self._peer_fault())
         if self._state.run_state == 'STOPPING':
             if health.stopped and health.motion_terminal:
                 self._state.run_state = 'PAUSED'
+            return self.take_effects()
+        if (self.private and self.paused and is_recoverable_pause(self._state.reason)
+                and self.phase in ('SEARCH_AB','SEARCH_C','DEPOSIT') and self._state.localization_valid
+                and health.nav_ready and health.stopped and health.motion_terminal
+                and self.peer_state and self.peer_state.task_id==self.context.task_id
+                and self.peer_state.stopped and self.peer_state.run_state!='STOPPING'
+                and not self.peer_identity_error
+                and all(received is not None and now-received<=self.lost_timeout
+                        for received in (self.sync_received,self.peer_received))
+                and self._peer_fault() in ('','peer paused for recovery')):
+            self.paused=False
+            self.awaiting_peer_resume=self.peer_state.run_state=='PAUSED'
+            self._state.reason=''
+            self._state.reply=self.pause_reply
+            self._state.run_state='IDLE'
+            if self.local_suspended:
+                self._state.run_state,self._state.goal_id=self.pause_state,self.pause_goal_id
+                self.resume_effect=Effect('LOCAL_RESUME')
+            elif self.command and self.pause_reply not in ('SUCCEEDED','FAILED','CANCELED'):
+                self._state.run_state='PLANNING'
+                self.resume_effect=Effect('LOCAL_EXECUTE')
+        if self.resume_effect and not self.paused:
+            if not self.awaiting_peer_resume:
+                self.effects.append(self.resume_effect)
+                self.resume_effect=None
             return self.take_effects()
         if self.guard and self.command:
             self._monitor_region(health, now)

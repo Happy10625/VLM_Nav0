@@ -28,6 +28,7 @@ def test_live_ranger_entry_uses_own_adapter_and_config(monkeypatch):
     config=mock_config();config['scene']['share_c_coordinates']=False
     config['alignment']['robots']['ranger']['transform']=None
     adapter=FakeAdapter('ranger')
+    adapter.vision=S(timeout=20.)
     adapter.create_vision_client=lambda config:S()
     monkeypatch.setattr(module.Node,'__init__',lambda self,*a:None)
     monkeypatch.setattr(module,'settings',lambda node:(config,False,'/multi_agent',[]))
@@ -43,6 +44,8 @@ def test_live_ranger_entry_uses_own_adapter_and_config(monkeypatch):
     assert node.machine.context.robot_id=='ranger'
     assert node.runner.adapter is adapter and node.runner.config is config
     assert node.runner.success_radius==1.
+    assert node.map_worker is not adapter.vision and node.map_worker.timeout==adapter.vision.timeout
+    node.map_worker.close()
 
 
 def test_live_map_monitor_rejects_wrong_map_and_expired_evidence(monkeypatch):
@@ -51,13 +54,16 @@ def test_live_map_monitor_rejects_wrong_map_and_expired_evidence(monkeypatch):
     node=object.__new__(module.AgentNode)
     from concurrent.futures import Future
     jobs=[];pending=Future()
-    node.simulation=False;node.adapter=S(task_map_ready=False,vision=S(available=True,submit=lambda fn:(jobs.append(fn) or pending)))
+    node.simulation=False;node.adapter=S(task_map_ready=False)
+    node.map_worker=S(available=True,poll=lambda:None,submit=lambda fn:(jobs.append(fn) or pending))
     node.robot='ranger';node.config={'robot_ranger':{'map_path':'/tmp/expected.yaml'}}
     node.map_probe=S(path='/tmp/wrong.yaml',poll=lambda now:None)
     node.map_ready=False;node.map_verified_at=0.;node.next_map_probe=0.
     node.map_validation=None;node.map_assets=None;node.map_digest_ready=False;node.next_map_validation=0.
     node.poll_map(1.)
     assert not node.adapter.task_map_ready
+    assert node.adapter.task_map_health['observed_path']=='/tmp/wrong.yaml'
+    assert node.adapter.task_map_health['path_matches'] is False
     assert len(jobs)==1 and not pending.done()
     monkeypatch.setattr(config_module,'file_signature',lambda paths:('stable',))
     pending.set_result(([],('/tmp/expected.yaml','/tmp/image.pgm'),('stable',)))
@@ -67,6 +73,9 @@ def test_live_map_monitor_rejects_wrong_map_and_expired_evidence(monkeypatch):
     node.next_map_probe=100.
     node.poll_map(6.)
     assert not node.adapter.task_map_ready
+    assert node.adapter.task_map_health['path_matches'] is True
+    assert node.adapter.task_map_health['verification_age_s']==4.
+    assert node.adapter.task_map_health['max_age_s']==3.
 
 
 def test_map_digest_evidence_invalidates_when_image_changes(tmp_path):
@@ -89,7 +98,8 @@ def test_map_monitor_revokes_health_before_slow_revalidation(monkeypatch):
     node=object.__new__(module.AgentNode)
     pending=Future();jobs=[]
     node.simulation=False;node.robot='ranger';node.config={}
-    node.adapter=S(task_map_ready=True,vision=S(available=True,submit=lambda fn:(jobs.append(fn) or pending)))
+    node.adapter=S(task_map_ready=True)
+    node.map_worker=S(available=True,poll=lambda:None,submit=lambda fn:(jobs.append(fn) or pending))
     node.map_assets=(('/tmp/map.yaml','/tmp/map.pgm'),('old',));node.map_digest_ready=True
     node.map_validation=None;node.map_probe=None;node.next_map_probe=100.;node.next_map_validation=0.
     node.map_ready=True;node.map_verified_at=1.
@@ -105,7 +115,8 @@ def test_periodic_worker_digest_detects_changes_even_with_unchanged_metadata(mon
     node=object.__new__(module.AgentNode)
     pending=Future();jobs=[]
     node.simulation=False;node.robot='ranger';node.config={}
-    node.adapter=S(task_map_ready=True,vision=S(available=True,submit=lambda fn:(jobs.append(fn) or pending)))
+    node.adapter=S(task_map_ready=True)
+    node.map_worker=S(available=True,poll=lambda:None,submit=lambda fn:(jobs.append(fn) or pending))
     node.map_assets=(('/tmp/map.yaml','/tmp/map.pgm'),('same',));node.map_digest_ready=True
     node.map_validation=None;node.map_probe=None;node.next_map_probe=100.;node.next_map_validation=2.
     node.map_ready=True;node.map_verified_at=1.
@@ -113,7 +124,7 @@ def test_periodic_worker_digest_detects_changes_even_with_unchanged_metadata(mon
     node.poll_map(2.)
     assert len(jobs)==1 and node.adapter.task_map_ready
     pending.set_result((['digest mismatch'],node.map_assets[0],('same',)))
-    node.adapter.vision.available=False
+    node.map_worker.available=False
     node.poll_map(2.1)
     assert not node.adapter.task_map_ready
 
@@ -127,6 +138,7 @@ def test_live_keepout_requires_both_mask_and_info_and_rejects_late_invalid_data(
     node.keepout_grid('correct-mask');assert not node.adapter.task_keepout_ready
     node.keepout_info('correct-info');assert node.adapter.task_keepout_ready
     node.keepout_grid('wrong-map');assert not node.adapter.task_keepout_ready
+    assert node.adapter.task_keepout_health['mask_received'] and not node.adapter.task_keepout_health['mask_matches']
     node.keepout_grid('correct-mask');assert node.adapter.task_keepout_ready
     node.keepout_info('wrong-topic');assert not node.adapter.task_keepout_ready
 

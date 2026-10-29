@@ -1,0 +1,28 @@
+# Test-only projection of frozen VLM parameters; never loaded by runtime.
+vlm_nav:
+  ros__parameters:
+    target_confirmation_timeout: 20.0
+    target_success_radius: 0.81
+    approach_cancel_radius: 0.89
+    arrival_odom_topic: /fastlio/odom
+    arrival_linear_speed_tolerance: 0.03
+    arrival_angular_speed_tolerance: 0.05
+    arrival_stationary_samples: 3
+    arrival_odom_max_age: 0.5
+    arrival_cancel_timeout: 3.0
+    arrival_stop_timeout: 5.0
+    arrival_retry_limit: 1
+    easy_case_timeout: 120.0
+    easy_case_alignment_tolerance: 0.1
+    easy_case_max_path_deviation: 0.1
+    allow_frontier_after_scan: true
+    path_horizon_segments: 16
+    path_execute_segments: 8
+    frontier_full_commit_distance: 1.0
+    rescan_at_frontier: true
+    goal_timeout: 120.0
+    blocked_goal_seconds: 15.0
+    rgbd_wait_timeout: 2.0
+    sensor_failure_timeout: 30.0
+    tf_failure_timeout: 3.0
+    max_travel_radius: 3.0

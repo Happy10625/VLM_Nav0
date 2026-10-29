@@ -109,6 +109,11 @@ def parser():
 def terminal_report(value):
     """Keep failure diagnostics on screen; coordinate arrays remain in result.json."""
     if isinstance(value,dict):
+        if value.get('mode')=='local_ranger_explore':
+            # Filter only the task console; inspection and saved evidence stay complete.
+            fields=('target_id','result','rejected','motion_sent','stop_confirmed',
+                    'stop_error','last_native_action_uuid','evidence_write_failed')
+            return {key:value[key] for key in fields if key in value}
         summary={}
         for key,item in value.items():
             if key in ('footprint','path') and isinstance(item,list):
@@ -314,7 +319,7 @@ def run_ros(config,args,events=None,*,robot_id='go2'):
                 nav_ready=sample.nav_ready,stopped=sample.stopped,motion_terminal=sample.motion_terminal,
                 local_costmap=adapter.costmap_transform() is not None,
                 rgbd_ready=node.vlm_input_ready(now),depth_units_verified=node.depth_units_verified,
-                odom_fresh=details.get('odom_age_s',float('inf'))<=details.get('odom_max_age_s',0.),
+                odom_fresh=details.get('checks',{}).get('odom_fresh',False),
                 no_other_goal_owner=not current_owners)
             failed=[k for k,v in checks.items() if not v]
             window['samples']+=1
@@ -460,7 +465,10 @@ def run_ros(config,args,events=None,*,robot_id='go2'):
     finally:
         if started and adapter:
             report['last_native_action_uuid']=getattr(adapter,'last_action_uuid','')
-            try:report['stop_confirmed']=stop_owned(adapter,spin,config['robot_'+robot_id].get('cancel_timeout',5.),record)
+            try:
+                report['stop_confirmed']=(True if robot_id=='ranger' and report.get('result')=='TARGET_APPROACHED'
+                    and getattr(adapter,'local_arrival_verified',False) else
+                    stop_owned(adapter,spin,config['robot_'+robot_id].get('cancel_timeout',5.),record))
             except Exception as error:
                 report['stop_confirmed']=False
                 report['stop_error']=type(error).__name__

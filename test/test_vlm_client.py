@@ -252,7 +252,7 @@ def test_frontier_reason_over_limit_is_truncated_without_rejecting_decision():
         valid_ids=[1],
     )
     assert result.selected_frontier_id == 1
-    assert len(result.reason) == 199
+    assert len(result.reason) == 20
 
 
 def test_frontier_prompt_lists_only_safe_candidates():
@@ -263,6 +263,7 @@ def test_frontier_prompt_lists_only_safe_candidates():
     prompt = build_frontier_prompt("chair", candidates)
     assert "ID 1" in prompt and "ID 4" in prompt
     assert "ID 2" not in prompt
+    assert "at most 20 characters" in prompt
 
 
 def test_dashscope_qwen_request_uses_non_thinking_json_mode(monkeypatch):

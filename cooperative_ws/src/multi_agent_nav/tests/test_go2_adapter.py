@@ -8,7 +8,7 @@ from multi_agent_nav.models import Pose2D
 from vlm_nav.models import VLMResult, Pixel
 
 def grounding(visible):
-    return dict(target_visible=visible, object_match=visible, qualifier_match=visible,
+    return dict(object_match=visible, qualifier_match=visible,
                 relation_match=visible, confidence=.9,
                 target_pixel={'u':2,'v':2} if visible else None,
                 evidence_pixel={'u':2,'v':2} if visible else None)
@@ -20,6 +20,28 @@ def test_abc_structure_and_invalid_outputs():
     with pytest.raises(ValueError): ABCClient.parse({'A':payload['A']},5,5)
     payload['C']['grounding']['confidence']=float('nan')
     with pytest.raises(ValueError): ABCClient.parse(payload,5,5)
+
+@pytest.mark.parametrize('flags',[(a,b,c) for a in (False,True) for b in (False,True) for c in (False,True)])
+def test_abc_visibility_is_computed_locally(flags):
+    visible=all(flags)
+    payload={t:dict(status='DETECTED' if visible else 'UNCERTAIN',grounding=grounding(visible)) for t in 'ABC'}
+    for item in payload.values():
+        item['grounding'].update(zip(('object_match','qualifier_match','relation_match'),flags))
+    result=ABCClient.parse(payload,5,5)
+    assert all(value.target_visible==visible for status,value in result.values())
+    assert all('target_visible' not in item['grounding'] for item in payload.values())
+
+@pytest.mark.parametrize('fault',['model_visible','non_boolean','missing_flag','wrong_status','missing_pixel','bad_pixel'])
+def test_abc_derived_visibility_keeps_strict_validation(fault):
+    payload={t:dict(status='DETECTED',grounding=grounding(True)) for t in 'ABC'}
+    g=payload['B']['grounding']
+    if fault=='model_visible':g['target_visible']=True
+    elif fault=='non_boolean':g['object_match']=1
+    elif fault=='missing_flag':del g['relation_match']
+    elif fault=='wrong_status':payload['B']['status']='UNCERTAIN'
+    elif fault=='missing_pixel':g['evidence_pixel']=None
+    else:g['target_pixel']={'u':1001,'v':5}
+    with pytest.raises(ValueError):ABCClient.parse(payload,1280,720,'normalized_1000')
 
 def test_detected_without_depth_is_not_navigation_position():
     frame=FrameAdapter('g','v','lab_ref','a',(0,0,0))
@@ -97,3 +119,68 @@ def test_delayed_odometry_cannot_confirm_physical_stop():
     message=SimpleNamespace(header=SimpleNamespace(stamp=SimpleNamespace(sec=1,nanosec=0)),twist=SimpleNamespace(twist=v))
     adapter.on_odometry(message)
     assert adapter.stationary_since is None and adapter.odom_at==0
+
+
+def test_discarded_request_does_not_block_resend_or_overwrite_new_reply():
+    from threading import Event
+    started,release=Event(),Event()
+    worker=AsyncVision(4.,max_workers=2)
+    def blocked():
+        started.set();release.wait(2.);return 'old'
+    try:
+        old=worker.submit(blocked)
+        assert started.wait(1.)
+        worker.discard()
+        new=worker.submit(lambda:'new')
+        deadline=time.monotonic()+1.
+        while not new.done() and time.monotonic()<deadline:
+            worker.poll();time.sleep(.001)
+        assert new.result(timeout=.1)=='new'
+        release.set()
+        worker.poll()
+        assert old.cancelled() and new.result()=='new'
+    finally:
+        release.set();worker.close()
+
+
+def test_cancelled_http_requests_release_capacity_across_viewpoints(monkeypatch):
+    import asyncio
+    from threading import Event
+    from types import SimpleNamespace as S
+    from multi_agent_nav.adapters.vision import CancellableCompletion
+    started=[Event() for _ in range(2)]
+    stopped=[Event() for _ in range(2)]
+    class Provider:
+        def __init__(self,**options):
+            self.http=options['http_client']
+            self.chat=S(completions=S(create=self.create))
+        async def __aenter__(self):return self
+        async def __aexit__(self,*args):await self.http.aclose()
+        async def create(self,**request):
+            i=request['attempt'];started[i].set()
+            try:await asyncio.sleep(100.)
+            finally:stopped[i].set()
+    monkeypatch.setattr('openai.AsyncOpenAI',Provider)
+    worker=AsyncVision(4.,max_workers=2)
+    clients=[]
+    try:
+        for i in range(2):
+            client=CancellableCompletion(api_key='fake',base_url='http://unused',timeout=4.,max_retries=0)
+            clients.append(client)
+            reply=worker.submit(lambda i=i,client=client:client.create(attempt=i))
+            reply.add_done_callback(lambda f,client=client:client.close() if f.cancelled() else None)
+            assert started[i].wait(1.)
+            worker.discard()
+        replacement=worker.submit(lambda:'next view')
+        deadline=time.monotonic()+1.
+        while not replacement.done() and time.monotonic()<deadline:
+            worker.poll();time.sleep(.001)
+        assert replacement.result(timeout=.1)=='next view'
+        assert all(e.wait(1.) for e in stopped)
+        canceled=CancellableCompletion(api_key='fake',base_url='http://unused',timeout=4.,max_retries=0)
+        canceled.close()
+        import pytest
+        with pytest.raises(TimeoutError):canceled.create(attempt=0)
+    finally:
+        for client in clients:client.close()
+        worker.close()

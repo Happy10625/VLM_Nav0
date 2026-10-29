@@ -16,6 +16,12 @@ def test_rejects_untrusted_selection(payload):
         parse_selection(json.dumps(payload), ['table_01'])
 
 
+@pytest.mark.parametrize('length',[20,21,200])
+def test_furniture_long_reason_keeps_valid_selection(length):
+    reply=parse_selection(json.dumps(dict(action='inspect_furniture',furniture_id='table_01',reason='近'*length)),['table_01'])
+    assert reply==dict(action='inspect_furniture',furniture_id='table_01',reason='近'*20)
+
+
 def test_selection_state_invalidates_old_or_cancelled_requests():
     state = SelectionState([{'id': 'p1'}, {'id': 'p2'}])
     token = state.snapshot(['p1'])
@@ -196,6 +202,7 @@ def test_furniture_api_uses_semantic_image_and_separate_request(monkeypatch, tmp
     client.evidence = S(request_started=lambda *args:pytest.fail('camera evidence polluted'))
     captured = []
     def completion(self, messages, max_tokens):
+        assert max_tokens==128
         captured.extend(messages)
         return S(choices=[S(message=S(content=json.dumps(dict(action='inspect_furniture',
                    furniture_id='t1', reason='secret-key unseen viewpoint'))))])
@@ -203,6 +210,7 @@ def test_furniture_api_uses_semantic_image_and_separate_request(monkeypatch, tmp
     reply = client.choose_furniture(dict(image=str(image), main_target='target',
                 targets=dict(A='a',B='b',C='c'), candidates=[dict(furniture_id='t1')], records={}))
     assert 'secret-key' not in reply['reason']
+    assert 'at most 20 characters' in captured[0]['content']
     assert captured[1]['content'][1]['image_url']['url'] == 'data:image/png;base64,cG5n'
     assert json.loads(captured[1]['content'][0]['text'])['targets']['C'] == 'c'
 

@@ -133,15 +133,23 @@ def test_abc_request_has_one_wrapper_contract_and_strict_schema(monkeypatch):
     calls=[]
     payload={t:dict(status='DETECTED' if t=='A' else 'NOT_DETECTED',grounding=grounding(t=='A')) for t in 'ABC'}
     def completion(self,messages,max_tokens,schema=None):
+        assert max_tokens==512
         calls.append((messages,schema));return S(choices=[S(message=S(content=json.dumps(payload)))])
     monkeypatch.setattr(OpenAICompatibleVLMClient,'_completion',completion)
     result=client.infer_abc(np.zeros((480,640,3),dtype=np.uint8),dict(A='灭火器',B='水杯',C='篮子'))
     assert result['A'][0]=='DETECTED' and set(result)==set('ABC')
     messages,schema=calls[0];prompt=messages[0]['content'][0]['text']
     assert 'Return exactly one valid JSON object matching the requested fields' not in prompt
-    assert 'normalized 1000x1000' in prompt
-    assert 'logical AND' in prompt and 'solid visible material' in prompt
+    assert '[0,1000]' in prompt and 'x 向右，y 向下' in prompt
+    assert 'UNCERTAIN' in prompt and '不得根据常识补全' in prompt
+    assert '同一候选及其关联对象' in prompt and '避开孔洞、缝隙和背景' in prompt
+    assert 'target_visible' not in prompt and 'target_visible' not in json.dumps(schema)
+    assert len(prompt)<2200
+    assert '紧凑 JSON' in prompt and '不换行' in prompt
     assert set(schema['schema']['properties'])==set('ABC')
     assert schema['schema']['additionalProperties'] is False
     assert set(schema['schema']['properties']['A']['properties'])=={'status','grounding'}
-    for target in 'ABC':assert target in json.loads(prompt.split('TARGET DESCRIPTIONS: ',1)[1].split('\n',1)[0])
+    definition=json.dumps(schema['schema']['properties']['A'],ensure_ascii=False,separators=(',',':'))
+    assert prompt.count(definition)==1
+    for target in 'ABC':assert target in json.loads(prompt.split('目标：',1)[1].split('\n',1)[0])
+    assert result['A'][1].target_visible
