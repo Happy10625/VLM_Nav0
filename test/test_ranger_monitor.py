@@ -25,6 +25,35 @@ def append(path, **row):
         stream.write(json.dumps(row, ensure_ascii=False) + '\n')
 
 
+def test_latest_experiment_uses_creation_time_and_clears_previous_success(monitor, tmp_path):
+    old = tmp_path / 'old'; old.mkdir()
+    (old / '.experiment.json').write_text(json.dumps({'owner': 'go2-vlm-experiment-v1', 'created_ns': 100}))
+    (old / 'result.json').write_text('{"result":"TARGET_APPROACHED","stop_confirmed":true}')
+    view = monitor.ExperimentView()
+    view.poll(monitor.latest_experiment(tmp_path))
+    assert view.result['result'] == 'TARGET_APPROACHED'
+    new = tmp_path / 'new'; new.mkdir()
+    (new / '.experiment.json').write_text(json.dumps({'owner': 'go2-vlm-experiment-v1', 'created_ns': 200}))
+    append(old / 'events.jsonl', state='TARGET_APPROACHED', wall_time=999.)
+    view.poll(monitor.latest_experiment(tmp_path))
+    assert view.directory == new and view.result == {} and view.latest == {}
+    assert 'TARGET_APPROACHED' not in monitor.render(view, {}, now=100., ros_now=100., can_delta=1)
+    append(new / 'events.jsonl', state='APPROACH_FAILED')
+    (new / 'result.json').write_text('{"result":"APPROACH_FAILED"}')
+    view.poll(monitor.latest_experiment(tmp_path))
+    assert view.result['result'] == 'APPROACH_FAILED'
+
+
+def test_latest_experiment_ignores_unmanaged_and_invalid_records(monitor, tmp_path):
+    assert monitor.latest_experiment(tmp_path / 'missing') is None
+    for i, data in enumerate(['{', '[]', '{"created_ns":999}',
+                              '{"owner":"go2-vlm-experiment-v1","created_ns":"999"}']):
+        directory = tmp_path / str(i); directory.mkdir()
+        (directory / '.experiment.json').write_text(data)
+    (tmp_path / 'current-single-experiment.txt').write_text('/old/success')
+    assert monitor.latest_experiment(tmp_path) is None
+
+
 def test_partial_event_waits_for_complete_line_and_follow_resets_old_result(monitor, tmp_path):
     first = tmp_path / 'first'; first.mkdir()
     events = first / 'events.jsonl'

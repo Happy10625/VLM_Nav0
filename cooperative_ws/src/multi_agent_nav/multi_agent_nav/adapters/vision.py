@@ -177,7 +177,8 @@ class ABCClient(OpenAICompatibleVLMClient):
             legend='Blue circle/arrow: robot. Orange P IDs: selectable. Gray: observed, cannot select.',
             images=['occupancy map','furniture semantic map' if annotated else 'unannotated candidate map'])
         if snapshot.get('observed_exclusion_radius',0)>0:
-            context['legend']+=f" Gray disks: excluded for this task within {snapshot['observed_exclusion_radius']:g} m of completed observations; not proof of target absence."
+            context['legend']=context['legend'].replace('Gray: observed','Gray: scan attempted')
+            context['legend']+=f" Gray disks: excluded for this task within {snapshot['observed_exclusion_radius']:g} m of scan attempts, even with incomplete or invalid views; not proof of target absence."
         content=[dict(type='text',text=json.dumps(context,ensure_ascii=False))]
         for path in snapshot['images']:
             data=base64.b64encode(Path(path).read_bytes()).decode('ascii')

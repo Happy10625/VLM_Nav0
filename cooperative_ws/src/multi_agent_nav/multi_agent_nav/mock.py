@@ -24,7 +24,8 @@ def mock_config():
 def make_machine(config,robot,simulation):
     alignment=config['alignment'];entry=alignment['robots'][robot]
     frame=configured_frame(config,robot)
-    context=AgentContext(robot,'',*frame.ids,simulation)
+    context=AgentContext(robot,'',*frame.ids,simulation,
+        wait_recovery=config[f'robot_{robot}'].get('wait_recovery',False))
     machine=AgentMachine(context,frame,config['scene'].get('lost_timeout',3.0),
         config[f'robot_{robot}'].get('path_start_timeout',1.0),config['scene'].get('task_timeout',600.0))
     regions={}

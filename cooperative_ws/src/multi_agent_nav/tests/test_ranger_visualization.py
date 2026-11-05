@@ -3,6 +3,7 @@ from types import SimpleNamespace as S
 from pathlib import Path
 
 import yaml
+import pytest
 from visualization_msgs.msg import Marker
 from builtin_interfaces.msg import Time
 from multi_agent_nav.frame_adapter import FrameAdapter
@@ -82,13 +83,14 @@ def test_runtime_factory_attaches_same_visualization_for_both_live_entry_names(m
     assert not hasattr(adapter,'visualization')
 
 
-def test_completed_points_show_gray_coverage_and_clear_for_new_task():
+@pytest.mark.parametrize('row',[dict(status='observed'),dict(status='observation_failed',scan_started=True)])
+def test_completed_points_show_gray_coverage_and_clear_for_new_task(row):
     view,topics,_=display();view.begin('task')
     topic='/vlm_nav/ranger_exploration/observed_points'
     view.record(dict(state='CANDIDATE_GEOMETRY',task_id='task',observed_radius=3.,
         candidates=[dict(id='done',pose=[2.,3.,0.]),dict(id='failed',pose=[8.,9.,0.])],records={}))
     view.record(dict(state='CANDIDATE_REQUEST',candidates=[dict(display_id='P1',pose=[2.,3.,0.])]))
-    view.record(dict(state='OBSERVATION_RECORD',observation_status='observed',records={'done':dict(status='observed'),
+    view.record(dict(state='OBSERVATION_RECORD',observation_status=row['status'],records={'done':row,
         'failed':dict(status='observation_failed'),'task_start':dict(status='observed')}))
     marks=spheres(topics[topic]);assert len(marks)==1
     assert (marks[0].pose.position.x,marks[0].pose.position.y)==(2.,3.)

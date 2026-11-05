@@ -49,8 +49,10 @@ class RangerVisualization:
             self.points={p['id']:p for p in event['candidates']}
             self.observed_radius=event.get('observed_radius',0.)
         if event.get('state') in ('CANDIDATE_GEOMETRY','OBSERVATION_RECORD'):
-            points=[('observed',Pose2D(*p['pose'])) for pid,p in self.points.items()
-                    if event.get('records',{}).get(pid,{}).get('status')=='observed']
+            records=event.get('records',{})
+            points=[('scanned',Pose2D(*p['pose'])) for pid,p in self.points.items()
+                    if records.get(pid,{}).get('status')=='observed'
+                    or self.observed_radius and records.get(pid,{}).get('scan_started',False)]
             markers=self.markers(points,(.5,.5,.5),'observed_points')
             for index,(_,pose) in enumerate(points):
                 if not self.observed_radius:continue
@@ -62,7 +64,7 @@ class RangerVisualization:
                 disk.color.r=disk.color.g=disk.color.b=.5;disk.color.a=.15
                 markers.markers.append(disk)
             self.observed_pub.publish(markers)
-            if event.get('observation_status')=='observed':
+            if event.get('observation_status')=='observed' or any(row.get('scan_started',False) for row in records.values()):
                 self.candidates_pub.publish(self.markers([], (0.,0.,1.),'vlm_candidates'))
         if event.get('state')=='CANDIDATE_REQUEST':
             points=[(p['display_id'],Pose2D(*p['pose'])) for p in event['candidates']]

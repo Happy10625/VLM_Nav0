@@ -144,7 +144,8 @@ class GeneratedCandidates:
             self.digests[self.semantic_path]=hashlib.sha256(semantic_bytes).hexdigest() if semantic_bytes is not None else None
 
     def observed_points(self,records):
-        return [p for p in self.points if records.get(p['id'],{}).get('status')=='observed']
+        return [p for p in self.points if records.get(p['id'],{}).get('status')=='observed'
+                or self.observed_radius and records.get(p['id'],{}).get('scan_started',False)]
 
     def uncovered_points(self,records):
         if not self.observed_radius:return self.points
@@ -208,7 +209,7 @@ def render_selection(catalog,candidates,records,robot_pose,directory):
     robot_label=getattr(catalog,'robot_id','go2').capitalize()
     marks=[(rx,ry,robot_label,blue)]
     marks.extend((*catalog.pixel(*p['pose'][:2]),p['display_id'],orange) for p in candidates)
-    marks.extend((*catalog.pixel(*p['pose'][:2]),'observed',gray) for p in observed)
+    marks.extend((*catalog.pixel(*p['pose'][:2]),'scanned' if catalog.observed_radius else 'observed',gray) for p in observed)
     footer_index=0
     for x,y,label,color in marks:
         reserved.append((x-8,y-8,x+8,y+8))
@@ -251,7 +252,7 @@ def render_selection(catalog,candidates,records,robot_pose,directory):
     for sign in (-1,1):
         angle=yaw+sign*.5
         draw.line((ax,ay,ax-8*math.cos(angle),ay+8*math.sin(angle)),fill=blue,width=3)
-    observed_legend=(f'Gray disks: observed / excluded within {catalog.observed_radius:g} m'
+    observed_legend=(f'Gray disks: scan attempted / excluded within {catalog.observed_radius:g} m'
                      if catalog.observed_radius else 'Gray: observed / cannot select')
     for offset,label,color in ((65,robot_label+': blue circle and heading',blue),(45,'P IDs: orange / selectable',orange),
                                (25,observed_legend,gray)):

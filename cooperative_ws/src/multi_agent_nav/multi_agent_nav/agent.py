@@ -11,6 +11,10 @@ class AgentMachine:
         if not math.isfinite(path_start_timeout) or path_start_timeout <= 0:
             raise ValueError('path_start_timeout must be finite and positive')
         self.context, self.frame, self.lost_timeout = context, frame, lost_timeout
+        if not isinstance(context.wait_recovery,bool):raise ValueError('wait_recovery must be boolean')
+        self._task_clock=TaskClock()
+        self._now=0.
+        self.pause_sync_received=None
         self.path_start_timeout = path_start_timeout
         self.task_timeout = task_timeout
         self.retired_tasks = set()
@@ -59,11 +63,18 @@ class AgentMachine:
             state.reason+=NAV_READY_DETAIL+self.health.nav_ready_reason
         return state
 
+    def task_clock(self,now):
+        waiting=self.paused or self.awaiting_peer_resume or bool(
+            self.context.task_id and not self.handshake_committed and not self.task_active)
+        active=self._task_clock.sample(now,waiting)
+        return active if self.private and self.context.wait_recovery else now
+
     def take_effects(self):
         effects, self.effects = self.effects, []
         return effects
 
     def receive_peer(self,state,entry,now):
+        self._now=now
         received=dict(received_monotonic=now,stamp=state.stamp,robot_id=state.robot_id[:160],
             task_id=state.task_id[:160],local_task_id=self.context.task_id[:160],
             run_state=state.run_state[:160],result='robot mismatch',peer_received=self.peer_received)
@@ -112,6 +123,11 @@ class AgentMachine:
     def _peer_fault(self):
         peer=self.peer_state
         if peer is None:return ''
+        if (self.private and self.context.wait_recovery and peer.run_state in ('STOPPING','PAUSED')
+                and not is_recoverable_pause(peer.reason)):
+            return 'peer paused during task'
+        if self.private and self.context.wait_recovery and not peer.localization_valid:
+            return 'peer localization temporarily unavailable'
         failed=[name for name in ('localization_valid','nav_ready') if not getattr(peer,name)]
         if not self.private and not peer.pose_valid:failed.append('pose_valid')
         if failed:
@@ -173,6 +189,7 @@ class AgentMachine:
             self.effects.append(Effect('PLAN', self.selected_goal))
 
     def accept(self, command, now):
+        self._now=now
         command=normalize_command(command)
         # SYNC alone establishes a task; EXECUTE can never silently replace it.
         if command.action == 'SYNC' and command.task_id != self.context.task_id:
@@ -190,6 +207,7 @@ class AgentMachine:
                 self.retired_tasks.add(self.context.task_id)
             self.context = candidate
             self.task_started_at=now
+            self._task_clock.reset(now,waiting=True)
             self.peer_received=None
             self.peer_state=None
             self.synced=self.task_active=False
@@ -415,18 +433,21 @@ class AgentMachine:
             # A manual stop or a nonrecoverable fault must revoke automatic recovery.
             if self.private and is_recoverable_pause(self._state.reason) and not is_recoverable_pause(reason):
                 self._state.reason=reason
-                if self.local_suspended:self.effects.append(Effect('STOP',('',reason)))
+                self.effects=[Effect('STOP',(self.pause_goal_id,reason))]
             elif self.private and is_recoverable_pause(self._state.reason) and (
                     reason.startswith(('local health invalid:','peer health invalid:'))
                     or reason in ('peer heartbeat timeout','coordinator heartbeat timeout')):
                 self._state.reason=reason
             return
         self.pause_reply=self._state.reply
+        self.pause_sync_received=self.sync_received
         self.pause_state,self.pause_goal_id=self._state.run_state,self._state.goal_id
         self.paused = True
+        self.effects.clear()
         self.effects.append(Effect('STOP', (self._state.goal_id, reason)))
         self._state.goal_id = ''
         self._state.run_state, self._state.reply, self._state.reason = 'STOPPING', 'CANCELED', reason
+        self.task_clock(self._now)
 
     def _heartbeat_timeout(self, reason, now):
         if self.paused and self._state.reason==reason:return
@@ -440,6 +461,7 @@ class AgentMachine:
         self.stop(reason)
 
     def tick(self, now, health):
+        self._now=now
         self.health = health
         self._state.localization_valid = health.localization_valid and health.pose.valid
         self._state.pose_valid = self._state.localization_valid and not self.private
@@ -449,11 +471,19 @@ class AgentMachine:
         else:self._state.common_pose=Pose2D()
         self._update_waiting(now)
         recovering=self.private and self.paused and is_recoverable_pause(self._state.reason)
-        if self.private and self.context.task_id and self.phase not in ('DONE','FAILED') and (not self.paused or recovering) and now-self.task_started_at>self.task_timeout:
+        if self.private and self.context.task_id and self.phase not in ('DONE','FAILED') and (not self.paused or recovering) and self.task_clock(now)-self.task_started_at>self.task_timeout:
             self.stop('task timeout')
         if self.context.task_id and (not self.private or self.task_active or self.handshake_committed) and (not self.paused or recovering):
-            if not self._state.localization_valid:
-                self.stop('local health invalid: localization_valid')
+            peer_fault=self._peer_fault()
+            if health.hard_fault:
+                self.stop(health.hard_fault)
+            elif self.peer_identity_error:
+                self.stop(self.peer_identity_error)
+            elif peer_fault and not is_recoverable_pause(peer_fault):
+                self.stop(peer_fault)
+            elif not self._state.localization_valid:
+                self.stop('local localization temporarily unavailable' if self.private and self.context.wait_recovery
+                    else 'local health invalid: localization_valid')
             elif self.sync_received is None or now-self.sync_received>self.lost_timeout:
                 self._heartbeat_timeout('coordinator heartbeat timeout',now)
             elif (self.peer_received is None and now-self.task_started_at>self.lost_timeout or
@@ -469,6 +499,9 @@ class AgentMachine:
         if (self.private and self.paused and is_recoverable_pause(self._state.reason)
                 and self.phase in ('SEARCH_AB','SEARCH_C','DEPOSIT') and self._state.localization_valid
                 and health.nav_ready and health.stopped and health.motion_terminal
+                and not health.hard_fault
+                and (not self.context.wait_recovery or self.sync_received!=self.pause_sync_received)
+                and not any(effect.kind=='STOP' for effect in self.effects)
                 and self.peer_state and self.peer_state.task_id==self.context.task_id
                 and self.peer_state.stopped and self.peer_state.run_state!='STOPPING'
                 and not self.peer_identity_error
@@ -477,6 +510,7 @@ class AgentMachine:
                 and self._peer_fault() in ('','peer paused for recovery')):
             self.paused=False
             self.awaiting_peer_resume=self.peer_state.run_state=='PAUSED'
+            self.task_clock(now)
             self._state.reason=''
             self._state.reply=self.pause_reply
             self._state.run_state='IDLE'

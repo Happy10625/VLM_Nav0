@@ -195,6 +195,34 @@ def stop_owned(adapter,spin,timeout,record=None):
         if health.stopped and health.motion_terminal:return True
     return False
 
+def wait_ranger_startup(adapter,node,active_map,spin,record,owners,configured_map):
+    configured_map=str(Path(configured_map).expanduser().resolve())
+    previous=None
+    while True:
+        if active_map.path and active_map.path!=configured_map:
+            return
+        try:
+            spin()
+            health=adapter.get_health()
+            checks=dict(localization_valid=health.localization_valid,stopped=health.stopped,
+                motion_terminal=health.motion_terminal,nav_ready=health.nav_ready,
+                rgbd_ready=node.vlm_input_ready(time.monotonic()),map_parameter=bool(active_map.path),
+                local_costmap=adapter.costmap_transform() is not None,
+                global_costmap=adapter.costmap_transform(global_goal=True) is not None,
+                no_other_goal_owner=not owners())
+            failed=[name for name,ready in checks.items() if not ready]
+        except Exception as error:
+            failed=[type(error).__name__+': '+str(error)]
+            time.sleep(.05)
+        if not failed:
+            if previous is not None:
+                record(dict(state='RECOVERED',reason='',recovery_status='resumed',motion_sent=False))
+            return
+        if failed!=previous:
+            record(dict(state='WAITING_RECOVERY',reason='startup prerequisites: '+', '.join(failed),
+                failed_gates=failed,recovery_status='waiting',motion_sent=False))
+            previous=failed
+
 def require_ros_environment(robot_id='go2',config=None):
     if robot_id=='ranger':
         expected=str((config or {}).get('robot_ranger',{}).get('domain_id',0))
@@ -231,6 +259,23 @@ def run_ros(config,args,events=None,*,robot_id='go2'):
     report['target_id']=getattr(args,'target_id',None) or ('B' if robot_id=='ranger' else 'A')
     latest={}; marker_pub=None; run_id=uuid.uuid4().hex; sequence=0
     generated_display={};generated_pubs=[]
+    def evidence_failure(error):
+        report['evidence_write_failed']=True
+        report['evidence_complete']=False
+        report['evidence_error']=type(error).__name__+': '+str(error)
+        if adapter:
+            adapter.evidence_write_failed=True
+            adapter.motion_fault=True
+    def invalidate_incomplete_evidence():
+        report['evidence_complete']=not report.get('evidence_write_failed',False) and not report.get('vlm_evidence_pending',False)
+        if not report['evidence_complete']:
+            report.setdefault('motion_result',report.get('result'))
+            if report.get('evidence_write_failed'):
+                report['result']='EVIDENCE_WRITE_FAILED'
+                report['failure_reason']='required experiment evidence could not be written: '+report.get('evidence_error','adapter evidence failure')
+            else:
+                report['result']='EVIDENCE_INCOMPLETE'
+                report['failure_reason']='required VLM evidence is still pending'
     def record(event):
         nonlocal latest, sequence
         if events is None:return
@@ -256,20 +301,20 @@ def run_ros(config,args,events=None,*,robot_id='go2'):
         try:
             events.write(json.dumps(row,ensure_ascii=False,allow_nan=False)+'\n')
             events.flush();os.fsync(events.fileno())
-        except OSError:
-            report['evidence_write_failed']=True
-            if adapter:
-                adapter.evidence_write_failed=True
-                adapter.motion_fault=True
+        except (OSError,ValueError,TypeError) as error:
+            evidence_failure(error)
         if marker_pub and 'state' in event:publish_marker()
     def publish_marker():
-        from .go2_exploration import exploration_markers,generated_exploration_markers
-        markers=exploration_markers(latest)
-        for marker in markers.markers:marker.header.stamp=node.get_clock().now().to_msg()
-        marker_pub.publish(markers)
-        for publisher,markers in zip(generated_pubs,generated_exploration_markers(generated_display)):
+        try:
+            from .go2_exploration import exploration_markers,generated_exploration_markers
+            markers=exploration_markers(latest)
             for marker in markers.markers:marker.header.stamp=node.get_clock().now().to_msg()
-            publisher.publish(markers)
+            marker_pub.publish(markers)
+            for publisher,markers in zip(generated_pubs,generated_exploration_markers(generated_display)):
+                for marker in markers.markers:marker.header.stamp=node.get_clock().now().to_msg()
+                publisher.publish(markers)
+        except Exception as error:
+            report['visualization_error']=type(error).__name__+': '+str(error)
     try:
         node,adapter=create_runtime(robot_id,config,read_only=not motion,
             node_name=f'multi_agent_{robot_id}_check_motion' if motion else f'multi_agent_{robot_id}_check_readonly',
@@ -284,15 +329,18 @@ def run_ros(config,args,events=None,*,robot_id='go2'):
             report['vlm_evidence_root']=str(adapter.scan_evidence_dir)
         executor=SingleThreadedExecutor();executor.add_node(node)
         if args.action=='explore':
-            from visualization_msgs.msg import MarkerArray
-            from rclpy.qos import QoSProfile,DurabilityPolicy,ReliabilityPolicy
-            marker_pub=node.create_publisher(MarkerArray,'/vlm_nav/'+robot_id+'_exploration/current_point',
-                QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL,reliability=ReliabilityPolicy.RELIABLE))
-            for topic in ('generated_candidates','selected_candidate'):
-                generated_pubs.append(node.create_publisher(MarkerArray,'/vlm_nav/'+robot_id+'_exploration/'+topic,
-                    QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL,reliability=ReliabilityPolicy.RELIABLE)))
-            publish_marker()
-            node.create_timer(.5,publish_marker)
+            try:
+                from visualization_msgs.msg import MarkerArray
+                from rclpy.qos import QoSProfile,DurabilityPolicy,ReliabilityPolicy
+                marker_pub=node.create_publisher(MarkerArray,'/vlm_nav/'+robot_id+'_exploration/current_point',
+                    QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL,reliability=ReliabilityPolicy.RELIABLE))
+                for topic in ('generated_candidates','selected_candidate'):
+                    generated_pubs.append(node.create_publisher(MarkerArray,'/vlm_nav/'+robot_id+'_exploration/'+topic,
+                        QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL,reliability=ReliabilityPolicy.RELIABLE)))
+                publish_marker()
+                node.create_timer(.5,publish_marker)
+            except Exception as error:
+                report['visualization_error']=type(error).__name__+': '+str(error)
         parameters=node.create_client(GetParameters,'/map_server/get_parameters')
         active_map=MapParameterRead(parameters,GetParameters.Request(names=['yaml_filename']))
         def spin():
@@ -300,9 +348,11 @@ def run_ros(config,args,events=None,*,robot_id='go2'):
             active_map.poll(time.monotonic())
             if started:adapter.tick()
             elif getattr(adapter, 'vision', None) is not None:adapter.vision.poll()
-        deadline=time.monotonic()+args.timeout
+        recoverable_explore=robot_id=='ranger' and args.action=='explore'
+        deadline=float('inf') if recoverable_explore else time.monotonic()+args.timeout
         # Initial data collection is passive, even for an explicit future motion action.
-        until=min(deadline,time.monotonic()+(args.timeout if args.action=='inspect' else 2.))
+        until=(time.monotonic() if recoverable_explore else
+            min(deadline,time.monotonic()+(args.timeout if args.action=='inspect' else 2.)))
         began=time.monotonic();next_sample=began;last_checks=None
         input_checks=('localization_valid','local_costmap','rgbd_ready','depth_units_verified','odom_fresh')
         window=dict(samples=0,first_input_ready_elapsed_s=None,post_input_ready_samples=0,
@@ -343,7 +393,10 @@ def run_ros(config,args,events=None,*,robot_id='go2'):
                 and window['post_input_ready_observed_s']>=window['minimum_observation_s']
                 and not window['post_input_ready_failure_counts'])
             report['health_window']=window
-        if motion and (not node.vlm_input_ready(time.monotonic()) or not active_map.path):
+        if recoverable_explore:
+            wait_ranger_startup(adapter,node,active_map,spin,record,lambda:other_owners(node,robot_id),
+                config['robot_'+robot_id]['map_path'])
+        elif motion and (not node.vlm_input_ready(time.monotonic()) or not active_map.path):
             record({'state':'WAITING_INPUTS','reason':'waiting for RGB-D/image-time TF and map_server parameter','motion_sent':False})
             # A new TF buffer may need longer than the initial two-second collection.
             while time.monotonic()<deadline and (not node.vlm_input_ready(time.monotonic()) or not active_map.path):spin()
@@ -467,36 +520,49 @@ def run_ros(config,args,events=None,*,robot_id='go2'):
             report['last_native_action_uuid']=getattr(adapter,'last_action_uuid','')
             try:
                 report['stop_confirmed']=(True if robot_id=='ranger' and report.get('result')=='TARGET_APPROACHED'
-                    and getattr(adapter,'local_arrival_verified',False) else
+                    and getattr(adapter,'local_arrival_verified',False)
+                    and not getattr(adapter,'evidence_write_failed',False) else
                     stop_owned(adapter,spin,config['robot_'+robot_id].get('cancel_timeout',5.),record))
             except Exception as error:
                 report['stop_confirmed']=False
                 report['stop_error']=type(error).__name__
-            report['evidence_write_failed']=getattr(adapter,'evidence_write_failed',False)
+            report['evidence_write_failed']=report.get('evidence_write_failed',False) or getattr(adapter,'evidence_write_failed',False)
         if args.action=='explore' and adapter:
             job=getattr(getattr(adapter,'vision',None),'job',None)
             if hasattr(args,'_evidence_lease'):args._evidence_lease['pending']=job
             report['vlm_evidence_pending']=job is not None and not job.done()
             for handle in adapter.plans.values():
                 if handle:handle.cancel_goal_async()
+        invalidate_incomplete_evidence()
         if events is not None:
-            state=latest.get('state','STOPPED')
+            state=report['result'] if not report['evidence_complete'] else latest.get('state','STOPPED')
             if state=='STOPPING' and report.get('stop_confirmed'):state='STOPPED'
             record({'state':'STOP_UNCONFIRMED' if started and not report['stop_confirmed'] else state,
                 'event':'SESSION_END','result':report.get('result'),
                 'motion_sent':report.get('motion_sent',False),
                 'stop_confirmed':report.get('stop_confirmed') if started else None})
             report['evidence_write_failed']=report.get('evidence_write_failed',False) or getattr(adapter,'evidence_write_failed',False)
+            invalidate_incomplete_evidence()
             try:
                 (Path(args.output_dir)/'result.json').write_text(json.dumps(report,ensure_ascii=False,allow_nan=False,indent=2)+'\n')
-            except OSError:report['evidence_write_failed']=True
+            except (OSError,ValueError,TypeError) as error:
+                evidence_failure(error)
+                invalidate_incomplete_evidence()
+                record(dict(state='STOP_UNCONFIRMED' if started and not report['stop_confirmed'] else 'EVIDENCE_WRITE_FAILED',
+                    event='SESSION_END',result=report['result'],
+                    reason=report['failure_reason'],stop_confirmed=report.get('stop_confirmed')))
         if adapter:adapter.close(stop=False)
         if executor:executor.shutdown()
         if node:node.destroy_node()
         if rclpy.ok():rclpy.shutdown()
-        emit(report)
+        try:emit(report)
+        except Exception as error:
+            report['display_failed']=True
+            report['display_error']=type(error).__name__+': '+str(error)
         if started and not report['stop_confirmed']:
             raise StopUnconfirmed('action terminal and physical stop were not both confirmed')
+        if not report['evidence_complete']:
+            return 1
 
 def main(argv=None,*,robot_id='go2'):
     p=parser();args=p.parse_args(argv)

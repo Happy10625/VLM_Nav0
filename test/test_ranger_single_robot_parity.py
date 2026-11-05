@@ -1,4 +1,4 @@
-"""Behavior oracle pinned to the only authorized historical revision."""
+"""Historical behavior oracle, with authorized Ranger depth recovery changes."""
 import importlib.util
 import ast
 import math
@@ -192,13 +192,13 @@ def test_detected_label_cannot_bypass_old_matching(local_runtime,field,value):
     assert r.node.target_reference_position is None
 
 
-def test_sparse_depth_uses_old_rotation_then_fresh_reobservation(local_runtime):
+def test_sparse_depth_uses_small_rotation_then_fresh_reobservation(local_runtime):
     r=local_runtime
     future=r.adapter.start_scan({'B':'cup'},'scan',stop_on_target='B',current_view_only=True)
     r.frame(float('nan'));r.adapter.tick();r.adapter.tick()
     assert not future.done()
-    assert r.requests[-1].target_yaw==pytest.approx(np.deg2rad(10.))
-    assert r.node.depth_reobserve_attempts==1
+    assert abs(r.requests[-1].target_yaw)==pytest.approx(math.radians(10.))
+    assert r.node.depth_reobserve_attempts==1 and not r.plans
     r.terminals[-1].set_result(types.SimpleNamespace(status=4))
     assert not future.done()
     r.clock[0]+=.4
@@ -371,16 +371,6 @@ def test_depth_recovery_remains_interruptible(local_runtime,interruption):
     assert not r.adapter.local_arrival_verified
 
 
-@pytest.mark.parametrize('u',[0,4,5,6,10])
-def test_probe_candidates_and_bearings_match_old_method_for_same_input(local_runtime,u):
-    from vlm_nav.models import Pixel
-    r=local_runtime;r.frame()
-    result=replace(r.result[0],target_pixel=Pixel(u,5));snapshot=r.node.latest_snapshot
-    for pose in [(0.,0.,0.),(3.,-2.,.7)]:
-        assert r.node.target_relative_bearing(snapshot,result.target_pixel,pose)==old_method('target_relative_bearing')(r.node,snapshot,result.target_pixel,pose)
-        assert r.node.build_target_probe_candidates(snapshot,result,pose)==old_method('build_target_probe_candidates')(r.node,snapshot,result,pose)
-
-
 @pytest.mark.parametrize('distance,retry,age,terminal', [(.81,0,0.,True),(.85,0,0.,True),(.85,1,0.,True),(.80,0,.51,True),(.80,0,0.,False)])
 def test_arrival_event_outcome_matches_fixed_old_method(distance,retry,age,terminal):
     from test_navigation_gate import arrival_node,stationary_odom
@@ -397,14 +387,14 @@ def test_arrival_event_outcome_matches_fixed_old_method(distance,retry,age,termi
     assert outcomes[0]==outcomes[1]
 
 
-def test_out_of_range_depth_dispatches_old_truncated_probe(local_runtime):
+def test_out_of_range_depth_rotates_without_forward_probe(local_runtime):
     r=local_runtime
     future=r.adapter.start_scan({'B':'cup'},'scan',stop_on_target='B',current_view_only=True)
     r.frame(7.);r.adapter.tick();r.adapter.tick()
     assert not future.done() and r.node.state=='TARGET_REOBSERVING'
-    assert r.plans[0].goal.pose.position.x==2.
-    assert r.requests[0].pose.pose.position.x==1.
-    assert r.node.target_probe_attempts==1 and r.node.depth_reobserve_attempts==0
+    assert not r.plans
+    assert abs(r.requests[0].target_yaw)==pytest.approx(math.radians(10.))
+    assert r.node.target_probe_attempts==0 and r.node.depth_reobserve_attempts==1
     r.terminals[0].set_result(types.SimpleNamespace(status=4))
     assert r.adapter.scan['phase']=='FRAME' and not future.done()
 
@@ -432,8 +422,10 @@ def test_runner_consumes_local_verification_without_replacing_it(local_runtime,k
     failures=[]
     state=types.SimpleNamespace(ready=False,deposited=False)
     command=types.SimpleNamespace(task_id='task',command_id='command',kind=kind)
-    machine=types.SimpleNamespace(paused=external_stop,local_suspended=False,command=command,peer_received=100.,
-        context=types.SimpleNamespace(robot_id='ranger',task_id='task'),_state=state,stop=failures.append,fail=failures.append)
+    machine=types.SimpleNamespace(paused=external_stop,local_suspended=False,awaiting_peer_resume=False,
+        private=True,command=command,peer_received=100.,
+        context=types.SimpleNamespace(robot_id='ranger',task_id='task',wait_recovery=False),
+        _state=state,stop=failures.append,fail=failures.append)
     def completed():
         yield from ()
         return 'TARGET_APPROACHED'
@@ -450,19 +442,17 @@ def test_runner_consumes_local_verification_without_replacing_it(local_runtime,k
 
 
 @pytest.mark.parametrize('attempt,u',[(0,5),(1,5),(2,5),(0,0),(0,10)])
-def test_depth_rotation_matches_old_method_exactly(local_runtime,attempt,u):
+def test_mixed_depth_rotates_toward_pixel_with_three_attempt_budget(local_runtime,attempt,u):
     from vlm_nav.models import Pixel
     r=local_runtime;r.frame()
     snapshot=r.node.latest_snapshot
     result=replace(r.result[0],target_pixel=Pixel(u,5))
-    outcomes=[]
-    for recover in [old_method('recover_target_depth'),r.node.recover_target_depth.__func__]:
-        r.node.depth_reobserve_attempts=attempt;r.node.target_probe_attempts=0
-        r.node.target_reference_position=None;r.node.state='SCANNING'
-        spins=[];r.node.send_spin=lambda angle,kind:spins.append((angle,kind))
-        applied=recover(r.node,snapshot,result,'mixed_depth_samples:0/8')
-        outcomes.append((applied,spins,r.node.state,r.node.depth_reobserve_attempts))
-    assert outcomes[0]==outcomes[1]
+    r.adapter.start_scan({'B':'cup'},'scan',current_view_only=True)
+    r.adapter.scan['depth_reobserve_attempts']=attempt
+    assert r.node.recover_target_depth(snapshot,result,'mixed_depth_samples:0/8')
+    assert r.node.state=='TARGET_REOBSERVING'
+    assert 0<abs(r.requests[-1].target_yaw)<=math.radians(10.)
+    assert r.node.depth_reobserve_attempts==attempt+1 and not r.plans
 
 
 def test_sensor_frames_can_recover_before_canceled_navigation_is_terminal(local_runtime):
@@ -516,7 +506,7 @@ def test_arrival_retry_does_not_require_path_messages(local_runtime):
     steps.close()
 
 
-def test_depth_probe_keeps_path_acquired_state_across_scan_ticks(local_runtime):
+def test_depth_rotation_does_not_require_navigation_path(local_runtime):
     from multi_agent_nav.go2_exploration import explore_steps,ExplorationStopped
     from multi_agent_nav.models import Pose2D
     r=local_runtime
@@ -534,7 +524,9 @@ def test_depth_probe_keeps_path_acquired_state_across_scan_ticks(local_runtime):
     r.adapter.path=[Pose2D(),Pose2D(1.,0.)]
     next(steps)
     r.adapter.path=[]
-    with pytest.raises(ExplorationStopped):next(steps)
+    next(steps)
+    assert hasattr(r.requests[-1],'target_yaw') and not r.plans
+    steps.close()
 
 
 class PendingVision:

@@ -43,6 +43,10 @@ class RangerAdapter(Nav2Adapter):
         self.local_arrival_verified=False
         self.completed_approach=None
         approach=SingleRobotApproach(self,target,task_id,command_id,kind,parameters,record,clock)
+        saved=getattr(self,'recovery_approach',None)
+        if saved is not None and saved['target']==(target.x,target.y):
+            approach.arrival_retry_count=saved['retry']
+            approach.blocked_goals.update(saved['blocked'])
         self.approach=approach
         self.approach_guard=check_motion
         try:
@@ -65,6 +69,12 @@ class RangerAdapter(Nav2Adapter):
                 arrival_retry=approach.arrival_retry_count)
             return 'TARGET_APPROACHED'
         finally:
+            if approach.state==SUCCEEDED or approach.reason=='Approach stopped outside target distance contract after retry':
+                self.recovery_approach=None
+            else:
+                self.recovery_approach=dict(target=(target.x,target.y),
+                    retry=getattr(approach,'failed_arrival_retry',approach.arrival_retry_count),
+                    blocked=dict(approach.blocked_goals))
             if approach.state!=SUCCEEDED:approach.close()
             self.approach=None
             self.approach_guard=None
@@ -111,24 +121,138 @@ class RangerAdapter(Nav2Adapter):
         return {}
 
     def begin_local_execution(self,task_id,command_id,target_id,description):
+        previous=getattr(self.node,'execution_identity',None)
+        continuing=bool(self.config.get('wait_recovery',False) and previous and previous[0]==task_id)
+        target=(self.node.target_reference_position
+            if continuing and previous==(task_id,command_id) else None)
         self.completed_approach=None
+        if not continuing:
+            self.depth_reobserve_budgets={}
+            self.recovery_approach=None
+        self.experiment_recovery=None
+        self.experiment_waiting=False
+        self.resume_scan=None
+        self.failed_scan=None
         self.node.begin_execution(self,task_id,command_id,target_id,description)
+        if target is not None:self.node.set_confirmed_target_reference_position(target)
         if getattr(self,'visualization',None):self.visualization.begin(task_id)
 
     def start_scan(self,*args,**kwargs):
         reply=super().start_scan(*args,**kwargs)
+        self.failed_scan=None
+        key=getattr(self,'scan_viewpoint_id',self.scan['id'])
+        self.scan.update(depth_budget_key=key,depth_reobserve_attempts=getattr(self,'depth_reobserve_budgets',{}).get(key,0))
+        resume=getattr(self,'resume_scan',None)
+        if resume is not None:
+            for key in ('index','initial','headings','observations','current_view_only',
+                        'depth_reobserve_attempts','depth_reobserve_observations','depth_budget_key'):
+                if key in resume:self.scan[key]=resume[key]
+            self.scan.update(phase='SPIN' if resume['phase'] in ('SPIN','SPIN_WAIT') else 'FRAME',after=time.monotonic())
+            self.resume_scan=None
         if getattr(self.node,'execution_active',False):
             # 251f9fb uses goal/confirmation/sensor timers, not an overall scan deadline.
             self.scan.update(deadline=None,request_timeout=self.node.vlm_request_timeout,vlm_attempt=1)
         return reply
 
+    def wait_for_experiment_recovery(self,reason,record,owners,clock=time.monotonic):
+        """Keep the local task alive while old motion stops and prerequisites recover."""
+        node=self.node
+        context=getattr(self,'experiment_recovery',None)
+        if context is None:
+            scan=self.scan or getattr(self,'failed_scan',None)
+            context=dict(identity=node.execution_identity,target=node.target_reference_position,
+                scan=dict(scan) if scan is not None else None,
+                depth_active=node.depth_reobserve_active,
+                sensor_wait=not node.vlm_input_ready(clock()),sensor_frames=0,sequence=node.sequence,
+                retry_at=clock()+float(node.p.blocked_goal_seconds))
+            if context['scan'] is not None:
+                context['scan']['viewpoint_id']=getattr(self,'scan_viewpoint_id','task_start')
+            self.experiment_recovery=context
+            self.experiment_waiting=True
+        if not context.get('stop_requested'):
+            try:node.cancel_motion(publish_stop=True)
+            finally:
+                try:self.hold_motion(reason)
+                finally:node.publish_stop()
+            context['stop_requested']=True
+            node.set_state('WAITING_RECOVERY')
+        previous=None
+        while True:
+            if not node.execution_active or node.execution_identity!=context['identity']:
+                raise RuntimeError('local execution has ended; recovery canceled')
+            health=self.get_health()
+            fault=getattr(self,'motion_fault_reason','')
+            if (self.motion_fault and fault in ('cancel_timeout','cancel_request_error')
+                    and not getattr(self,'motion_terminal_unknown',False)
+                    and not self.motions and health.stopped):
+                self.motion_fault=False
+                self.motion_fault_reason=''
+                health=self.get_health()
+            failed=[]
+            rgbd=node.vlm_input_ready(clock())
+            if not rgbd:
+                context.update(sensor_wait=True,sensor_frames=0)
+            elif context['sequence']!=node.sequence:
+                context['sensor_frames']+=1
+            context['sequence']=node.sequence
+            for name,ok in (('localization',health.localization_valid),('nav_ready',health.nav_ready),
+                    ('motion_terminal',health.motion_terminal),('stopped',health.stopped),
+                    ('local_costmap',self.costmap_transform() is not None),
+                    ('global_costmap',self.costmap_transform(global_goal=True) is not None),
+                    ('rgbd',rgbd),('other_goal_owner',not owners()),
+                    ('native_terminal_known',not getattr(self,'motion_terminal_unknown',False)),
+                    ('motion_fault',not self.motion_fault)):
+                if not ok:failed.append(name)
+            if context['sensor_wait'] and context['sensor_frames']<max(1,int(node.p.sensor_recovery_frames)):
+                failed.append('sensor_recovery_frames')
+            if clock()<context['retry_at']:failed.append('retry_cooldown')
+            status=(reason,tuple(failed),fault)
+            if status!=previous:
+                record(dict(state='WAITING_RECOVERY',reason=reason,reason_class='runtime',
+                    failed_gates=failed,recovery_status='waiting',motion_fault_reason=fault,
+                    task_id=context['identity'][0]))
+                previous=status
+            if not failed:break
+            yield None
+        self.results.clear()
+        node.reset_task('SCANNING')
+        node.clear_target_depth_recovery()
+        node.execution_recovering=False
+        node.execution_recovery_scan=None
+        node.execution_scan_pose=None
+        if context['target'] is not None:
+            node.set_confirmed_target_reference_position(context['target'])
+        else:
+            self.resume_scan=context['scan']
+            node.depth_reobserve_active=context['depth_active']
+            if node.depth_reobserve_active:node.set_state('TARGET_REOBSERVING')
+        self.failed_scan=None
+        self.experiment_waiting=False
+        self.experiment_recovery=None
+        record(dict(state='RECOVERED',reason=reason,recovery_status='resumed',
+            failed_gates=[],task_id=context['identity'][0]))
+
+    def stop_failed_scan(self,reason):
+        if getattr(self,'experiment_recovery_enabled',False) and self.node.execution_active:
+            if self.scan is not None:self.failed_scan=self.scan
+            self.hold_motion(reason)
+            raise RuntimeError(reason)
+        return super().stop_failed_scan(reason)
+
     def stop_motion(self,reason):
         self.local_arrival_verified=False
         self.completed_approach=None
         approach=getattr(self,'approach',None)
-        if approach is not None:approach.close()
-        if getattr(self.node,'execution_active',False):self.node.end_execution()
-        return super().stop_motion(reason)
+        try:
+            try:
+                if approach is not None:approach.close()
+            finally:
+                if getattr(self.node,'execution_active',False):
+                    try:self.node.end_execution()
+                    finally:self.node.execution_active=False
+        finally:
+            result=super().stop_motion(reason)
+        return result
 
     def hold_motion(self,reason):
         return super().stop_motion(reason)
@@ -136,9 +260,9 @@ class RangerAdapter(Nav2Adapter):
     def get_health(self):
         health=super().get_health()
         if getattr(self.node,'execution_active',False):
-            # RGB-D/image-time TF use the old local wait; every other gate stays fatal.
+            # RGB-D/image-time TF use the local sensor wait; other gates reach the exploration loop.
             checks=self.last_health_details['checks']
-            health=replace(health,nav_ready=all(value for key,value in checks.items()
+            health=replace(health,nav_ready=not health.hard_fault and all(value for key,value in checks.items()
                 if key not in ('rgbd_ready','localization_valid')),
                 nav_ready_reason=self.nav_ready_reason(('rgbd_ready','localization_valid')))
         codes=tuple(self.last_health_details.get('nav_ready_failures',{}))
@@ -166,6 +290,9 @@ class RangerAdapter(Nav2Adapter):
             or results.get(t,('API_ERROR',None))[1] is None for t in scan['targets'])
         if error or stale or invalid:
             reason='TIMEOUT' if stale or error=='TimeoutError' else 'API_ERROR'
+            if node.depth_reobserve_active:
+                node.retry_depth_reobservation(reason)
+                return None
             attempt=scan.get('vlm_attempt',1)
             node.get_logger().warn(f'VLM view {scan["index"]+1} attempt {attempt}/2 failed: {reason}; '
                 + ('retrying same view' if attempt<2 else 'skipping this view'))
@@ -192,8 +319,12 @@ class RangerAdapter(Nav2Adapter):
         node.scan_request_sequence=snapshot.sequence
         before=node.state
         result=results.get(target,('API_ERROR',None))[1]
+        scan['depth_reobserve_observations']=observations
+        index=scan['index']
         node.handle_worker_result(WorkerResult(snapshot,result,0.,error))
+        if self.scan is not scan or scan['index']!=index:return None
         if node.state in ('FAILED','API_ERROR'):
+            self.failed_scan=scan
             scan['reply'].set_exception(RuntimeError(node.last_failure_reason))
             self.scan=None
             return None
@@ -214,8 +345,22 @@ class RangerAdapter(Nav2Adapter):
         return [replace(o,status='NOT_DETECTED',position_valid=False) if o.target_id==target else o
             for o in observations]
 
+    def finish_depth_reobservation(self):
+        scan=self.scan
+        scan['observations'] += [replace(o,status='UNCERTAIN',position_valid=False,
+            reason='depth reobservation attempts exhausted at this observation point')
+            if o.target_id==self.node.execution_target_id else o
+            for o in scan.pop('depth_reobserve_observations')]
+        scan.update(index=scan['index']+1,phase='SPIN',vlm_attempt=1,depth_attempt=1)
+        if scan.get('current_view_only'):
+            scan['reply'].set_result(scan['observations'])
+            self.scan=None
+
     def tick(self):
         node=self.node
+        if getattr(self,'experiment_waiting',False):
+            super().tick(advance_scan=False)
+            return
         if getattr(self,'execution_paused',False):
             super().tick(advance_scan=False)
             return
@@ -230,6 +375,7 @@ class RangerAdapter(Nav2Adapter):
                 return
             scan=self.scan
             if scan and node.state in ('FAILED','API_ERROR'):
+                self.failed_scan=scan
                 self.vision.cancel()
                 scan['reply'].set_exception(RuntimeError(node.last_failure_reason))
                 self.scan=None
@@ -246,7 +392,11 @@ class RangerAdapter(Nav2Adapter):
             if scan and (self.motions or node.plan_pending) and scan['phase'] not in ('SPIN_WAIT',):
                 super().tick(advance_scan=False)
                 return
+        previous_scan=self.scan
         super().tick()
+        if (previous_scan is not None and self.scan is None and previous_scan['reply'].done()
+                and not previous_scan['reply'].cancelled() and previous_scan['reply'].exception() is not None):
+            self.failed_scan=previous_scan
         recovery=getattr(node,'execution_recovery_scan',None)
         if recovery is not None and recovery.done():
             node.execution_recovery_scan=None

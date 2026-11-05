@@ -353,7 +353,7 @@ def test_full_gates_only_read_the_current_pcs_map_files():
     ('navigate',[],True,'path_finished',0),
     ('navigate',[],True,'path_timeout',1),
     ('navigate',[],True,'no_path_moving',1),
-    ('navigate',[],True,'evidence_error',0),
+    ('navigate',[],True,'evidence_error',1),
     ('navigate',[],True,'rgbd_warmup',0),
     ('navigate',[],True,'rgbd_unavailable',1),
     ('navigate',[],True,'rgbd_deadline',1),

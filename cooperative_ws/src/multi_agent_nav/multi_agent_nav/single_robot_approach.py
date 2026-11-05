@@ -93,6 +93,7 @@ class SingleRobotApproach:
         self.state = state
 
     def fail_safe(self, reason):
+        self.failed_arrival_retry = self.arrival_retry_count
         self.reason = reason
         self.emit('APPROACH_FAILURE_DETAIL', reason=reason, arrival_retry=self.arrival_retry_count,
                   stationary_samples=self.arrival_stationary_count,

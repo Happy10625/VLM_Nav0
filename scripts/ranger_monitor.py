@@ -11,6 +11,25 @@ import sys
 import time
 
 
+def latest_experiment(root):
+    latest, created = None, -1
+    try:
+        directories = list(root.iterdir())
+    except OSError:
+        return None
+    for directory in directories:
+        try:
+            if directory.is_symlink() or not directory.is_dir():
+                continue
+            record = json.loads((directory / '.experiment.json').read_text())
+        except (OSError, ValueError):
+            continue
+        if (isinstance(record, dict) and record.get('owner') == 'go2-vlm-experiment-v1'
+                and type(record.get('created_ns')) is int and record['created_ns'] > created):
+            latest, created = directory, record['created_ns']
+    return latest
+
+
 class ExperimentView:
     def __init__(self):
         self.directory = None
@@ -22,6 +41,7 @@ class ExperimentView:
         self.failure_reason = ''
         self.failure_detail, self.vlm = '', '-'
         self.event_reason = ''
+        self.recovery_status, self.recovery_reason = '', ''
         self.offset, self.errors = 0, 0
         self.identity = self.result_identity = None
         self.io_error = ''
@@ -80,6 +100,13 @@ class ExperimentView:
         self.latest.update({k: row[k] for k in ('state', 'event', 'viewpoint_id', 'target_id',
                                                'target', 'reason', 'wall_time') if k in row})
         state, event = row.get('state'), row.get('event')
+        if state == 'WAITING_RECOVERY':
+            self.recovery_status = 'waiting'
+            self.recovery_reason = row.get('reason', '')
+            self.failure_detail = self.failure_reason = ''
+        elif state == 'RECOVERED' or row.get('recovery_status') == 'resumed':
+            self.recovery_status, self.recovery_reason = 'resumed', ''
+            self.failure_detail = self.failure_reason = self.event_reason = ''
         if row.get('failure_reason') or event == 'SCAN_FAILED':
             self.failure_detail = row.get('failure_reason') or row.get('reason', '')
         if row.get('reason') and event not in ('PATH_CLEARED', 'STOP_COMMAND_SENT', 'STOP_OBSERVATION', 'SESSION_END') and state not in ('STOPPING', 'STOPPED'):
@@ -222,9 +249,13 @@ def render(view, telemetry, *, now, ros_now, can_delta, odom_max_age=.5, path_ma
     if view.motion.get('kind') == 'SCAN_SPIN' and not view.finished and not result:
         path_state = '旋转阶段无需导航路径'
     outcome = result.get('result', '已结束，等待结果文件' if view.finished else '运行中' if row else '等待实验')
+    if not result and not view.finished and view.recovery_status:
+        outcome = '等待恢复' if view.recovery_status == 'waiting' else '已恢复，继续运行'
     confirmed = {True: '是', False: '否'}.get(result.get('stop_confirmed'), '未记录')
     reason = view.failure_detail or result.get('failure_reason') or view.failure_reason or result.get('reason')
     reason = reason or ('；'.join(result.get('rejected', [])) if result.get('rejected') else '-')
+    if not result and not view.finished and view.recovery_status == 'waiting':
+        reason = view.recovery_reason
     diagnostic = []
     if motion_status == 'ABORTED':
         detail = view.motion.get('error_msg') or view.motion.get('reason') or view.motion.get('log_reason')
@@ -252,9 +283,9 @@ def render(view, telemetry, *, now, ros_now, can_delta, odom_max_age=.5, path_ma
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='Ranger状态/动作/速度只读诊断终端，默认自动跟随当前实验。')
+    parser = argparse.ArgumentParser(description='Ranger状态/动作/速度只读诊断终端，默认自动显示实验记录目录中最新创建的实验。')
     parser.add_argument('--once', action='store_true', help='采样约2秒后仅显示一屏，替代打印完整result.json')
-    parser.add_argument('--experiment-dir', type=Path, help='固定观察一个实验目录，不跟随当前实验指针')
+    parser.add_argument('--experiment-dir', type=Path, help='显式固定观察一个实验目录，用于历史排障')
     args = parser.parse_args(argv)
     import rclpy
     from rclpy.executors import ExternalShutdownException
@@ -269,7 +300,8 @@ def main(argv=None):
             config = yaml.safe_load((Path(os.environ['RANGER_CONFIG']) / 'robot_ranger.yaml').read_text()) or {}
         except (OSError, ValueError, yaml.YAMLError):
             pass
-    marker = Path(os.environ.get('ACCEPTANCE_RUN') or 'build/ranger-local') / 'current-single-experiment.txt'
+    root = Path(config.get('experiment_records_root',
+                           str(Path(__file__).resolve().parents[1] / 'build/ranger-local/experiments')))
     view, telemetry = ExperimentView(), {}
     rclpy.init()
     node = rclpy.create_node('ranger_diagnostic', enable_rosout=False, start_parameter_services=False)
@@ -296,11 +328,7 @@ def main(argv=None):
             next_refresh = now + 1.
             directory = args.experiment_dir
             if directory is None:
-                try:
-                    value = marker.read_text().strip()
-                    directory = Path(value) if value else None
-                except OSError:
-                    directory = None
+                directory = latest_experiment(root)
             view.poll(directory)
             current_can = can_packets()
             delta = max(0, current_can-last_can) if current_can is not None and last_can is not None else None

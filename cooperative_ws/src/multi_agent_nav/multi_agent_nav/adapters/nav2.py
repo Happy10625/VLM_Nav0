@@ -216,6 +216,9 @@ class Nav2Adapter:
             self._set_motion_fault('evidence_write_failed')
 
     def _set_motion_fault(self,reason):
+        if reason in ('action_send_error','action_response_error','action_result_error'):
+            self.motion_terminal_unknown=True
+            self.motion_terminal_unknown_reason=reason
         if not getattr(self,'motion_fault',False) or not getattr(self,'motion_fault_reason',''):
             self.motion_fault_reason=reason
         self.motion_fault=True
@@ -326,8 +329,15 @@ class Nav2Adapter:
                 f'Execution path receive timeout: topic={self.config.get("path_topic")}; '
                 f'receive_age_s={now-self.path_at:.3f}; timeout_s={self.config.get("path_receive_timeout",5.0)}')
             self._motion_event('PATH_RECEIVE_TIMEOUT',receive_age_s=now-self.path_at)
-        return Health(pose,valid,ready,stopped,list(self.path),path_valid,self.config['footprint'],not self.motions,
-                      'execution path missing or receive timeout' if not path_valid else '',self.nav_ready_reason())
+        hard_fault=''
+        if self.config.get('wait_recovery',False):
+            if getattr(self,'motion_terminal_unknown',False):
+                hard_fault=getattr(self,'motion_terminal_unknown_reason','native_action_terminal_unknown')
+            elif getattr(self,'evidence_write_failed',False):hard_fault='evidence_write_failed'
+            elif self.motion_fault:hard_fault=getattr(self,'motion_fault_reason','latched_motion_fault')
+        return Health(pose,valid,ready and not hard_fault,stopped,list(self.path),path_valid,self.config['footprint'],not self.motions,
+                      'execution path missing or receive timeout' if not path_valid else '',self.nav_ready_reason(),
+                      hard_fault=hard_fault)
 
     def nav_ready_reason(self, ignored=('localization_valid',)):
         details=self.last_health_details
@@ -509,6 +519,9 @@ class Nav2Adapter:
         motion={'handle':None,'cancel':False,'reply':reply,'task':task_id,'command':command_id,'kind':kind,'since':time.monotonic(),
                 'native_uuid':'','target':target}
         yaw_target=self.get_health().pose.yaw+goal.target_yaw if kind=='SCAN_SPIN' else None
+        node_token=(getattr(self.node,'goal_token',None) if self.config.get('wait_recovery',False)
+            and on_accept is not None and getattr(self,'approach',None) is None
+            and getattr(self.node,'execution_identity',None)==(task_id,command_id) else None)
         def restart():
             if yaw_target is not None:goal.target_yaw=normalize_angle(yaw_target-self.get_health().pose.yaw)
             else:goal.pose.header.stamp=self.node.get_clock().now().to_msg()
@@ -518,6 +531,11 @@ class Nav2Adapter:
                 self.navigation_resume_sequence=getattr(self,'navigation_resume_sequence',0)+1
             self._motion(client,goal,task_id,command_id,kind,target,on_accept=on_accept,on_result=on_result,
                 _resume=(goal_id,reply))
+            restarted=self.motions.get(goal_id)
+            if (node_token is not None and restarted is not None and not restarted['cancel']
+                    and getattr(self.node,'execution_active',False) and self.node.goal_token==node_token
+                    and self.node.execution_identity==(task_id,command_id)):
+                self.node.goal_started=restarted['since']
         motion['restart']=restart
         self.motions[goal_id]=motion
         self.last_motion=(goal_id,motion)
@@ -589,25 +607,26 @@ class Nav2Adapter:
         return future
 
     def stop_motion(self,reason):
-        self.execution_paused=False
-        for motion in getattr(self,'paused_motions',[]):
-            motion['suspended']=False
-            motion['reply'].cancel()
-        self.paused_motions=[]
-        self.paused_callbacks=[]
-        self.selection_epoch = getattr(self, 'selection_epoch', 0) + 1
         if getattr(self,'read_only',False):raise RuntimeError('read-only adapter cannot publish stopping commands')
         from geometry_msgs.msg import Twist
-        self.vision.cancel()
         scan=self.scan
-        if self.scan:
-            self.scan['reply'].cancel()
+        try:
+            self.execution_paused=False
+            for motion in getattr(self,'paused_motions',[]):
+                motion['suspended']=False
+                motion['reply'].cancel()
+            self.paused_motions=[]
+            self.paused_callbacks=[]
+            self.selection_epoch = getattr(self, 'selection_epoch', 0) + 1
             self.scan=None
-        for goal_id in list(self.motions):self.cancel_navigation(goal_id)
-        for handle in self.plans.values():
-            if handle:handle.cancel_goal_async()
-        self.node.stop_pub.publish(Twist())
-        self._motion_event('STOP_COMMAND_SENT',reason=reason)
+            if scan:scan['reply'].cancel()
+            self.vision.cancel()
+            for goal_id in list(self.motions):self.cancel_navigation(goal_id)
+            for handle in self.plans.values():
+                if handle:handle.cancel_goal_async()
+        finally:
+            self.node.stop_pub.publish(Twist())
+            self._motion_event('STOP_COMMAND_SENT',reason=reason)
         if scan and scan.get('phase')=='INFER':
             self._record_scan_view(scan,[],'CANCELED','Canceled')
         future=Future();future.set_result(True)
@@ -620,18 +639,21 @@ class Nav2Adapter:
         self.paused_at=time.monotonic()
         self.paused_callbacks=[]
         self.paused_motions=list(self.motions.values())
-        for goal_id,motion in list(self.motions.items()):
+        for motion in self.paused_motions:
             motion['suspended']=True
             motion['already_canceling']=motion['cancel']
-            self.cancel_navigation(goal_id)
-        if self.scan and self.scan['phase']=='INFER':
-            self.vision.discard()
-            self.scan.update(phase='FRAME',pending=None)
-        self.node.stop_pub.publish(Twist())
-        self._motion_event('LOCAL_NAV_PAUSED',reason=reason,viewpoint_id=getattr(self,'scan_viewpoint_id',''),
-            view_index=self.scan['index'] if self.scan else None)
+        try:
+            for goal_id in list(self.motions):self.cancel_navigation(goal_id)
+            if self.scan and self.scan['phase']=='INFER':
+                self.vision.discard()
+                self.scan.update(phase='FRAME',pending=None)
+        finally:
+            self.node.stop_pub.publish(Twist())
+            self._motion_event('LOCAL_NAV_PAUSED',reason=reason,viewpoint_id=getattr(self,'scan_viewpoint_id',''),
+                view_index=self.scan['index'] if self.scan else None)
 
     def resume_local_execution(self):
+        if self.config.get('wait_recovery',False):return self._resume_waiting_execution()
         health=self.get_health()
         if not (health.nav_ready and health.localization_valid and health.stopped and health.motion_terminal):
             raise RuntimeError('local resume prerequisites changed')
@@ -652,6 +674,51 @@ class Nav2Adapter:
             else:motion['finish'](status,native_status)
         callbacks,self.paused_callbacks=self.paused_callbacks,[]
         for callback in callbacks:callback()
+        self._motion_event('LOCAL_NAV_RESUMED',viewpoint_id=getattr(self,'scan_viewpoint_id',''),
+            view_index=self.scan['index'] if self.scan else None)
+
+    def _resume_waiting_execution(self):
+        health=self.get_health()
+        if getattr(health,'hard_fault',''):raise RuntimeError(health.hard_fault)
+        if not (health.nav_ready and health.localization_valid and health.stopped and health.motion_terminal):
+            raise RecoverablePause('local execution temporarily unavailable')
+        if getattr(self,'motion_guard',None):self.motion_guard()
+        paused_at=self.paused_at
+        confirmation_started=getattr(self.node,'target_confirmation_started',0.)
+        scan=self.scan
+        scan_deadline=scan['deadline'] if scan else None
+        self.execution_paused=False
+        if scan:scan['after']=time.monotonic()
+        try:
+            while self.paused_motions:
+                motion=self.paused_motions[0]
+                status,native_status=motion['terminal']
+                motion['suspended']=False
+                try:
+                    if status=='CANCELED' and not motion['already_canceling']:motion['restart']()
+                    else:motion['finish'](status,native_status)
+                except Exception:
+                    motion['suspended']=True
+                    raise
+                self.paused_motions.pop(0)
+            while self.paused_callbacks:
+                self.paused_callbacks[0]()
+                self.paused_callbacks.pop(0)
+        except Exception:
+            remaining=self.paused_motions
+            callbacks=self.paused_callbacks
+            try:self.pause_local_execution('local execution temporarily unavailable')
+            finally:
+                self.paused_motions.extend(remaining)
+                self.paused_callbacks.extend(callbacks)
+                self.paused_at=paused_at
+            raise
+        elapsed=time.monotonic()-paused_at
+        # Only perception work budgets freeze; native action/stop timestamps remain real.
+        if confirmation_started>0 and getattr(self.node,'target_confirmation_started',0.)==confirmation_started:
+            self.node.target_confirmation_started+=elapsed
+        if self.scan is scan and scan is not None and scan_deadline is not None:
+            scan['deadline']+=elapsed
         self._motion_event('LOCAL_NAV_RESUMED',viewpoint_id=getattr(self,'scan_viewpoint_id',''),
             view_index=self.scan['index'] if self.scan else None)
 
@@ -693,16 +760,16 @@ class Nav2Adapter:
         if evidence and evidence.write_failed:
             self._scan_evidence=None
             self.evidence_write_failed=True;self._set_motion_fault('evidence_write_failed')
-            self.stop_motion('VLM evidence write failed');return
+            self.stop_failed_scan('VLM evidence write failed');return
         if not scan:return
         if getattr(self,'local_pause_enabled',False) and self.get_health().localization_valid and not self.get_health().nav_ready:
             return  # The task owner suspends this scan without canceling its progress.
         if not self.get_health().nav_ready or not self.get_health().localization_valid:
-            self.stop_motion('scan health lost')
+            self.stop_failed_scan('scan health lost')
             return
         if scan['deadline'] is not None and now>scan['deadline']:
             scan['reply'].set_exception(TimeoutError('scan timeout'))
-            self.stop_motion('scan timeout')
+            self.stop_failed_scan('scan timeout')
             return
         if not advance_scan:return
         phase=scan['phase']
@@ -811,6 +878,9 @@ class Nav2Adapter:
             if scan.get('current_view_only'):
                 scan['reply'].set_result(scan['observations']);self.scan=None;return
             scan['index']+=1;scan['phase']='SPIN'
+
+    def stop_failed_scan(self,reason):
+        return self.stop_motion(reason)
 
     def close(self,stop=True):
         if stop and not getattr(self,'read_only',False):self.stop_motion('shutdown')

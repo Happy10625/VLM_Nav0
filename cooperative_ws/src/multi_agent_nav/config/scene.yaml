@@ -2,6 +2,7 @@ scenario_id: lab
 enabled: false
 simulation: false
 share_c_coordinates: false
+wait_recovery: true
 targets:
   A: 纸巾
   B: 浅棕色盒子

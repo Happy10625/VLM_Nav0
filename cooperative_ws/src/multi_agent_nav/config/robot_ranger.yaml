@@ -1,6 +1,7 @@
 # Ranger local interfaces; verification flags require field evidence.
 # /plan source and stop margin remain field checks; no extra motion-permission gate.
 robot_id: ranger
+wait_recovery: true
 adapter: ranger
 local_map_id: lab_ranger_20261006
 map_version: sha256:3bebc0aad79b9e3add860b33c59a1c7f98231341182103c8a20f1cdd9b43badb

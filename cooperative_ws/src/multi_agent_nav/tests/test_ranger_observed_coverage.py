@@ -33,6 +33,8 @@ def test_disk_boundary_failed_scans_and_initial_view(ranger_geometry):
     records={'done':dict(status='observed')}
     assert [p['id'] for p in geometry.observed_points(records)]==['done']
     assert [p['id'] for p in geometry.uncovered_points(records)]==['outside','far']
+    records={'done':dict(status='observation_failed',scan_started=True)}
+    assert [p['id'] for p in geometry.uncovered_points(records)]==['outside','far']
     assert len(geometry.uncovered_points({}))==5
 
 
@@ -42,12 +44,13 @@ def test_go2_candidate_policy_is_unchanged(generated_config):
     assert geometry.uncovered_points({p['id']:dict(status='observed') for p in geometry.points})==geometry.points
 
 
-def test_both_vlm_maps_draw_same_3m_disk_without_editing_map(ranger_geometry,tmp_path):
+@pytest.mark.parametrize('row',[dict(status='observed'),dict(status='observation_failed',scan_started=True)])
+def test_both_vlm_maps_draw_same_3m_disk_without_editing_map(ranger_geometry,tmp_path,row):
     _,geometry=ranger_geometry
     geometry.points=[dict(id='done',pose=[0.,0.,0.],furniture_id='')]
     original=Path(geometry.source['image']).read_bytes()
     blank=render_selection(geometry,[],{},Pose2D(-4.,-4.),tmp_path/'blank')
-    marked=render_selection(geometry,[],{'done':dict(status='observed')},Pose2D(-4.,-4.),tmp_path/'marked')
+    marked=render_selection(geometry,[],{'done':row},Pose2D(-4.,-4.),tmp_path/'marked')
     arrays=[np.array(Image.open(p)) for p in marked]
     assert np.array_equal(*arrays)
     before=np.array(Image.open(blank[0]))
@@ -58,7 +61,8 @@ def test_both_vlm_maps_draw_same_3m_disk_without_editing_map(ranger_geometry,tmp
 
 
 @pytest.mark.parametrize('cooperative',[False,True])
-def test_completed_disk_persists_in_task_and_resets_in_new_task(ranger_geometry,tmp_path,monkeypatch,cooperative):
+@pytest.mark.parametrize('scan_outcome',['complete','api_error','missing_view','exception'])
+def test_completed_disk_persists_in_task_and_resets_in_new_task(ranger_geometry,tmp_path,monkeypatch,cooperative,scan_outcome):
     from multi_agent_nav.go2_exploration import explore_steps
     config,geometry=ranger_geometry
     geometry.points=[dict(id=name,pose=[x,0.,0.],furniture_id='') for name,x in [('first',0.),('near',1.),('far',3.1)]]
@@ -70,8 +74,15 @@ def test_completed_disk_persists_in_task_and_resets_in_new_task(ranger_geometry,
     adapter.observation_candidate_free=lambda goal:True
     compute=adapter.compute_path
     adapter.compute_path=lambda goal:(plans.append(goal) or compute(goal))
-    adapter.start_scan=lambda descriptions,scan_id,**kw:completed([
-        Observation(target_id=t,view_index=0,status='NOT_DETECTED') for t in descriptions])
+    config['robot_ranger']['scan_angles']=[0.,math.pi]
+    def scan(descriptions,scan_id,**kw):
+        if scan_outcome=='exception':
+            from concurrent.futures import Future
+            future=Future();future.set_exception(ValueError('invalid VLM response'));return future
+        return completed([Observation(target_id=t,view_index=i,
+            status='API_ERROR' if scan_outcome=='api_error' and i==1 else 'NOT_DETECTED')
+            for i in range(1 if scan_outcome=='missing_view' else 2) for t in descriptions])
+    adapter.start_scan=scan
     frame=FrameAdapter('fixture','1','ranger_local_map','',[0,0,0]);now=[0.]
     def run(task):
         steps=explore_steps(adapter,config,frame,100.,'target',events.append,lambda:[],lambda:True,lambda:None,
@@ -86,8 +97,10 @@ def test_completed_disk_persists_in_task_and_resets_in_new_task(ranger_geometry,
     assert [p['id'] for p in requests[1]['candidates']]==['far']
     assert requests[1]['observed_exclusion_radius']==3.
     assert [p.x for _,p,_ in adapter.calls]==[0.,3.1]
-    completed_rows=[e for e in events if e.get('observation_status')=='observed']
+    status='observed' if scan_outcome=='complete' else 'observation_failed'
+    completed_rows=[e for e in events if e.get('observation_status')==status]
     assert completed_rows[-1]['records']['near']['status']=='unobserved'
+    assert adapter.generated_observations[1]['first']['status']==status
     count=len(requests);plans.clear()
     run('one')
     assert len(requests)==count and not plans

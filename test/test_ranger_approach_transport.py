@@ -112,7 +112,7 @@ def test_outer_barrier_rejects_invalid_completion(local_runtime,fault):
     state=S(ready=False,deposited=False)
     failures=[]
     machine=S(command=S(task_id='task',command_id='command',kind='APPROACH_PICKUP'),
-        context=S(task_id='task'),paused=False,_state=state,stop=failures.append,fail=failures.append)
+        context=S(task_id='task',wait_recovery=False),private=True,paused=False,_state=state,stop=failures.append,fail=failures.append)
     health=r.adapter.get_health()
     if fault=='identity':machine.command.command_id='new'
     if fault=='context':machine.context.task_id='new'
@@ -220,7 +220,7 @@ def test_plan_callback_cannot_send_old_command_before_next_runner_tick(local_run
     runner.adapter=r.adapter;runner.now=r.clock[0];runner.owners=lambda:[]
     runner.local_identity=('task','command');runner.local_steps=object()
     runner.machine=S(paused=False,command=S(task_id='task',command_id='command'),
-        context=S(task_id='task'),sync_received=r.clock[0],peer_received=r.clock[0],lost_timeout=3.)
+        context=S(task_id='task',wait_recovery=False),private=True,sync_received=r.clock[0],peer_received=r.clock[0],lost_timeout=3.)
     r.adapter.motion_guard=runner.motion_guard
     a=start_approach(r)
     runner.machine.command=S(task_id='task',command_id='replacement')

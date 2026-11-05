@@ -82,19 +82,18 @@ vlm_nav:
     depth_neighborhood_radius: 5
     min_depth_samples: 8
     min_depth: 0.20
-    # Direct target grounding is trusted up to this range. Farther readings
-    # trigger a Nav2-validated intermediate approach along the VLM direction.
+    # Direct target grounding is trusted up to this range; Ranger retries
+    # invalid/far depth with bounded in-place rotation.
     max_depth: 6.0
     # Reject mixed neighborhoods before taking the near-median depth.
     max_depth_deviation: 0.20
-    # Sparse or mixed target depth triggers a small pixel-directed rotation
-    # and a fresh stationary VLM/RGB-D observation.
+    # Ranger retries in place, at most three rotations per observation point;
+    # failed API responses also consume attempts. No forward depth probe.
     depth_reobserve_angle_deg: 10.0
     depth_reobserve_attempt_limit: 3
-    # If the target remains outside reliable depth range, approach one safe
-    # target-ray observation subgoal and observe again. Raw candidates go
-    # directly to Nav2; no occupancy-grid snap or footprint heuristic is used.
+    # Forward-probe settings below apply only to generic VLMNavigator.
     target_probe_distance: 2.0
+    # Generic VLMNavigator: maximum intermediate approaches.
     target_probe_attempt_limit: 3
     target_probe_min_distance: 0.30
     max_ground_height: 0.35

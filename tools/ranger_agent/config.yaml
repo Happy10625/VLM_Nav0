@@ -1,0 +1,16 @@
+framework_root: /home/isee601/ws/SenseNova-RoboRSI
+framework_python: /home/isee601/ws/SenseNova-RoboRSI/.venv/bin/python
+framework_commit: 0208cd72ec7c885a7219040cd2be459d127e374e
+cli_path: /home/isee601/.codex/packages/standalone/releases/0.166.0-x86_64-unknown-linux-musl/bin/codex
+cli_version: codex-cli 0.166.0
+cli_sha256: b8a11fedf24b2dfb59a70c9e52b030f9a508dcd49cd2dd0d41956f4c785156b8
+model: gpt-6-astra
+reasoning_effort: high
+planner_timeout_s: 1200
+action_timeout_s: 30
+real_backend_enabled: false
+# Recognized feature names only; actual exposed tools/isolation require stage B.
+cli_args: [--sandbox, read-only, --disable, shell_tool, --disable, unified_exec,
+           --disable, code_mode, --disable, code_mode_host, --disable, multi_agent]
+cli_overrides: {}
+capability_verification: null

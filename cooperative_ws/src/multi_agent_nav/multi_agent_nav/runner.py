@@ -37,6 +37,15 @@ class AgentRunner:
 
     def motion_guard(self):
         machine=self.machine;health=self.adapter.get_health()
+        if health.hard_fault:raise RuntimeError(health.hard_fault)
+        if machine.context.wait_recovery and machine.private:
+            fault=machine.peer_identity_error or machine._peer_fault()
+            if fault and not is_recoverable_pause(fault):raise RuntimeError(fault)
+            if self.owners():raise RuntimeError('another local motion owner is active')
+            if not health.localization_valid or not health.pose.valid:
+                raise RecoverablePause('local localization temporarily unavailable')
+            if machine.awaiting_peer_resume:raise RecoverablePause('peer paused for recovery')
+            if fault:raise RecoverablePause(fault)
         if machine.paused or not machine.command or not health.localization_valid or not health.pose.valid:
             raise RuntimeError('motion identity/health invalid')
         if self.local_steps is not None and (self.local_identity!=(machine.command.task_id,machine.command.command_id)
@@ -83,13 +92,14 @@ class AgentRunner:
             self._record_local,self.owners,None,self.motion_guard,clock=lambda:self.now,
             robot_id=machine.context.robot_id,target_id=command.target_id,
             success_radius=None if hasattr(self.adapter,'begin_local_execution') else self.success_radius,require_navigation_success=True,
+            task_clock=(lambda:machine.task_clock(self.now)) if machine.context.wait_recovery else None,
             scan_at_start=machine.context.robot_id=='ranger' and command.sequence==1,
             task_id=command.task_id,command_id=command.command_id,on_observation=self._local_observation,
             initial_observation=machine.local_observations.get(command.observation_id) if command.kind=='APPROACH_DEPOSIT' else None)
 
     def _advance_local(self):
         machine=self.machine;command=machine.command
-        if machine.local_suspended:return
+        if machine.local_suspended or machine.awaiting_peer_resume:return
         if machine.paused or not command or self.local_identity!=(command.task_id,command.command_id):
             self.local_steps.close();self.local_steps=None
             return
@@ -101,8 +111,25 @@ class AgentRunner:
             self.local_completion=(self.local_identity,completed.value)
         except Exception as error:
             self.local_steps.close();self.local_steps=None
-            machine.stop(str(error) if machine.private and isinstance(error,RecoverablePause)
-                         else 'local execution: '+str(error))
+            machine.stop(self._failure_reason(error,'local execution: '+str(error)))
+
+    def _failure_reason(self,error,fallback):
+        from .go2_exploration import is_recoverable_execution_error
+        if self.machine.peer_identity_error:return self.machine.peer_identity_error
+        peer=self.machine._peer_fault()
+        if peer and not is_recoverable_pause(peer):return peer
+        if self.machine.health.hard_fault:return self.machine.health.hard_fault
+        if getattr(self.adapter,'evidence_write_failed',False):return 'evidence_write_failed'
+        try:health=self.adapter.get_health()
+        except Exception as inspection_error:return 'health inspection failed: '+str(inspection_error)
+        if health.hard_fault:return health.hard_fault
+        try:owners=self.owners()
+        except Exception as inspection_error:return 'motion owner inspection failed: '+str(inspection_error)
+        if owners:return 'another local motion owner is active'
+        if self.machine.private and isinstance(error,RecoverablePause):return str(error)
+        if self.machine.private and self.machine.context.wait_recovery and is_recoverable_execution_error(error):
+            return 'local execution temporarily unavailable'
+        return fallback
 
     def _complete_local(self):
         machine=self.machine;command=machine.command
@@ -111,6 +138,13 @@ class AgentRunner:
             self.local_completion=None
             return
         health=self.adapter.get_health()
+        if machine.private and machine.context.wait_recovery and outcome not in ('TARGET_APPROACHED','TARGET_FOUND'):
+            from .go2_exploration import ExplorationStopped
+            error=ExplorationStopped(outcome)
+            reason=self._failure_reason(error,'local execution: '+str(outcome))
+            self.local_completion=None
+            machine.stop(reason)
+            return
         if self.owners():
             machine.stop('another local motion owner is active')
             return
@@ -140,8 +174,7 @@ class AgentRunner:
             if hasattr(self.adapter,'advance'):self.adapter.advance(now)
             if hasattr(self.adapter,'tick'):self.adapter.tick()
         except Exception as error:
-            self.machine.stop(str(error) if self.machine.private and isinstance(error,RecoverablePause)
-                              else 'adapter tick failed: '+str(error))
+            self.machine.stop(self._failure_reason(error,'adapter tick failed: '+str(error)))
             self.dispatch(self.machine.take_effects(),now)
         if self.local_steps and self.machine._state.run_state=='NAVIGATING' and any(
                 (result.task_id,result.command_id,result.goal_id,result.goal_kind)==(
@@ -151,7 +184,11 @@ class AgentRunner:
             self.machine._state.run_state='LOCAL_STOP'
         while self.adapter.results and self.local_steps is None:
             self.machine.on_goal_result(self.adapter.results.popleft(),now)
-        effects=self.machine.tick(now,self.adapter.get_health())
+        try:effects=self.machine.tick(now,self.adapter.get_health())
+        except Exception as error:
+            self.machine.stop(self._failure_reason(error,'health inspection failed: '+str(error)))
+            self.dispatch(self.machine.take_effects(),now)
+            return
         for item in list(self.pending):
             future,identity,kind,goal=item
             if not future.done():continue
@@ -175,7 +212,9 @@ class AgentRunner:
             self._advance_local()
             self.dispatch(self.machine.take_effects(),now)
         if self.local_completion is not None:
-            self._complete_local()
+            try:self._complete_local()
+            except Exception as error:
+                self.machine.stop(self._failure_reason(error,'completion inspection failed: '+str(error)))
             self.dispatch(self.machine.take_effects(),now)
 
     def dispatch(self,effects,now):
@@ -188,19 +227,33 @@ class AgentRunner:
                         and getattr(self.adapter,'approach',None) is None
                         and hasattr(self.adapter,'pause_local_execution')):
                     if not self.machine.local_suspended:
-                        self.machine.local_suspended=True
-                        self.adapter.pause_local_execution(reason)
-                    continue
+                        try:self.adapter.pause_local_execution(reason)
+                        except Exception as error:
+                            self.machine.local_suspended=False
+                            self.machine.stop('local pause failed: '+str(error))
+                            reason=self.machine.state().reason
+                        else:
+                            self.machine.local_suspended=True
+                            continue
+                    else:continue
                 self.machine.local_suspended=False
-                if self.local_steps:self.local_steps.close();self.local_steps=None
-                for future,*_ in self.pending:future.cancel()
-                self.pending.clear()
-                if goal_id:self.adapter.cancel_navigation(goal_id)
-                self.adapter.stop_motion(reason)
+                try:
+                    steps,self.local_steps=self.local_steps,None
+                    if steps:steps.close()
+                    pending,self.pending=self.pending,[]
+                    for future,*_ in pending:future.cancel()
+                    if goal_id:self.adapter.cancel_navigation(goal_id)
+                except Exception as error:
+                    self.machine.stop('motion stop cleanup failed: '+str(error))
+                    reason=self.machine.state().reason
+                finally:
+                    try:self.adapter.stop_motion(reason)
+                    except Exception as error:self.machine.stop('stop motion failed: '+str(error))
             elif effect.kind=='OBSERVATION':self.on_observation(effect.payload)
             elif command and not self.machine.paused:
                 try:
                     if effect.kind=='LOCAL_RESUME':
+                        if self.machine.context.wait_recovery:self.motion_guard()
                         self.machine.navigation_started_at=now
                         self.machine.path_acquired=False
                         self.adapter.resume_local_execution()
@@ -220,6 +273,7 @@ class AgentRunner:
                     else:continue
                     self.pending.append((future,(command.task_id,command.command_id),effect.kind,goal))
                 except Exception as error:
-                    self.machine.stop(str(error) if self.machine.private and isinstance(error,RecoverablePause)
-                                      else f'{effect.kind.lower()} adapter failure')
+                    if effect.kind=='LOCAL_RESUME' and self.machine.context.wait_recovery:
+                        self.machine.local_suspended=getattr(self.adapter,'execution_paused',False)
+                    self.machine.stop(self._failure_reason(error,f'{effect.kind.lower()} adapter failure'))
                     self.dispatch(self.machine.take_effects(),now)

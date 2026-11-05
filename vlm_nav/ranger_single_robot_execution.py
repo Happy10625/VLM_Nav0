@@ -1,4 +1,4 @@
-"""Ranger's 251f9fb local behavior, driven by the existing task owner.
+"""Ranger local behavior, with bounded in-place depth reobservation.
 
 The observer's timers remain disabled. Nav2Adapter owns motion identities and
 execution-path monitoring; this class owns confirmation, recovery and arrival.
@@ -37,6 +37,7 @@ class RangerSingleRobotExecution(VLMNavigator):
         self.execution_adapter = adapter
         self.execution_active = False
         self.reset_task(SCANNING)
+        self.clear_target_depth_recovery()
         self.execution_identity = (task_id, command_id)
         self.execution_target_id = target_id
         self.execution_description = description
@@ -84,6 +85,7 @@ class RangerSingleRobotExecution(VLMNavigator):
             super().confirm_target(point)
 
     def begin_scan(self, pose):
+        self.clear_target_depth_recovery()
         super().begin_scan(pose)
         scan = self.execution_adapter.scan
         if scan is None and self.execution_recovering:
@@ -110,6 +112,8 @@ class RangerSingleRobotExecution(VLMNavigator):
         if self.state in (DISARMED, API_ERROR, SUCCEEDED, FAILED):
             return
         first = self.state != SENSOR_WAITING
+        if first and self.execution_adapter.scan is not None:
+            self.sensor_wait_scan_phase=self.execution_adapter.scan['phase']
         super().enter_sensor_wait(reason)
         if first:
             self.execution_recovering = True
@@ -125,6 +129,25 @@ class RangerSingleRobotExecution(VLMNavigator):
     def finish_approach_success(self):
         super().finish_approach_success()
         self.execution_adapter.local_arrival_verified = True
+
+    def recover_from_sensor_wait(self):
+        resume_scan=(getattr(self.execution_adapter,'experiment_recovery_enabled',False)
+            and self.execution_adapter.scan is not None)
+        if not self.depth_reobserve_active and not resume_scan:
+            return super().recover_from_sensor_wait()
+        if self.state != SENSOR_WAITING or self.robot_pose() is None:
+            return False
+        self.sensor_wait_started=0.
+        self.sensor_wait_reason='none'
+        self.sensor_recovery_count=0
+        self.target_tracker.reset()
+        self.target_seen_time=0.
+        self.execution_recovering=False
+        self.set_state(TARGET_REOBSERVING if self.depth_reobserve_active else SCANNING)
+        self.prepare_stationary_observation()
+        if resume_scan and getattr(self,'sensor_wait_scan_phase',None) in ('SPIN','SPIN_WAIT'):
+            self.execution_adapter.scan['phase']='SPIN'
+        return True
 
     def on_navigation_result(self, future, token, kind):
         if token != self.goal_token:return
@@ -202,6 +225,57 @@ class RangerSingleRobotExecution(VLMNavigator):
                 or self.state in (APPROACHING,APPROACH_STOPPING)):
             return
         self.safety_tick()
+
+    def clear_target_depth_recovery(self):
+        super().clear_target_depth_recovery()
+        self.depth_reobserve_active = False
+
+    def recover_target_depth(self, snapshot, result, reason):
+        if self.target_reference_position is not None:return False
+        if not str(reason).startswith((
+                'insufficient_valid_depth_samples:', 'mixed_depth_samples:', 'depth_out_of_range:')):
+            if self.depth_reobserve_active:
+                self.retry_depth_reobservation(reason)
+                return True
+            return False
+        pose=self.robot_pose()
+        if pose is None:return False
+        # Invalid intrinsics cannot supply a bearing; use the bounded alternating turn.
+        relative=(self.target_relative_bearing(snapshot,result.target_pixel,pose)
+            if all(math.isfinite(v) and v>0 for v in snapshot.intrinsics[:2]) else 0.)
+        self.rotate_depth_reobservation(reason,relative)
+        return True
+
+    def retry_depth_reobservation(self, reason):
+        self.rotate_depth_reobservation(reason)
+
+    def rotate_depth_reobservation(self, reason, relative=0.):
+        scan=self.execution_adapter.scan
+        attempts=scan.get('depth_reobserve_attempts',0)
+        limit=min(3,max(1,int(self.p.depth_reobserve_attempt_limit)))
+        self.target_tracker.reset()
+        self.scan_waiting_for_vlm=False
+        self.scan_request_sequence=-1
+        if attempts>=limit:
+            self.clear_target_depth_recovery()
+            self.set_state(SCANNING)
+            self.execution_adapter.finish_depth_reobservation()
+            return
+        angle=math.radians(max(1.,float(self.p.depth_reobserve_angle_deg)))
+        relative=max(-angle,min(angle,relative))
+        if abs(relative)<math.radians(2.):
+            relative=angle if attempts%2==0 else -angle
+        self.cancel_motion(publish_stop=True)
+        self.task_epoch+=1
+        self.depth_reobserve_active=True
+        self.depth_reobserve_attempts=attempts+1
+        scan['depth_reobserve_attempts']=attempts+1
+        self.execution_adapter.depth_reobserve_budgets[scan['depth_budget_key']]=attempts+1
+        scan['phase']='LOCAL_RECOVERY'
+        self.last_depth_recovery_action=f'rotate:{math.degrees(relative):.1f}deg;attempt={attempts+1}/{limit}'
+        self.set_state(TARGET_REOBSERVING)
+        self.get_logger().warn(f'Depth reobservation {attempts+1}/{limit}: rotating {math.degrees(relative):.1f} degrees; {reason}')
+        self.send_spin(relative,kind='depth_reobserve')
 
     def handle_worker_result(self, completed: WorkerResult):
         self.last_api_latency = completed.latency_s
@@ -295,13 +369,15 @@ class RangerSingleRobotExecution(VLMNavigator):
             if self.target_reference_position is None:
                 self.target_tracker.reset()
                 self.clear_vlm_grounding_markers()
-                if self.state == TARGET_CONFIRMING:
+                if self.state == TARGET_CONFIRMING and not self.depth_reobserve_active:
                     pose = self.robot_pose()
                     if pose is not None:
                         self.begin_scan(pose)
                     else:
                         self.set_state(SCANNING)
-            if depth_reobserve_result:
+            if self.depth_reobserve_active:
+                self.retry_depth_reobservation('target not detected or matching rejected')
+            elif depth_reobserve_result:
                 pose = self.robot_pose()
                 if pose is None:
                     self.fail_safe(
@@ -368,9 +444,10 @@ class RangerSingleRobotExecution(VLMNavigator):
         if scan_result or depth_reobserve_result:
             self.scan_waiting_for_vlm = False
             self.scan_request_sequence = -1
-        self.clear_target_depth_recovery()
         self.target_seen_time = time.monotonic()
         self.confirm_target(target)
+        if self.target_reference_position is not None:
+            self.clear_target_depth_recovery()
         self.publish_grounded_markers(target)
         if self.easy_case_enabled():
             self.log_worker_result(

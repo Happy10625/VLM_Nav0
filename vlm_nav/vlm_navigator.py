@@ -2972,6 +2972,7 @@ class VLMNavigator(Node):
                 "approach",
                 "easy_approach",
                 "target_probe",
+                "target_probe_return",
             ):
                 self.fail_safe(f"No unblocked {kind} candidate")
             elif kind == "frontier":
@@ -3413,6 +3414,7 @@ class VLMNavigator(Node):
                 "scan",
                 "depth_reobserve",
                 "target_probe",
+                "target_probe_return",
                 "target_align",
                 "easy_approach",
             ):
